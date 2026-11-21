@@ -1,0 +1,405 @@
+import { PermissionGrantTab } from "@/components/bs-comp/permission/PermissionGrantTab"
+import {
+  getGrantablePermissionModelsApi,
+  mutateResourceGrantsApi,
+  type PermissionGrantAssignee,
+  type ResourcePermissionContext,
+} from "@/controllers/API/permission"
+import { fireEvent, render, screen, selectOption, waitFor } from "@/test/test-utils"
+import { beforeEach, describe, expect, it, vi } from "vitest"
+
+vi.mock("@/controllers/API/permission", () => ({
+  getGrantablePermissionModelsApi: vi.fn(),
+  mutateResourceGrantsApi: vi.fn(),
+}))
+
+vi.mock("@/components/bs-comp/permission/SubjectSearchUser", () => ({
+  SubjectSearchUser: (props: {
+    value: Array<{ type: "user"; id: number; name: string }>
+    onChange: (
+      value: Array<{ type: "user"; id: number; name: string }>,
+    ) => void
+  }) => (
+    <button
+      type="button"
+      onClick={() =>
+        props.onChange([{ type: "user", id: 9, name: "Alice" }])
+      }
+    >
+      select-alice
+    </button>
+  ),
+}))
+
+vi.mock("@/components/bs-comp/permission/SubjectSearchDepartment", () => ({
+  SubjectSearchDepartment: () => <div>department-picker</div>,
+}))
+
+vi.mock("@/components/bs-comp/permission/SubjectSearchUserGroup", () => ({
+  SubjectSearchUserGroup: (props: {
+    value: Array<{ type: "user_group"; id: number; name: string }>
+    onChange: (
+      value: Array<{ type: "user_group"; id: number; name: string }>,
+    ) => void
+  }) => (
+    <button
+      type="button"
+      onClick={() =>
+        props.onChange([
+          { type: "user_group", id: 77, name: "Reviewers" },
+        ])
+      }
+    >
+      select-group
+    </button>
+  ),
+}))
+
+const context: ResourcePermissionContext = {
+  mode: "CUSTOM",
+  parent_type: null,
+  parent_id: null,
+  resource_version: 8,
+  catalog_release_id: 14,
+  projection_state: "READY",
+  can_manage_permission: true,
+}
+
+const editableAssignee: PermissionGrantAssignee = {
+  assignee_id: "41",
+  assignee_version: 2,
+  subject: { type: "user", id: "10", name: "Bob" },
+  model: { key: "viewer", name: "Viewer", level: 1, active: true },
+  source: { type: "DIRECT", include_children: false },
+  scope: "LOCAL",
+  inherited_from: null,
+  protected: false,
+  editable: true,
+}
+
+const protectedAssignee: PermissionGrantAssignee = {
+  ...editableAssignee,
+  assignee_id: "42",
+  assignee_version: 5,
+  subject: { type: "user", id: "11", name: "Creator" },
+  model: { key: "owner", name: "Owner", level: 4, active: true },
+  protected: true,
+  editable: false,
+}
+
+describe("F048 PermissionGrantTab", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(getGrantablePermissionModelsApi).mockResolvedValue([
+      { key: "viewer", name: "Viewer", level: 1, active: true },
+      { key: "editor", name: "Editor", level: 2, active: true },
+      { key: "owner", name: "Owner", level: 4, active: true },
+    ])
+    vi.mocked(mutateResourceGrantsApi).mockResolvedValue({
+      resource_version: 9,
+      items: [],
+    })
+  })
+
+  it("keeps the legacy add-dialog layout while submitting an F048 mutation", async () => {
+    render(
+      <PermissionGrantTab
+        resourceType="workflow"
+        resourceId="flow-1"
+        context={context}
+        fixedSubjectType="user"
+        legacyAddLayout
+        showExistingAssignees={false}
+        onSuccess={vi.fn()}
+      />,
+    )
+
+    expect(
+      await screen.findByTestId("legacy-permission-grant-layout"),
+    ).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "select-alice" }))
+    await selectOption("grant.addModel", "Editor")
+    fireEvent.click(screen.getByRole("button", { name: "grant.submit" }))
+
+    await waitFor(() => {
+      expect(mutateResourceGrantsApi).toHaveBeenCalledWith(
+        "workflow",
+        "flow-1",
+        expect.objectContaining({
+          expected_resource_version: 8,
+          expected_catalog_release_id: 14,
+          changes: [
+            {
+              op: "ADD",
+              model_key: "editor",
+              subject: { type: "user", id: "9" },
+            },
+          ],
+        }),
+      )
+    })
+  })
+
+  it("submits ADD with only a stable model key and subject contract", async () => {
+    render(
+      <PermissionGrantTab
+        resourceType="workflow"
+        resourceId="flow-1"
+        context={context}
+        onSuccess={vi.fn()}
+      />,
+    )
+
+    await waitFor(() => expect(screen.getByLabelText("grant.addModel")).not.toHaveAttribute("aria-disabled", "true"))
+    fireEvent.click(screen.getByRole("button", { name: "select-alice" }))
+    fireEvent.click(screen.getByLabelText("grant.addModel"))
+    expect(await screen.findByRole("option", { name: "Owner" })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("option", { name: "Editor" }))
+    fireEvent.click(screen.getByRole("button", { name: "grant.submit" }))
+
+    await waitFor(() => {
+      expect(mutateResourceGrantsApi).toHaveBeenCalledWith(
+        "workflow",
+        "flow-1",
+        {
+          idempotency_key: expect.stringMatching(/^grant-mutate-/),
+          expected_resource_version: 8,
+          expected_catalog_release_id: 14,
+          changes: [
+            {
+              op: "ADD",
+              model_key: "editor",
+              subject: {
+                type: "user",
+                id: "9",
+              },
+            },
+          ],
+        },
+      )
+    })
+    const payload = vi.mocked(mutateResourceGrantsApi).mock.calls[0][2]
+    expect(payload.changes[0]).not.toHaveProperty("source")
+    expect(payload.changes[0]).not.toHaveProperty("protected")
+    expect(payload.changes[0]).not.toHaveProperty("level")
+    expect(payload.changes[0]).not.toHaveProperty("derived_level")
+  })
+
+  it("moves an editable assignee using its stable id and version", async () => {
+    render(
+      <PermissionGrantTab
+        resourceType="workflow"
+        resourceId="flow-1"
+        context={context}
+        assignees={[editableAssignee, protectedAssignee]}
+        onSuccess={vi.fn()}
+      />,
+    )
+
+    await screen.findByLabelText("grant.model.41")
+    await selectOption("grant.model.41", "Editor")
+    fireEvent.click(screen.getByRole("button", { name: "grant.move.41" }))
+
+    await waitFor(() => {
+      expect(mutateResourceGrantsApi).toHaveBeenCalledWith(
+        "workflow",
+        "flow-1",
+        expect.objectContaining({
+          changes: [
+            {
+              op: "MOVE",
+              assignee_id: "41",
+              expected_assignee_version: 2,
+              target_model_key: "editor",
+            },
+          ],
+        }),
+      )
+    })
+    expect(screen.getByLabelText("grant.model.42")).toHaveAttribute("aria-disabled", "true")
+    fireEvent.click(screen.getByLabelText("grant.model.42"))
+    expect(screen.getByLabelText("grant.model.42")).toHaveAttribute("aria-expanded", "false")
+    expect(screen.getByRole("button", { name: "grant.remove.42" })).toBeDisabled()
+  })
+
+  it("shows an existing user-group administrator grant", async () => {
+    render(
+      <PermissionGrantTab
+        resourceType="workflow"
+        resourceId="flow-1"
+        context={context}
+        assignees={[
+          {
+            ...editableAssignee,
+            subject: {
+              type: "user_group",
+              id: "77",
+              name: "Reviewers",
+            },
+            source: {
+              type: "USER_GROUP",
+              include_children: false,
+              userset_relation: "admin",
+            },
+          },
+        ]}
+        onSuccess={vi.fn()}
+      />,
+    )
+
+    expect(
+      await screen.findByText(/source\.userGroupAdmin/),
+    ).toBeInTheDocument()
+  })
+
+  it("does not expose or submit a user-group administrator grant", async () => {
+    render(
+      <PermissionGrantTab
+        resourceType="workflow"
+        resourceId="flow-1"
+        context={context}
+        onSuccess={vi.fn()}
+      />,
+    )
+
+    await screen.findByLabelText("grant.addModel")
+    fireEvent.click(screen.getByRole("button", { name: "subject.userGroup" }))
+    fireEvent.click(screen.getByRole("button", { name: "select-group" }))
+    fireEvent.click(screen.getByRole("button", { name: "grant.submit" }))
+
+    await waitFor(() => {
+      expect(mutateResourceGrantsApi).toHaveBeenCalledWith(
+        "workflow",
+        "flow-1",
+        expect.objectContaining({
+          changes: [
+            {
+              op: "ADD",
+              model_key: "viewer",
+              subject: {
+                type: "user_group",
+                id: "77",
+              },
+            },
+          ],
+        }),
+      )
+    })
+  })
+
+  it("removes exactly one editable assignee and reports stale conflicts", async () => {
+    vi.mocked(mutateResourceGrantsApi).mockRejectedValueOnce(
+      { status_code: 25002, status_message: "stale resource version" },
+    )
+    render(
+      <PermissionGrantTab
+        resourceType="workflow"
+        resourceId="flow-1"
+        context={context}
+        assignees={[editableAssignee]}
+        onSuccess={vi.fn()}
+      />,
+    )
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "grant.remove.41" }),
+    )
+    await waitFor(() => {
+      expect(mutateResourceGrantsApi).toHaveBeenCalledWith(
+        "workflow",
+        "flow-1",
+        expect.objectContaining({
+          changes: [
+            {
+              op: "REMOVE",
+              assignee_id: "41",
+              expected_assignee_version: 2,
+            },
+          ],
+        }),
+      )
+      expect(screen.getByText("grant.conflict")).toBeInTheDocument()
+    })
+  })
+
+  it("does not misreport an unavailable tenant member as a version conflict", async () => {
+    vi.mocked(mutateResourceGrantsApi).mockRejectedValueOnce({ status_code: 25016, status_message: "Member is unavailable" })
+    const onSuccess = vi.fn()
+    render(<PermissionGrantTab resourceType="workflow" resourceId="flow-1" context={context} legacyAddLayout showExistingAssignees={false} onSuccess={onSuccess} />)
+    await screen.findByTestId("legacy-permission-grant-layout")
+    fireEvent.click(screen.getByRole("button", { name: "select-alice" }))
+    await selectOption("grant.addModel", "Editor")
+    fireEvent.click(screen.getByRole("button", { name: "grant.submit" }))
+    await screen.findByRole("alert")
+    expect(screen.queryByText("grant.conflict")).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "grant.submit" })).toBeDisabled()
+    expect(onSuccess).not.toHaveBeenCalled()
+  })
+
+  it("respects server read-only eligibility for an inactive existing row", async () => {
+    vi.mocked(getGrantablePermissionModelsApi).mockResolvedValueOnce([
+      { key: "viewer", name: "Viewer", level: 1, active: true },
+      { key: "editor", name: "Editor", level: 2, active: true },
+      { key: "retired-editor", name: "Retired editor", level: 3, active: false },
+    ])
+    const inactiveAssignee: PermissionGrantAssignee = {
+      ...editableAssignee,
+      editable: false,
+      model: {
+        key: "retired-editor",
+        name: "Retired editor",
+        level: 3,
+        active: false,
+      },
+    }
+    render(
+      <PermissionGrantTab
+        resourceType="workflow"
+        resourceId="flow-1"
+        context={context}
+        assignees={[inactiveAssignee]}
+        onSuccess={vi.fn()}
+      />,
+    )
+
+    expect(await screen.findByText("Retired editor")).toBeInTheDocument()
+    const rowModel = screen.getByLabelText("grant.model.41")
+    expect(rowModel).toHaveAttribute("aria-disabled", "true")
+    fireEvent.click(rowModel)
+    expect(rowModel).toHaveAttribute("aria-expanded", "false")
+    expect(screen.getByLabelText("grant.addModel")).not.toHaveTextContent(
+      "Retired editor",
+    )
+    expect(
+      screen.getByRole("button", { name: "grant.move.41" }),
+    ).toBeDisabled()
+    expect(
+      screen.getByRole("button", { name: "grant.remove.41" }),
+    ).toBeDisabled()
+    expect(mutateResourceGrantsApi).not.toHaveBeenCalled()
+  })
+
+  it("shows an inactive source and permits its authorized removal", async () => {
+    render(
+      <PermissionGrantTab
+        resourceType="workflow"
+        resourceId="flow-1"
+        context={context}
+        assignees={[{
+          ...editableAssignee,
+          model: { key: "old-custom", name: "Old permission", level: 1, active: false },
+        }]}
+        onSuccess={vi.fn()}
+      />,
+    )
+    expect(await screen.findByText("roster.inactive_existing_grant")).toBeInTheDocument()
+    const remove = screen.getByRole("button", { name: "grant.remove.41" })
+    await waitFor(() => expect(remove).toBeEnabled())
+    expect(screen.getByLabelText("grant.addModel")).not.toHaveTextContent("Old permission")
+    fireEvent.click(remove)
+    await waitFor(() => expect(mutateResourceGrantsApi).toHaveBeenCalled())
+    expect(vi.mocked(mutateResourceGrantsApi).mock.calls.at(-1)?.[2].changes).toEqual([
+      { op: "REMOVE", assignee_id: "41", expected_assignee_version: 2 },
+    ])
+  })
+})

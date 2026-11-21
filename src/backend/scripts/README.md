@@ -1,0 +1,1421 @@
+# Script Directory
+
+This directory contains manual maintenance and migration scripts for the backend.
+
+## Built-in knowledge retrieval tool
+
+`register_work_knowledge_tool.py` completes the Work knowledge-search upgrade in
+an existing database: register `bisheng_knowledge_search`, reconcile its category
+through the F048 permission facade, and verify the projection is CURRENT. Fresh
+installations use the seed catalog. Run one process during release maintenance
+from `src/backend` with the live service `config`:
+
+```bash
+python scripts/register_work_knowledge_tool.py
+python scripts/register_work_knowledge_tool.py --apply --confirm-store-id <store-id-from-preview> --operator-id <user-id>
+```
+
+The preview returns the Store/model identity, catalog plan, permission state and
+`ready`. Apply validates the selected Store and runtime readiness before writing,
+creates missing catalog rows with database-assigned IDs in one transaction, and
+projects exactly the knowledge category. Existing entries, account switches,
+administrator configuration and current permission modes are preserved. Conflicting
+ownership, duplicate keys, deleted entries or a pending projection require operator
+resolution. A permission failure exits with an error; repeat the same command after
+recovering the service to complete the committed catalog's projection.
+
+Both container entrypoints expose the same upgrade operation. After deploying the
+backend code, use the service's working directory and configuration:
+
+```bash
+docker compose exec backend sh entrypoint.sh upgrade-work-knowledge
+docker compose exec backend sh entrypoint.sh upgrade-work-knowledge --apply --confirm-store-id <store-id-from-preview> --operator-id <user-id>
+```
+
+For repository-managed Compose updates, `scripts/deploy.sh update` includes this
+operation as a required release stage whenever `backend` is selected. It requires
+the confirmed Store and audit operator, waits for backend readiness, runs the
+upgrade, then updates the remaining services. See the
+[deployment procedure](../../../docker/README.md) for preview, failure recovery
+and external-pipeline integration.
+
+Completion requires `ready: true`, then ordinary-user discovery and execution.
+Verify single-space retrieval and K1/K2 multi-selection with distinct source markers
+and citations in Work. Keep the account enable switch and document permissions in
+the acceptance path. Code deployment, successful data upgrade, and real Work task
+acceptance are separate delivery states.
+
+## Diagnostic Scripts
+
+### `measure_dsh_model_audit.py`
+
+Post-development DSH audit timing probe for the **disposable loopback fixture only**.
+Start `python -m test.dsh.audit_local_server --real-stores` first. Supply its
+synthetic administrator/user tokens via `DSH_AUDIT_ADMIN_TOKEN` and
+`DSH_AUDIT_USER_TOKEN`; never use business credentials. The default performs
+read-only preflight. `--apply` sends synthetic requests, measures OFF/METADATA/CONTENT,
+and restores the initial mode. It neither loads application config nor opens DB clients.
+
+```bash
+python scripts/measure_dsh_model_audit.py --base http://127.0.0.1:8786
+python scripts/measure_dsh_model_audit.py --base http://127.0.0.1:8786 --apply --samples 10
+```
+
+JSON output separates first content/response duration, metadata/body visibility,
+and the existing persisted `dsh_model_call` Token baseline. An independent fixture
+model-entered counter supplies the denominator. Small-sample percentiles and process
+peak RSS are observations, not a production SLA; production identity/model/Gateway/DM8
+are outside this fixture. No prompt text or credentials are printed.
+
+### `diagnose_dm_column_reflection.py`
+
+Read-only comparison of DM8 catalog metadata, SQLAlchemy
+`Inspector.get_columns()`, and BiSheng's shared `column_exists()` helper. Use it
+when Alembic reports that a column already exists after the helper reported it
+missing.
+
+Run inside an API or worker container from `/app`; the default target is
+`knowledge.metadata_fields`:
+
+```bash
+cd /app
+/app/.venv/bin/python scripts/diagnose_dm_column_reflection.py
+```
+
+Specify another target or override the schema inferred from `database_url`:
+
+```bash
+/app/.venv/bin/python scripts/diagnose_dm_column_reflection.py \
+  --schema BISHENG \
+  --table knowledge \
+  --column metadata_fields
+```
+
+The script never writes to the database. Exit `0` means reflection found the
+column, exit `2` confirms a catalog/reflection mismatch, exit `3` means the
+column is absent from the DM catalog, and exit `4` means the diagnostic itself
+failed.
+
+### `verify_mcp_stdio_blocked.py`
+
+Remote check that STDIO MCP is fail-closed after the 15025 freeze. Hits
+`POST /api/v1/tool/mcp/test` (must return business code 15025), optionally
+`POST /api/v1/tool/mcp/schema`, then `POST /api/v1/tool/mcp/refresh`. The probe
+payload uses a non-existent command name and does not create tools.
+
+```bash
+cd src/backend
+bash scripts/verify_mcp_stdio_blocked.sh --base-url http://HOST:7860 \
+  --username admin --password '***'
+
+BISHENG_PASSWORD='***' bash scripts/verify_mcp_stdio_blocked.sh \
+  --base-url http://HOST:7860 --username admin
+```
+
+Hosts with `use_captcha` (login error “验证码错误” / `Kode verifikasi salah`)
+write `mcp-stdio-login-captcha.png` and prompt, or take `--captcha AB12`.
+Alternatively copy `access_token_cookie` from the browser and pass `--token`.
+
+Exit `0` = required checks passed. `1` = login/network. `2` = `/mcp/test`
+(or `/mcp/schema`) did not return 15025. `3` = refresh still reconnected a
+saved STDIO tool.
+
+## Export Scripts
+
+### `export_daily_chat_messages.py`
+
+Export 日常模式（`flow_type = 15`）对话内容，默认导出最近 30 天消息并按会话聚合为 JSON。
+
+Usage:
+
+```bash
+PYTHONPATH=./ .venv/bin/python scripts/export_daily_chat_messages.py
+PYTHONPATH=./ .venv/bin/python scripts/export_daily_chat_messages.py --days 7
+PYTHONPATH=./ .venv/bin/python scripts/export_daily_chat_messages.py --format csv
+PYTHONPATH=./ .venv/bin/python scripts/export_daily_chat_messages.py --tenant-id 3
+PYTHONPATH=./ .venv/bin/python scripts/export_daily_chat_messages.py --full-session
+```
+
+Options:
+
+- `--config`: 指定配置文件，默认取环境变量 `config`，否则使用 `config.yaml`
+- `--days`: 最近多少天，默认 `30`
+- `--format`: `json` 或 `csv`
+- `--tenant-id`: 仅导出指定租户
+- `--user-id`: 仅导出指定用户
+- `--chat-id`: 仅导出指定会话
+- `--include-deleted`: 包含已删除会话
+- `--full-session`: 只要会话在时间窗口内活跃，就导出该会话的全部消息
+
+## Verification Scripts
+
+### `verify_open_mcp.py`
+
+Verify the F067 Streamable HTTP MCP endpoint with the official MCP client. The
+script initializes the connection, lists the tools visible to the supplied API
+key or PAT, compares them with an explicit expected profile in both directions, and can
+optionally invoke one of the three read-only tools. It never prints the
+credential and does not expose write or destructive calls.
+
+Run from `src/backend/`:
+
+```bash
+export BISHENG_MCP_URL=https://bisheng.example.com/api/v2/mcp
+export BISHENG_API_KEY='<full-scope-api-key>'
+.venv/bin/python scripts/verify_open_mcp.py --expected-profile full
+```
+
+Optional read-only smoke calls:
+
+```bash
+.venv/bin/python scripts/verify_open_mcp.py \
+  --expected-profile full \
+  --call-tool bisheng_knowledge_list \
+  --arguments-json '{"type":0,"page_size":1}'
+
+.venv/bin/python scripts/verify_open_mcp.py \
+  --expected-profile full \
+  --call-tool bisheng_knowledge_file_list \
+  --arguments-json '{"knowledge_id":123,"page_size":1}'
+```
+
+Use `--expected-profile pat` for a PAT, which must expose exactly the three
+read-only tools. `--expected-profile scope-filtered` is diagnostic-only for an
+intentionally restricted API key: it still rejects tools outside the F067
+allowlist, but does not prove that all ten release tools are present.
+
+```bash
+export BISHENG_API_KEY='<personal-access-token>'
+.venv/bin/python scripts/verify_open_mcp.py --expected-profile pat
+```
+
+For delegated service-account mode, add `--on-behalf-of <external-user-id>`.
+Use `--end-user <partition>` only for the existing end-user partition mode;
+the two headers are mutually exclusive. To keep secrets out of shell history
+and process arguments, the credential is accepted only through the environment
+variable named by `--api-key-env` (default `BISHENG_API_KEY`). Exit codes are
+`0` for success, `2` for missing/invalid local configuration, `3` for a
+connection/protocol failure, and `4` for an allowlist or tool-call failure.
+
+## Permission Scripts
+
+For an existing F048 installation, run the model publisher below in the release
+maintenance window even when its dry-run says the model is already current.
+Model equality does not establish that historical service-account resource
+markers exist. This is an explicit deployment operation: container startup,
+`alembic upgrade head`, and `scripts/deploy.sh update` do not run data repairs.
+
+For a first migration from pre-F048 ReBAC, use `migrate_f048_permission_data.py`;
+its resource projection already writes both `user:*` and `service_account:*`
+markers at every hierarchy level. Do not repeat the first migration to repair
+an existing F048 installation. Legacy RBAC environments must first complete
+the 2.5.x upgrade stage described below.
+
+### `repair_deleted_app_grants.py`
+
+Close the permission gate of hosted apps deleted before the 2026-09-16 delete
+fix (`AppStateService.delete` used to re-read the permission record after
+flipping the app to `deleted`, got 19003, and skipped the delete projection, the
+delete audit and the lifecycle hooks). F048's delete plan removes only the
+`permission_enabled` markers on the object; grant links, `custom_mode` and
+visible-projection tuples stay, as after deleting any F048 resource. The script
+lists deleted apps that still carry `permission_enabled` and, with `--apply`,
+projects the removal using the pre-deletion record. Dry-run is the default.
+
+```bash
+cd src/backend
+PYTHONPATH=./ .venv/bin/python scripts/repair_deleted_app_grants.py                  # list only
+PYTHONPATH=./ .venv/bin/python scripts/repair_deleted_app_grants.py --apply          # repair all
+PYTHONPATH=./ .venv/bin/python scripts/repair_deleted_app_grants.py --apply --app-id <app_id>
+```
+
+Exit code 1 means at least one app still has a `permission_enabled` marker after `--apply`.
+
+### `cleanup_f048_user_group_admin_grants.py`
+
+Audit and revoke resource Grant sources assigned to one user group's
+administrator userset (`user_group:<id>#admin`). The command does not change
+group administrator membership, ordinary member Grants, protected creator
+sources, or unrelated assignments. It retires selected assignee rows through
+the normal F048 Grant projection service so the SQL control plane, durable
+projection ledger, flattened `visible` sources, and OpenFGA tuples remain
+consistent.
+
+Run a dry-run first from `src/backend/` with the live `config`. The default
+batch contains at most 100 resources:
+
+```bash
+export config=config.yaml
+PYTHONPATH=./ .venv/bin/python \
+  scripts/cleanup_f048_user_group_admin_grants.py \
+  --tenant-id 1 \
+  --user-group-id 2
+```
+
+The report identifies the exact Store/model/Catalog pin, selected assignees,
+resource/model/source breakdown, blockers, remaining resource count, resume
+cursor, and `plan_checksum`. The safest apply mode requires a maintenance
+window: stop ingress and all API/Worker/Linsight processes, wait for F048
+heartbeat TTLs to expire, then repeat the same selection arguments with all
+confirmation values from the immediately preceding dry-run:
+
+```bash
+PYTHONPATH=./ .venv/bin/python \
+  scripts/cleanup_f048_user_group_admin_grants.py \
+  --tenant-id 1 \
+  --user-group-id 2 \
+  --apply \
+  --operator-id <operator-user-id> \
+  --confirm-store-id <store-id> \
+  --confirm-model-id <model-id> \
+  --confirm-plan-checksum <plan-checksum>
+```
+
+If the service cannot be stopped, an online apply is available only when the
+operator has confirmed that no new matching `user_group:<id>#admin` Grants can
+be created during the run. It processes resources serially, defaults to a
+100-ms delay between resources, and stops if the per-resource version or exact
+source identity changes concurrently:
+
+```bash
+PYTHONPATH=./ .venv/bin/python \
+  scripts/cleanup_f048_user_group_admin_grants.py \
+  --tenant-id 1 \
+  --user-group-id 2 \
+  --apply \
+  --online \
+  --delay-ms 100 \
+  --operator-id <operator-user-id> \
+  --confirm-store-id <store-id> \
+  --confirm-model-id <model-id> \
+  --confirm-plan-checksum <plan-checksum>
+```
+
+Maintenance apply refuses active F048 runtime heartbeats and in-flight
+projection operations. Both modes refuse non-current Grant/resource
+projections, non-`CUSTOM` resources, protected sources, changed candidates, or
+a mismatched confirmation. Use repeatable `--resource-type` filters for a
+narrower rollout. When the report has more resources, review the next dry-run
+with `--after-assignee-id` set to the last successful
+`resume_after_assignee_id`; never advance the cursor past a failed resource.
+For an explicitly reviewed full-type cleanup, `--max-resources` accepts up to
+50,000 resources while remaining bound to one exact plan checksum. `--quiet`
+suppresses routine runtime logs but keeps JSON reports and failures visible.
+
+Deleted assistant/workflow rows can leave an active permission mirror that the
+business resolver intentionally rejects. Such an orphan is blocked by default.
+After verifying the resource is absent, repeat both dry-run and apply with
+`--allow-orphan-applications`; the apply path asks the owning business loader to
+confirm absence before constructing a target from the CURRENT permission mirror
+and still uses the normal Grant/projection mutation.
+
+Unpublished knowledge spaces/libraries are also rejected by the normal visible
+target resolver. After verifying that these lifecycle states should have their
+administrator Grants retired, repeat dry-run and apply with
+`--allow-unpublished-knowledge-containers`. The fallback accepts only a valid
+record from the owning knowledge loader, requires a non-`PUBLISHED` status and
+an exact tenant/identity/version match, then continues through the normal
+Grant/projection mutation.
+
+Deleted knowledge containers require the separate
+`--allow-orphan-knowledge-containers` flag. The owning loader must confirm that
+the record is absent, while the permission mirror must remain CUSTOM/CURRENT
+with one consistent version and parent scope; the script then uses the same
+normal Grant/projection mutation.
+
+### `publish_authorization_model_change.py`
+
+Publish the OpenFGA Authorization Model generated by the current code and move
+the CURRENT Permission Catalog pin to it. Use this when the authorization-model
+DSL changed but the existing F048 control-plane actions/models and Grant data do
+not need a formal data migration, or when historical service-account resource
+markers need repair under the current model.
+
+Run dry-run first from `src/backend/` with the live `config`:
+
+```bash
+export config=config.yaml
+PYTHONPATH=./ .venv/bin/python scripts/publish_authorization_model_change.py
+```
+
+The report prints the current Store/model/Catalog pin, the latest OpenFGA model
+observed in the Store, the code-generated target model checksum, and whether a
+model publish or Catalog cutover is required. `service_account_marker_tuple_count`
+is the expected marker count from CURRENT SQL resource modes, not the number of
+missing tuples. Apply requires an explicit Store
+and checksum confirmation copied from the immediately preceding dry-run:
+
+```bash
+PYTHONPATH=./ .venv/bin/python scripts/publish_authorization_model_change.py \
+  --apply \
+  --confirm-store-id <store-id> \
+  --confirm-target-model-checksum <target-model-checksum> \
+  --operator-id <operator-user-id>
+```
+
+Apply refuses active F048 runtime heartbeats, in-flight permission projection
+operations, a write-fenced CURRENT Catalog, or a confirmation mismatch. It
+idempotently ensures `service_account:*` `permission_enabled` and the existing
+`custom_mode`/`inherit_mode` on every CURRENT resource, including nested folders
+and files, then verifies them with higher consistency. It preserves CUSTOM
+boundaries, existing parent edges, and per-account Grants. This also runs before
+the `already_current` result; `service_account_marker_tuples_verified` records
+successful verification. A write or verification failure exits nonzero.
+
+On the `already_current` path it also ensures the CURRENT Catalog's own
+`service_account:*` markers (`active`, and `enabled_marker` / `<action>_marker` /
+`grant_level_<n>_marker` on every model release), compiled with the same rule a
+publish uses; `service_account_catalog_marker_tuples_verified` records them. A
+Catalog released before service accounts joined the model (2026-09-09) carries
+only `user:*` markers there, so every action a service account receives through
+a model (edit, use, manage_permission ...) was denied until this ran. The user
+half of the Catalog is never touched.
+
+When the model changes, it publishes or reuses the immutable model in the same
+Store and its `authorization_model_release`. It verifies the markers against
+that target model before publishing a no-op Permission Catalog release bound
+to it and retiring older active model-release rows. It does not
+create or modify a formal `permission_migration_run`, does not rewrite Grants,
+and does not clean legacy tuples such as `public_reader`.
+Stop ingress and all API/Worker/Linsight processes before apply, wait for their
+runtime heartbeats to expire, and restart them only after success. Run the
+command from an independent maintenance process/container using the same live
+configuration. If canonical Grant visible projections also need rebuilding,
+use `reconcile_f048_visible_projection.py` instead.
+
+### `cleanup_f048_public_reader_tuples.py`
+
+Audit and delete stale `user:* public_reader -> knowledge_space:<id>` OpenFGA
+tuples written by older F048 public-space logic. Public square discovery is no
+longer a permission grant, so the hotfix model ignores these tuples; this
+script physically removes the old Store data after review.
+
+Run dry-run first from `src/backend/` with the live `config`:
+
+```bash
+export config=config.yaml
+PYTHONPATH=./ .venv/bin/python scripts/cleanup_f048_public_reader_tuples.py
+```
+
+The dry-run prints `store_id`, `model_id`, `stale_tuple_count`, the exact tuple
+list, and `cleanup_checksum`. Apply requires copying both confirmations from
+the immediately preceding dry-run:
+
+```bash
+PYTHONPATH=./ .venv/bin/python scripts/cleanup_f048_public_reader_tuples.py \
+  --apply \
+  --confirm-store-id <store-id> \
+  --confirm-cleanup-checksum <cleanup-checksum>
+```
+
+Use repeated `--object knowledge_space:<id>` flags for a scoped cleanup. Apply
+exits without deleting if the Store ID or checksum does not match.
+
+### `reconcile_f048_visible_projection.py`
+
+Audit and repair environments that already completed an older F048 data
+migration before the final flattened-visible and service-account marker design.
+The command also mirrors each CURRENT resource's `permission_enabled` and
+`custom_mode`/`inherit_mode` state to `service_account:*`. The command is
+available in production as well as development/test; safety comes from the
+same maintenance and consistency gates, not from an environment-name allowlist.
+
+Run dry-run first from `src/backend/` with the live `config`:
+
+```bash
+export config=config.yaml
+PYTHONPATH=./ .venv/bin/python scripts/reconcile_f048_visible_projection.py
+```
+
+The JSON report includes canonical Grant/assignee source counts, persisted
+source differences, service-account resource marker counts, and the
+deduplicated expected tuple count/checksum. Add an explicit Store scan to
+report missing and orphan direct `visible` tuple keys:
+
+```bash
+PYTHONPATH=./ .venv/bin/python scripts/reconcile_f048_visible_projection.py \
+  --audit-orphan-tuples \
+  --orphan-object folder:97394
+```
+
+The audit treats the union of canonical Grant sources and every ACTIVE SQL
+visible-source contribution as supported, so non-Grant system/resource sources
+are not classified as orphans. With `--orphan-object`, it uses an exact OpenFGA
+Read for those resources and prints the scoped anomaly set plus a stable cleanup
+checksum. Repeat the flag to select more than one reviewed resource. Omit it to
+scan the whole Store and select every audited orphan.
+
+For apply, stop ingress traffic and all API/Worker/Linsight processes, wait for
+their F048 heartbeat TTL to expire, and copy the dry-run `store_id` into the
+explicit confirmation:
+
+```bash
+PYTHONPATH=./ .venv/bin/python scripts/reconcile_f048_visible_projection.py \
+  --apply \
+  --confirm-store-id <store-id> \
+  --operator-id <operator-user-id> \
+  --allow-model-upgrade
+```
+
+`--allow-model-upgrade` is required only when dry-run reports that CURRENT
+still points at an older F048 model. Apply exits with code `3` before writing
+when Store confirmation differs, a runtime heartbeat or projection operation
+is active, the CURRENT Catalog has an unrelated/non-resumable fence, canonical
+SQL data is incomplete, or stale source projections would require a classified
+revocation. It publishes/reuses the final immutable model in the same Store,
+ensures every Grant-derived direct `visible` tuple and service-account resource
+state marker in batches of at most 90 with OpenFGA duplicate-ignore semantics,
+verifies them with higher consistency, then activates the rebuilt Grant source
+rows and publishes a no-op Catalog release bound to the new Authorization Model
+release. It does not create or modify a formal `permission_migration_run`.
+Re-running after an interruption is forward-only and idempotent.
+
+To delete reviewed orphan tuple keys, keep the maintenance window in place and
+copy both `store_id` and `orphan_tuple_checksum` from the immediately preceding
+dry-run:
+
+```bash
+PYTHONPATH=./ .venv/bin/python scripts/reconcile_f048_visible_projection.py \
+  --apply \
+  --audit-orphan-tuples \
+  --orphan-object folder:97394 \
+  --cleanup-orphan-tuples \
+  --confirm-orphan-checksum <orphan-tuple-checksum> \
+  --confirm-store-id <store-id> \
+  --operator-id <operator-user-id>
+```
+
+Cleanup is an independent operation: it does not backfill or retire SQL source
+rows and does not publish an Authorization Model/Catalog release. It is refused
+if the selected orphan set changes. Each resource is fenced by its current
+permission version, each exact delete is recorded as a
+`VISIBLE_ORPHAN_CLEANUP` projection operation, and higher-consistency reads must
+confirm that no selected orphan direct tuple remains. Other unselected anomalies
+are untouched. Effective `visible` checks can still be true through an inherited
+parent; the audit verifies exact direct tuple presence instead.
+Restart all permission-using processes after success; they discover the latest
+model through the stable Store name and validate the new SQL CURRENT Catalog
+pin.
+
+### `reconcile_f048_projection_operations.py`
+
+Inspect and recover explicitly selected F048 permission projection ledger
+operations. The script validates tenant ownership, the live Catalog/OpenFGA
+Store and model pin, durable tuple rows, and the resource projection fence. It
+then delegates recovery to the normal projection reconciler; it never updates
+ledger status or OpenFGA tuples directly.
+
+Run from `src/backend/` with the same `config` value as the live service. The
+default is dry-run:
+
+```bash
+export config=config.yaml
+PYTHONPATH=./ .venv/bin/python \
+  scripts/reconcile_f048_projection_operations.py \
+  --tenant-id 1 11 15 18
+```
+
+After reviewing every `preflight` record, apply the recovery:
+
+```bash
+PYTHONPATH=./ .venv/bin/python \
+  scripts/reconcile_f048_projection_operations.py \
+  --tenant-id 1 11 15 18 --apply
+```
+
+The command exits with code `3` without writing if an operation is from a
+different tenant, uses a different Store/model pin, has an incomplete ledger,
+is `FAILED_CLOSED`, or no longer owns the expected resource projection fence.
+Exit code `4` indicates an unexpected runtime/infrastructure failure. Re-run
+is safe: already `FINALIZED` operations are verified and skipped. Catalog
+publish should only be retried when the final `remaining_active` report is
+empty.
+
+### `reconcile_f048_system_owned_resources.py`
+
+Audit and repair missing F048 projections for business-verified platform
+resources. The current inventory covers preset tool categories
+(`is_preset=1 AND is_delete=0`), regardless of historical `user_id`. Preset dashboards are intentionally
+excluded: they are ordinary resources owned by the first super administrator.
+The reconciler does not infer system ownership from the resource-type
+allowlist alone.
+
+The default dry-run reports missing/non-current modes. CURRENT resources retain
+their current authorization, including a revoked all-member grant. Bootstrap
+never requires or restores legacy public `user:*` visibility/use markers.
+`missing_count` counts resources without a mode.
+Dry-run writes no permission modes, operations, grants, or tuples:
+
+```bash
+export config=config.yaml
+PYTHONPATH=./ .venv/bin/python \
+  scripts/reconcile_f048_system_owned_resources.py
+```
+
+After reviewing the Store ID and exact resource list, apply with an explicit
+Store confirmation and audit operator:
+
+```bash
+PYTHONPATH=./ .venv/bin/python \
+  scripts/reconcile_f048_system_owned_resources.py \
+  --apply \
+  --confirm-store-id '<dry-run store_id>' \
+  --operator-id 1
+```
+
+Apply calls `authorize_system_owned` only for absent modes, creating a revocable
+all-member grant for the owning tenant through the durable projection protocol.
+CURRENT resources are not changed. Non-CURRENT resources remain blocked and
+must be recovered through the ordinary operation/FAILED_CLOSED recovery scripts.
+
+For an existing installation upgrading from public markers, use the explicit
+`migrate_capability_authorization.py` procedure after publishing the matching
+authorization model and Catalog. This bootstrap command does not migrate or
+reset existing grants and does not audit actual tuples against the SQL ledger.
+
+### `recover_f048_failed_closed_projection.py`
+
+Forward-recover one explicitly selected F048 resource operation that has
+already entered `FAILED_CLOSED`. This is separate from ordinary reconcile: it
+uses the operation ledger's frozen AFTER state, reads the exact live tuples
+with higher consistency, and proposes only the missing writes and surplus
+deletes. It never derives authorization intent from staged SQL rows and never
+updates SQL or OpenFGA directly.
+
+Run a dry-run first from `src/backend/` with the same `config` as the service:
+
+```bash
+export config=config.yaml
+PYTHONPATH=./ .venv/bin/python \
+  scripts/recover_f048_failed_closed_projection.py \
+  --tenant-id 1 \
+  --resource-type knowledge_space \
+  --resource-id 4166
+```
+
+The dry-run prints the live Store/model pins and a
+`recovery_confirmation_checksum` bound to the exact correction proposal. Copy
+those three values into the apply command:
+
+```bash
+PYTHONPATH=./ .venv/bin/python \
+  scripts/recover_f048_failed_closed_projection.py \
+  --tenant-id 1 \
+  --resource-type knowledge_space \
+  --resource-id 4166 \
+  --apply \
+  --confirm-store-id '<dry-run store_id>' \
+  --confirm-model-id '<dry-run model_id>' \
+  --confirm-recovery-checksum '<dry-run recovery_confirmation_checksum>'
+```
+
+The script resolves the active operation from the resource mode row; operators
+do not need to discover or enter an operation ID. The resolved ID remains in
+the dry-run output for audit. Apply is refused when tenant, resource scope,
+operation ownership, expected
+version, CURRENT Catalog Store/model pin, durable ledger checksum, or the live
+tuple proposal changed after dry-run. The correction must fit one atomic
+OpenFGA write (at most 90 tuples). Only resource scopes are supported; external
+business-owned scopes such as department remain manual-analysis cases. A
+successful run higher-consistency verifies the full AFTER state, finalizes the
+staged SQL rows, advances the resource version, and ends at
+`operation=FINALIZED` plus `resource projection_state=CURRENT`. Re-running a
+finalized operation only verifies and skips it.
+
+### `migrate_f048_permission_data.py`
+
+Legacy `user_group:<id>#admin` resource `manager`/`can_manage` tuples are
+retired with an INFO audit item instead of becoming F048 Grants or visible
+contributions. User groups no longer grant resource management separately to
+administrators. These tuples are not reassigned to `#member`; existing member
+Grants and protected resource creators still migrate normally. The retired
+F006 RBAC-to-ReBAC scripts are no longer shipped on this release line.
+
+Formal, forward-only migration from the legacy relation-model Config and
+resource tuples to the F048 Catalog / Model / Grant control plane. This is the
+only F048 business-data migration entry point. Alembic remains DDL-only, and
+the service never invokes this script from API startup, Celery, or Linsight.
+
+Upgrade prerequisite for legacy RBAC environments:
+
+1. Upgrade to a 2.5.x release that ships F006. Follow that release's schema
+   and data-upgrade instructions, then run its F006 RBAC-to-ReBAC migration
+   and verification. Require zero permission regressions and verify resource
+   access with a non-admin account before continuing.
+2. Upgrade from the verified 2.5.x environment to the target release while
+   retaining its database and OpenFGA Store, then run the F048 migration and
+   verification below. F048 consumes the existing ReBAC tuples; it does not
+   replace F006's conversion of legacy `roleaccess` rows.
+
+Do not skip the 2.5.x stage for a pure RBAC environment or restore/run F006
+inside an F048 deployment. Existing pre-F048 ReBAC environments that have
+already completed F006 do not need to repeat that stage.
+
+Run every command from `src/backend/` with the same `config` value as the live
+deployment.
+
+Normal Compose upgrade flow:
+
+```bash
+docker compose pull
+docker compose up -d
+docker exec -it <backend-container> bash
+
+cd /app
+PYTHONPATH=./ .venv/bin/python scripts/migrate_f048_permission_data.py migrate --apply
+PYTHONPATH=./ .venv/bin/python scripts/migrate_f048_permission_data.py verify --run-id <run-id>
+exit
+
+docker compose restart backend backend_worker
+```
+
+Migration traffic control is an operator responsibility; the application does
+not couple `/health` or a global HTTP/WebSocket middleware to F048 migration
+state. If the deployment splits Celery/Linsight into additional Compose
+services, include all backend process services in the final restart.
+API, Celery, and Linsight register the permission runtime as a lazy application
+Context; Store/model/Catalog validation and the ready heartbeat begin only on
+the first permission operation in that process. Department projection is a
+separate lazy Context and initializes only on the first department mutation
+that needs an OpenFGA projection.
+
+#### D0/D1 prerequisites
+
+1. Update the backend image and start the normal Compose services. Before
+   migration, use the deployment platform or ingress to stop business traffic.
+   When the latest OpenFGA model is still the predecessor model,
+   API/Worker/Linsight do not initialize the F048 permission runtime or publish
+   a ready heartbeat. Celery/Linsight task consumption remains paused until the
+   post-migration restart. Use the migration command output and exit code as the
+   authoritative operational status; `/health` remains a process-liveness
+   check.
+2. Enter the backend container. Confirm the configured stable OpenFGA Store
+   name. The script discovers the unique matching Store and latest source
+   model, persists both IDs in the durable migration run, and prints them for
+   the change ticket; operators do not query or copy them into configuration.
+3. The API entrypoint has already run `alembic upgrade head`. Verify the
+   database revision and the single code head:
+
+   ```bash
+   export config=config.yaml
+   PYTHONPATH=./ .venv/bin/alembic current
+   PYTHONPATH=./ .venv/bin/alembic heads
+   ```
+
+   Both commands must identify `f048_visible_source_projection` as the head.
+   Its predecessor `f048_migration_item_message_longtext` widens the frozen
+   source payload column before the data script records large legacy Config
+   values; the head then creates the single-slot visible source projection
+   table required by migration and D4 verification.
+4. Do not proceed if Redis is unavailable, a ready F048 runtime heartbeat
+   remains, dashboard tenant attribution is ambiguous, an unresolved failed
+   tuple exists, or the source watermark changes between scans.
+
+No Store/model ID or manual stop acknowledgement is required. The script
+checks schema, the unique named Store, Redis readiness heartbeats, and two
+identical source scans.
+
+#### D2/D3 migrate
+
+From the started backend container, use its normal OpenFGA
+connection/Store-name configuration:
+
+```bash
+export config=config.yaml
+PYTHONPATH=./ .venv/bin/python scripts/migrate_f048_permission_data.py \
+  migrate \
+  --apply
+```
+
+The command creates one durable run, publishes one new immutable model in the
+same Store, writes SQL rows in batches of at most 500 and OpenFGA tuples in
+batches of at most 90, verifies target tuples with higher consistency, then
+removes only the recorded legacy tuples. The two legacy Config rows remain
+read-only as migration/debug evidence and are never used by the F048 runtime.
+The script prints the run ID; record it in the change ticket.
+
+If the process exits before `VERIFYING`, leave the automatic migration gate in
+place, fix the forward path, and resume the same run:
+
+```bash
+PYTHONPATH=./ .venv/bin/python scripts/migrate_f048_permission_data.py \
+  migrate \
+  --run-id <run-id> \
+  --apply
+```
+
+Resume uses the frozen source facts stored in `permission_migration_item`; it
+does not infer a new plan from a partially rewritten Store. Repeating a
+completed batch is idempotent.
+
+#### D4 verify and runtime discovery
+
+After migrate reports `VERIFYING`, leave the automatic migration gate in place
+and do not restart the processes yet. Do not query Store/model/Catalog tables
+for values to copy into configuration. The migration always reuses the durable
+Store, source model and target model pinned by the original run; operators
+cannot replace them with command-line parameters. Then run:
+
+```bash
+PYTHONPATH=./ .venv/bin/python scripts/migrate_f048_permission_data.py \
+  verify --run-id <run-id>
+```
+
+Verification independently rebuilds source and target checksums, requires one
+traceable visible contribution for every legal assignee, validates the
+deduplicated direct `visible` aggregate and complete streamed enumeration,
+checks high-risk dashboard/download semantics, preserves allowed Store facts,
+requires the run target release to be the one referenced by the SQL CURRENT
+Catalog, and requires unattributed visible tuples, legacy tuples and blockers
+to be zero. The report still records the retained legacy Config count for
+audit, but that count does not block verification. Success moves the run to
+`READY_TO_START`; restart API and Worker processes so they discover the new
+F048 model and automatically remove the migration gate.
+
+At D5 each process resolves the unique Store by stable `store_name`, selects
+its latest model, and requires the discovered Store/model/checksum to equal the
+ACTIVE authorization release referenced by the SQL CURRENT Catalog. Each
+Check/List/Write then sends that resolved model ID explicitly. A duplicate
+Store name or missing Store/model still fails startup. A predecessor checksum
+keeps the process alive but not ready for the explicit migration; after the
+post-migration restart, any model/Catalog mismatch fails readiness.
+
+There is no preview, dry-run, cleanup, rollback, Store replacement,
+intermediate permission model, relation-slot switch, second migration, or
+automatic API/Celery startup migration. A failure keeps maintenance active and
+is repaired only by a forward fix against the same run and target model.
+
+Exit codes:
+
+- `0`: command completed successfully
+- `3`: a migration or verification safety gate blocked progress
+- `4`: unexpected runtime/infrastructure failure; traceback is printed
+
+### `upgrade_f048_authorization_model.py` / `.sh`
+
+Makes the F054 **`app`** resource type effective on an environment that has
+**already** run the F048 migration. A fresh install needs nothing — the model is
+built from the constants at first boot — but an existing one needs this, for two
+independent reasons:
+
+- adding `app` changes the authorization-model checksum, so every process boots
+  into `migration_required` and answers 503 for **all** permission checks until
+  the SQL pin is moved deliberately;
+- `permission_action_resource_scope` is written only by the first migration and
+  by a Catalog draft publish, and no `CatalogChangeType` can change an action's
+  `resource_types` — so without a backfill `is_action_effective("app", …)` is
+  false forever and every check raises `InvalidCatalogActionError`.
+
+Four steps: publish (or adopt) the model in the store, insert the new ACTIVE
+`authorization_model_release` and retire the old one, re-point the CURRENT
+`permission_catalog_release`, backfill the `app` scope rows. Steps 2-4 share one
+transaction; step 1 is an HTTP write and cannot join it.
+
+```bash
+cd src/backend/
+export config=config.yaml            # same value the live service runs with
+
+bash scripts/upgrade_f048_authorization_model.sh              # plan — writes nothing
+bash scripts/upgrade_f048_authorization_model.sh apply
+bash scripts/upgrade_f048_authorization_model.sh verify
+bash scripts/upgrade_f048_authorization_model.sh rollback     # re-point SQL back
+```
+
+Operational notes:
+
+- **Restart every process after `apply` or `rollback`** — API, celery x3, beat,
+  linsight worker. Heartbeats are re-checked every 15 s (TTL 45 s): a process
+  left running fails closed rather than continuing to serve.
+- **Ship the code before adding a new `config.yaml` key.** `load_settings_from_yaml`
+  raises `KeyError` on an unknown top-level key, so adding `app_runtime:` ahead
+  of the code stops the backend from starting.
+- `apply` is idempotent — it locates an existing model by canonical checksum, so
+  a re-run reports `noop` instead of publishing a duplicate. It refuses to run
+  while permission runtime heartbeats are live unless `--allow-live` is given.
+- `rollback` re-points SQL and removes the `app` scope rows. The published model
+  **stays in the store** (OpenFGA models are immutable); it becomes an orphan
+  nobody pins, which is harmless exactly because `apply` matches by checksum.
+
+Exit codes: `0` success, `3` a safety gate blocked progress, `4` unexpected
+runtime failure.
+
+### `benchmark_f048_permission_paths.py`
+
+Reproducible BENCH-01 harness for the single F048 OpenFGA model. It prepares a
+deterministic dataset in an operator-created benchmark Store, then measures
+Check, BatchCheck 20/50/100, ListObjects direct/department/group/inherit/
+multi-grant and 10/100/1000 result sets, plus the default business
+cursor+BatchCheck path. The report contains P50/P95/P99, result checksums,
+error rate, and request-correlated OpenFGA `dispatch_count` /
+`datastore_query_count`.
+
+The script refuses production environment names, never creates or switches a
+Store, never runs data migration, and never maintains an old/new model pair.
+`prepare` writes only a new F048 model and the benchmark namespace into the
+explicit Store. Use a disposable Store.
+
+The repository fixture
+`test/permission/fixtures/f048_bench_contract.synthetic.json` is checksum-pinned
+but explicitly synthetic. It only validates the harness. A formal release
+BENCH-01 run must replace it with a checksum-pinned, production-derived
+sanitized distribution; `--allow-synthetic` can never produce
+`release_ready=true`.
+
+Prepare from `src/backend/`:
+
+```bash
+PYTHONPATH=./ .venv/bin/python scripts/benchmark_f048_permission_paths.py \
+  prepare \
+  --environment performance \
+  --api-url http://127.0.0.1:8080 \
+  --store-id <dedicated-benchmark-store> \
+  --expected-contract-checksum <fixture-checksum> \
+  --apply
+```
+
+Capture OpenFGA JSON logs for only the benchmark window, then run the model ID
+printed by `prepare`:
+
+```bash
+PYTHONPATH=./ .venv/bin/python scripts/benchmark_f048_permission_paths.py \
+  run \
+  --environment performance \
+  --api-url http://127.0.0.1:8080 \
+  --store-id <same-benchmark-store> \
+  --model-id <f048-model-id> \
+  --fixture <production-derived-sanitized-fixture.json> \
+  --expected-contract-checksum <fixture-checksum> \
+  --openfga-log <openfga-benchmark.jsonl> \
+  --output <bench-01-report.json>
+```
+
+Exit codes:
+
+- `0`: all performance/semantic/observability gates passed
+- `2`: unsafe environment, invalid fixture, or checksum/pin mismatch
+- `3`: a measured gate failed or the fixture is not release-eligible
+- `4`: unexpected runtime/infrastructure failure
+
+> F048 business-data conversion has exactly one entry point:
+> `migrate_f048_permission_data.py`. Legacy relation-template and permission
+> repair CLIs were removed because they cannot run against the F048 model.
+
+### `migrate_workstation_models_to_workbench.py`
+
+One-off migration for moving the legacy daily-workbench model list from the
+global `config.key = "workstation"` row into the default tenant's
+`tenant_system_model_config.key = "linsight_llm"` row.
+
+Behavior:
+
+- reads `workstation.models` from `config`
+- writes only to default tenant `tenant_id = 1`
+- if Root already has `linsight_llm`, merges by updating only `models`
+- if Root does not have `linsight_llm`, creates a new row
+- preserves legacy `workstation.models`; later UI save flows can handle cleanup/overwrite
+
+Usage:
+
+```bash
+PYTHONPATH=./ .venv/bin/python scripts/migrate_workstation_models_to_workbench.py
+PYTHONPATH=./ .venv/bin/python scripts/migrate_workstation_models_to_workbench.py --apply
+
+bash scripts/migrate_workstation_models_to_workbench.sh
+bash scripts/migrate_workstation_models_to_workbench.sh apply
+```
+
+Options:
+
+- `--apply`: perform writes; default is dry-run
+
+Legacy F006/F033/F034/F040 permission migration, relation-model backfill, and
+channel-member repair CLIs were removed by F048. They target retired
+`permission_id`/relation-template/Config semantics and are not valid after the
+formal F048 migration. Historical feature documents may still describe the
+commands that existed in those releases; do not reconstruct or run them on an
+F048 deployment.
+
+## Linsight Scripts (F035)
+
+### `migrate_sop_to_skill.sh` / `migrate_sop_to_skill.py`
+
+> **Upgrade-required (< v2.6 → v2.6, F035 step 4 of 4) — MANUAL.** Run after
+> `alembic upgrade head`. Unlike the F035 menu/model backfills (steps 2/3, which
+> auto-run at startup), this SOP→Skill data migration is **not** auto-run — it
+> writes object storage and is heavier, so it stays a manual ops script. Part of
+> the F035 upgrade checklist — see `docs/architecture/08-deployment.md` → 升级 checklist.
+
+One-shot migration of legacy `linsight_sop` rows into tenant custom skills
+(a `linsight_skill` row + its bundle object in storage).
+`display_name` keeps the original (Chinese) SOP name; the skill ID is a
+pypinyin slug; `metadata.sop-id` makes re-runs idempotent. The skill description
+uses the SOP's own description, falling back to the SOP name when absent (no LLM
+call — a skill description is mandatory and can never be blank). Prints and writes
+a JSON migration summary (ops artifact — there is no in-product migration report).
+
+Usage (from `src/backend/`, dry-run by default):
+
+```bash
+bash scripts/migrate_sop_to_skill.sh                       # dry-run, all tenants
+bash scripts/migrate_sop_to_skill.sh apply                 # persist
+bash scripts/migrate_sop_to_skill.sh --tenant-id 2 apply   # single tenant
+```
+
+Options: `--apply` (persist), `--tenant-id <id>`,
+`--report-file <path>` (default `./migrate_sop_to_skill_report.json`).
+
+### `migrate_skills_to_object_storage.py`
+
+> **Upgrade-required (→ v3.0) — run on EVERY host that has served the API.**
+> Startup performs a deliberately narrow version of this automatically; the script
+> is what resolves everything the self-heal refuses to guess at. See
+> `docs/architecture/08-deployment.md` → 升级 checklist.
+
+Skill bundles used to be authoritative on the node's local disk, so an upgraded
+deployment has rows whose `content_hash` is empty and whose bytes exist only on
+whichever host wrote them — those skills silently fail to load. This publishes
+them to object storage and repoints the row.
+
+The startup self-heal only publishes a bundle whose local byte count matches what
+the row recorded, and skips `source='builtin'` rows (the seeder republishes those
+from the image). Anything else — a size mismatch, or a bundle held by a different
+host — is logged **by name** and left for this script.
+
+Idempotent: a row that already resolves is skipped; publishing the same bundle
+twice writes the same content-addressed object. Dry-run by default.
+
+```bash
+PYTHONPATH=./ .venv/bin/python scripts/migrate_skills_to_object_storage.py             # dry-run
+PYTHONPATH=./ .venv/bin/python scripts/migrate_skills_to_object_storage.py --apply
+```
+
+Options: `--apply`, `--tenant-id <id>`, `--legacy-root <path>` (defaults to
+`linsight_conf.skills_root`). Prints a JSON report; a non-empty `unresolved` list
+means those bundles live on another host — run it there too.
+
+### `restore_skills_to_local.py`
+
+> **Rollback aid only.** Needed before rolling BACK to a release that reads skill
+> bundles from `SKILLS_ROOT` instead of object storage.
+
+Writes every skill bundle back to the legacy on-disk layout. Skills created or
+edited while the newer release was running exist only as objects; the older code
+looks on local disk, finds nothing, and — because that path only warns — the skill
+silently stops working. Run on every host that will serve the older release.
+
+```bash
+PYTHONPATH=./ .venv/bin/python scripts/restore_skills_to_local.py             # dry-run
+PYTHONPATH=./ .venv/bin/python scripts/restore_skills_to_local.py --apply
+```
+
+### `backfill_linsight_task_mode_web_menu.py`
+
+> **F035 step 3 of 4 — AUTO at startup.** Runs automatically on service startup
+> (`main.lifespan`, idempotent, failure never blocks boot); shared logic in
+> `bisheng/permission/domain/linsight_task_mode_menu_backfill.py`. This CLI is only
+> for a manual re-run or dry-run preview. See `docs/architecture/08-deployment.md` → 升级 checklist.
+
+Grants WEB_MENU `linsight_task_mode` to every role that already has `home`.
+F035 split 任务模式 (`/linsight`) out of the shared `home` menu permission into
+its own sub-toggle; without this backfill, upgraded deployments would lose
+任务模式 access for existing roles (the route guard now checks
+`linsight_task_mode`). Idempotent & re-runnable; dry-run by default.
+
+Usage (from `src/backend/`):
+
+```bash
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/backfill_linsight_task_mode_web_menu.py            # dry-run
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/backfill_linsight_task_mode_web_menu.py --apply    # write
+```
+
+### `migrate_linsight_task_model_to_default.py`
+
+> **F035 step 2 of 4 — AUTO at startup.** Runs automatically on service startup
+> (`main.lifespan`, idempotent, failure never blocks boot); shared logic in
+> `bisheng/llm/domain/services/linsight_default_model_backfill.py`. This CLI is only
+> for a manual re-run or dry-run preview. See `docs/architecture/08-deployment.md` → 升级 checklist.
+
+F035 Track E (deepagents). Rewrites every tenant's `linsight_llm` config row in
+`tenant_system_model_config`: drops the legacy `task_model` / `linsight_executor_mode`
+keys and sets the new single `linsight_default_model_id` (keeps the old
+`task_model.id` when it still exists in the row's `models` list, otherwise falls
+back to the first model id, or empty when `models` is empty). JSON is parsed in
+Python (no `JSON_EXTRACT`) for DM8/MySQL compatibility. Idempotent (rows without
+`task_model` are skipped) & re-runnable; dry-run by default.
+
+Usage (from `src/backend/`):
+
+```bash
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/migrate_linsight_task_model_to_default.py            # dry-run
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/migrate_linsight_task_model_to_default.py --apply    # write
+```
+
+### `backfill_workbench_upgrade.py`
+
+> **v3.0 upgrade — AUTO at startup.** Both steps run on service startup
+> (`main.lifespan`, idempotent, failure never blocks boot). This CLI is for a
+> dry-run preview or a manual re-run. See `docs/architecture/08-deployment.md` → 升级 checklist.
+
+Carries pre-3.0 workbench model settings into the 3.0 model settings:
+
+1. **Daily-mode default model** — a `linsight_llm` row whose `chat_default_model_id` is
+   absent or `null` gets the last listed model, which is what the 2.x client opened daily
+   chat with (and what the 3.0 client still falls back to when no default is set).
+2. **User-selectable model visibility** — each active tenant's workbench models become
+   "visible to all members". Runs once per tenant (audit
+   `migration:workbench-visibility-v1`), so an admin's later edits are kept. A tenant that
+   already has any `dsh_model_visibility` row is skipped (its admin already manages
+   visibility); pass `--include-configured-tenants` to fill only its unconfigured models.
+   A tenant holding unmigrated legacy DSH grants is skipped: run
+   `scripts/dsh/migrate_unified_credits.py` for it first, then rerun this script.
+
+Usage (from `src/backend/`):
+
+```bash
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/backfill_workbench_upgrade.py            # dry-run
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/backfill_workbench_upgrade.py --apply    # write
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/backfill_workbench_upgrade.py --apply --tenant-id 2 --actor-id 1
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/backfill_workbench_upgrade.py --apply --tenant-id 2 --include-configured-tenants
+```
+
+### `seed_overflow_skill.py`
+
+> **Dev/QA fixture — NOT part of any upgrade checklist.** Seeds ONE throwaway
+> "overflow QA" skill whose fields are pushed to their limits so the skill-detail
+> drawer (`SkillDetailSheet.tsx`, 2026-06-16 overflow hardening, Track I) can be
+> eyeballed. Idempotent (re-run replaces the same skill); `--remove` deletes it.
+
+Inserts a skill into the target tenant (default 1) with `display_name`=255 chars,
+`name`=64 chars, `description`=1024 chars (no spaces), a SKILL.md body carrying a
+400-char unbroken token, and a long-named bundle asset — covering all four
+overflow points (title / ID chip / description / preview) plus the file tree.
+Manual-verification checklist: `features/v2.6.0/035-linsight-task-mode/tasks.md` → TI-1.
+
+Usage (from `src/backend/`):
+
+```bash
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/seed_overflow_skill.py            # dry-run
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/seed_overflow_skill.py --apply    # create
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/seed_overflow_skill.py --remove   # clean up
+```
+
+## Tenant / Data Fix Scripts
+
+### `migrate_f068_knowledge_chat_entries.py`
+
+F068 知识空间历史会话入口迁移。脚本只访问数据库，扫描指定会话租户（不传
+`--tenant-id` 时扫描全部租户）的全部知识空间 session，识别原资源已删除或已移出
+原空间的活动会话，并把 `message_session.entry_flow_id` 指向原空间根目录。脚本不会
+改写 session/message/citation 的内容 `flow_id`，也不会初始化 OpenFGA、Redis、Milvus
+或 Elasticsearch。
+
+默认 dry-run，输出不含密码的数据库身份、稳定 manifest SHA-256、分类计数和掩码后的
+chat 样例。先处理所有 `unparseable`、`cross_tenant_conflict` 和非法 entry blocker，
+再复制 dry-run 的 SHA 执行 apply。apply 按 `--batch-size` 独立提交，并把同一 manifest
+hash 与最后完成的 `(tenant_id, chat_id)` 写入 checkpoint；可用同一命令续跑。原知识
+空间已删除的会话只计入非阻断的 `deleted_space_skipped`，不写 entry。
+
+> 前置：先执行包含 `f068_knowledge_chat_entry` 的 `alembic upgrade head`。运行期间应保持
+> 资源迁移/删除和知识空间会话写入入口关闭，避免 dry-run 与 apply 之间输入变化。
+
+Usage (from `src/backend/`):
+
+```bash
+export config=config.yaml
+PYTHONPATH=./ .venv/bin/python scripts/migrate_f068_knowledge_chat_entries.py --tenant-id 3
+
+PYTHONPATH=./ .venv/bin/python scripts/migrate_f068_knowledge_chat_entries.py \
+  --tenant-id 3 \
+  --apply \
+  --expected-input-sha256 <dry-run-sha256> \
+  --batch-size 500 \
+  --checkpoint-file /var/lib/bisheng/f068-tenant-3.checkpoint.json
+```
+
+### `backfill_message_citation_relations.py`
+
+把历史 `message_citation.message_id` 回填到新的 `message_citation_relation` 关联表，使同一个全局 `citation_id` 可以被多条工作流输出消息复用。脚本默认 dry-run、分批执行且幂等；必须在升级后的服务已经创建 `message_citation_relation` 表后运行。
+
+可选 `--recover-markers` 会额外扫描消息正文中的引用标记，恢复旧版本中“消息已提交、随后引用唯一键冲突”留下的关联。恢复时会校验 `chat_id/flow_id`，找不到引用实体或作用域不匹配的标记只统计、不写入。
+
+Usage (from `src/backend/`):
+
+```bash
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/backfill_message_citation_relations.py
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/backfill_message_citation_relations.py --recover-markers --apply
+
+# 或用 shell 包装（自动探测解释器 / PYTHONPATH / config）：
+bash scripts/backfill_message_citation_relations.sh
+bash scripts/backfill_message_citation_relations.sh --recover-markers apply
+```
+
+### `dedupe_gpts_tools.py`
+
+清理同一租户下 `(tool_key, tenant_id)` 重复的**预置**工具 / 工具类型行。历史上"复制内置工具到子租户"未显式带 `tenant_id`，在 root 上下文下被 `server_default=1` 盖成 root，加上 `t_gpts_tools.tool_key` 当时没有唯一约束，导致 root 下同一 `tool_key` 堆了多份（如 `web_search` ×3）。这会让 `get_tool_by_tool_key().first()` 解析到非预期的那条（工作流读到旧配置），也会阻止后续添加 `UNIQUE(tool_key, tenant_id)` 约束。
+
+行为：每组保留最小 id 为 canonical，重定向 `assistantlink.tool_id`、`t_gpts_tools.type` 到 canonical，硬删 stray 行。非预置（自定义 API/MCP）重复**只报告不删除**。工作台配置 JSON / OpenFGA 中对 stray id 的引用也只报告，需人工跟进。
+
+Usage (from `src/backend/`，**apply 前先备份数据库**):
+
+```bash
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/dedupe_gpts_tools.py           # dry-run（默认，不写库）
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/dedupe_gpts_tools.py --apply    # 执行清理（硬删 + 重定向引用）
+```
+
+apply 干净后再手动加约束：
+
+```sql
+ALTER TABLE t_gpts_tools ADD CONSTRAINT uk_gpts_tools_key_tenant UNIQUE (tool_key, tenant_id);
+```
+
+### `converge_media_no_asr_transcript.py`
+
+收敛"识别为空却入库成功"的音视频知识文件。历史 bug：ASR 返回 200 但没有识别出任何句子（`output: null`）时，`str(RecognitionResult)` 整个 JSON 信封（`{"status_code": 200, "request_id": ...}`）被当作识别文本入库，文件被标记为解析成功、可点开预览，识别文本显示这串 JSON 垃圾。服务端已修复（`_call_aliyun_asr` 不再回退到 `str(result)`，无识别文本时抛 10956）；本脚本把存量脏数据统一收敛为与其他"未检测到可识别音频"一致的失败态。
+
+行为：扫描媒体后缀且 `status=SUCCESS` 的 `knowledgefile`，下载其 MinIO 转写预览（`preview/{id}.md`）判断入库文本；若为空或为原始 JSON 信封 → 删除该文件的 Milvus/ES 向量（保留 MinIO 源文件，可重新解析/下载），并置 `status=FAILED`、`remark=10956 错误 JSON`（前端据此显示"失败"徽标 + 悬浮原因，且不可点开）。无预览文件的 SUCCESS 行只报告不动。幂等：收敛后的行不再命中 `status=SUCCESS` 条件，可重复运行。
+
+Usage (from `src/backend/`，需 MinIO/Milvus/ES 可达):
+
+```bash
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/converge_media_no_asr_transcript.py                    # dry-run（默认，不写库）
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/converge_media_no_asr_transcript.py --apply            # 执行收敛
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/converge_media_no_asr_transcript.py --knowledge-id 123 # 限定单个知识库/空间
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/converge_media_no_asr_transcript.py --file-id 456 --apply
+```
+
+### `converge_knowledge_rebuild_failed_state.py`
+
+把重建失败留下的**容器级** `FAILED` 状态收敛回 `PUBLISHED`。
+
+背景：重建 worker 过去只要有一个文件重建失败，就把整个知识库/知识空间标成
+`KnowledgeState.FAILED`。这个标记本是给"下次自动重建"用的，但失败文件已经不能自动
+重建、必须走重新解析，所以它只剩副作用：权限目标解析要求容器处于 `PUBLISHED`
+(`knowledge_permission_service.py`)，于是一个坏文件让整个空间在权限层面"不存在"，
+接口报 19003「资源类型或 ID 无效」，用户进不去。服务端已不再写这个状态
+(`rebuild_knowledge_worker.py`)；本脚本收敛存量。
+
+只改容器状态，**不碰文件状态**——哪些文件失败仍记录在 `knowledge_file` 上，重新解析
+要靠它。`--scope space`（默认）只处理知识空间；`all` 再加普通知识库与个人知识库。
+QA 知识库不在范围内，其 `FAILED` 由 `worker/knowledge/qa.py` 另行写入、语义未变。
+
+Usage (from `src/backend/`，默认 dry-run):
+
+```bash
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/converge_knowledge_rebuild_failed_state.py
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/converge_knowledge_rebuild_failed_state.py --apply
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/converge_knowledge_rebuild_failed_state.py --scope all --apply
+```
+
+### `backfill_knowledge_space_user_pin.py`
+
+F037：知识空间置顶从 `space_channel_member.is_pinned` 解耦到独立的 `knowledge_space_user_pin` 表（置顶是纯个人偏好，不再寄生在成员关系上）。本脚本把历史置顶迁移到新表，让升级后用户保留已置顶的空间。
+
+来源行：`space_channel_member` 中 `business_type='space'` 且 `is_pinned` 为真且 `status='ACTIVE'`，每条转成 `knowledge_space_user_pin(user_id, space_id=business_id)`。幂等：已存在的 `(user_id, space_id)` 跳过，可重复运行。
+
+> 前置：先 `alembic upgrade head`（建好 `knowledge_space_user_pin` 表，迁移 `f044_knowledge_space_user_pin`）。
+
+Usage (from `src/backend/`):
+
+```bash
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/backfill_knowledge_space_user_pin.py            # dry-run（默认，不写库）
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/backfill_knowledge_space_user_pin.py --apply    # 写入
+
+# 或用 shell 包装（自动探测解释器 / PYTHONPATH / config）：
+bash scripts/backfill_knowledge_space_user_pin.sh          # dry-run
+bash scripts/backfill_knowledge_space_user_pin.sh apply    # 写入
+```
+
+### `backfill_departments_under_single_root.py`
+
+把所有"误挂为根"的部门收编到默认组织根部门(`BS@root`)下，保证全平台只有一个根部门。
+
+背景：历史上 SSO 网关同步的顶层部门(`parent_external_id` 为空)被挂为 `parent_id=None`，变成与"默认组织"平级的兄弟根，导致出现多个根、且其 `path` 不以默认组织根 path 为前缀(按 `path LIKE '{root_path}%'` 圈定租户成员时被漏算)。同步逻辑已修复(顶层部门改挂默认组织根下)，但增量推送未重推的存量部门需本脚本一次性收编。
+
+做什么：默认租户下、除默认组织根外的所有 active 根部门(`parent_id IS NULL`)，设 `parent_id=默认组织根.id` 并级联重写整棵子树 `path`。不区分 source，不触碰挂载状态。幂等：收编后 `parent_id` 不再为空，重复运行被自然跳过。
+
+Usage (from `src/backend/`):
+
+```bash
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/backfill_departments_under_single_root.py            # dry-run（默认，不写库）
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/backfill_departments_under_single_root.py --apply    # 写入
+
+# 或用 shell 包装（自动探测解释器 / PYTHONPATH / config）：
+bash scripts/backfill_departments_under_single_root.sh          # dry-run
+bash scripts/backfill_departments_under_single_root.sh apply    # 写入
+```
+
+### `backfill_user_tenant_associations.py`
+
+把缺失/未激活的默认租户归属回填到 `user_tenant` 表。这段逻辑原先挂在服务启动流程 `init_default_data()` 的 `_init_default_tenant` 里，每次进程启动都会全表扫描 `users`/`user_tenant`（一次反连接 + 一次"把全部 `is_active=1` 行读进内存"），在大用户量部署下属于把数据维护塞进了热路径。已从启动流剥离——启动只保证默认租户(id=1)存在。
+
+运行期不依赖这张回填表：`UserPayload` 租户解析在用户无 `user_tenant` 行时回退到 `DEFAULT_TENANT_ID`，多租户登录还会惰性补挂，故缺行不会阻塞登录/查询，本回填是纯数据一致性维护，按需运行一次即可。
+
+做什么（两步，与原启动逻辑等价、幂等）：①对没有任何 `user_tenant` 行的用户插入默认租户行 `(tenant_id=1, is_default=1, is_active=1, status='active')`；②对 `tenant_id=1 / is_default=1 / status='active' / is_active IS NULL` 且该用户当前无任何 `is_active=1` 行的孤儿默认行，置 `is_active=1`（每用户只激活一条）。只新增/激活，不删除、不 demote。
+
+Usage (from `src/backend/`):
+
+```bash
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/backfill_user_tenant_associations.py            # dry-run（默认，不写库）
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/backfill_user_tenant_associations.py --apply    # 写入
+
+# 或用 shell 包装（自动探测解释器 / PYTHONPATH / config）：
+bash scripts/backfill_user_tenant_associations.sh          # dry-run
+bash scripts/backfill_user_tenant_associations.sh apply    # 写入
+```
+
+### `backfill_department_parent_tuples.py`
+
+把 DB 部门树的父子关系回填成 OpenFGA 的 `department#parent` 继承边（additive，只加不删，幂等）。
+
+背景：写 `department:{parent}#parent@department:{child}` 边的只有 F002 手动建/移部门；SSO 同步及早期 f006 迁移进来的部门在 FGA 里没有这条边，导致部门 admin 的 FGA 继承对其失效。SSO 同步链路已修复为实时维护 parent 边，本脚本按 DB 当前树形一次性补齐**存量**部门的边。
+
+遍历所有 `status='active'` 且 `parent_id` 非空的部门（全租户、全来源），每个发一条 `write department:{parent_id}#parent department:{id}`。`batch_write_tuples` 对重复写幂等，可反复跑。
+
+> 运行顺序：在 `backfill_departments_under_single_root.py`（定型 parent_id）**之后**运行，会一并补上被收编部门的 root→顶层 边。
+
+Usage (from `src/backend/`):
+
+```bash
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/backfill_department_parent_tuples.py            # dry-run（默认）
+config=config.yaml PYTHONPATH=./ .venv/bin/python scripts/backfill_department_parent_tuples.py --apply     # 写入
+
+# 或用 shell 包装（自动探测解释器 / PYTHONPATH / config）：
+bash scripts/backfill_department_parent_tuples.sh          # dry-run
+bash scripts/backfill_department_parent_tuples.sh apply    # 写入
+```
+
+### `seed_load_test_org.py`
+
+压测数据脚本：批量生成**部门树 + 用户**灌入数据库，用于大用户量下的体验/性能测试（尤其 ReBAC 读路径）。
+
+在平台默认根部门（`Tenant.root_dept_id`）下按 `--fanout` 广度优先生成 `--departments` 个部门（自动维护物化 `path` 与 `department#parent` FGA 边），再生成 `--users` 个本地用户轮询分配主部门（`is_primary=1`，可选 `--secondary-ratio` 挂附属部门），每人写 user + 默认角色 + user_department + user_tenant 及 `department#member` FGA 边。
+
+所有数据打 `source=<--source>`（默认 `loadtest`）标签 + `external_id=loadtest_dept_*/loadtest_user_*`，因此**幂等**且可用 `--purge` 一键清理。统一密码 `Test@1234ab`。
+
+> 干跑是默认行为，`--apply` 才写库/写 FGA/删数据。默认写 OpenFGA；`--no-fga` 只灌库。`--with-role-fga` 才逐用户同步默认角色到 FGA（慢）。
+
+Usage (from `src/backend/`):
+
+```bash
+config=config.yaml PYTHONPATH=./ python scripts/seed_load_test_org.py --departments 200 --users 50000 --fanout 8             # dry-run（默认）
+config=config.yaml PYTHONPATH=./ python scripts/seed_load_test_org.py --departments 200 --users 50000 --fanout 8 --apply      # 写入 DB + FGA
+config=config.yaml PYTHONPATH=./ python scripts/seed_load_test_org.py --departments 200 --users 50000 --apply --no-fga        # 只灌库
+config=config.yaml PYTHONPATH=./ python scripts/seed_load_test_org.py --purge --apply                                        # 清理压测数据
+
+# 或用 shell 包装（自动探测解释器 / PYTHONPATH / config）：
+bash scripts/seed_load_test_org.sh --departments 200 --users 50000 --apply
+```
+
+### `dsh_migrate_role_policies.py`
+
+将当前角色授权的有效额度迁为个人额度，用于切换到部门树授权；执行前后核对每个成员的最终额度，席位和累计用量沿用原记录。
+
+从 `src/backend/` 运行，`config` 与线上服务配置一致。默认输出迁移计划，确认计划后加 `--apply` 保存。
+
+```bash
+python scripts/dsh_migrate_role_policies.py --tenant 2 --actor 1 --model 7
+python scripts/dsh_migrate_role_policies.py --tenant 2 --actor 1 --model 7 --apply
+```
+
+## Vibe runtime v2 deployment bindings
+
+`upgrade_vibe_runtime.py` uses authenticated scope APIs only. Export a signed manager
+`/v2/upgrade/inventory` during the maintenance window, review its SHA256, then run
+dry-run first with `BISHENG_MANAGEMENT_TOKEN`, `--inventory`, `--base-url` and
+`--report`. `--apply` additionally requires `--acknowledge-maintenance` and
+`--expected-inventory-sha256`. The backend rechecks live Engine facts. After import,
+use `POST /api/v1/apps/{app_id}/runtime/upgrade/rebind` to rebuild the current frozen
+image with backend storage; pending approved versions are preserved. Do not restore
+an older SQLite database as part of a code rollback.
+## DSH audit model-name digest backfill
+
+After the `dsh_audit_model_lookup` schema migration and deployment of all new writers,
+run from `src/backend/` using the same `config` environment as the service:
+
+```bash
+python scripts/backfill_dsh_audit_model_names.py --tenant-id 1
+python scripts/backfill_dsh_audit_model_names.py --tenant-id 1 --apply --batch-size 200 --max-batches 20
+```
+
+Dry-run is the default. Repeat per tenant until `has_more=false`; resume with
+`--after-request-id` from the previous output. Rerun from the beginning for a final
+check. Only missing digests are filled; original names and bodies remain unchanged.
+Historical exact-name lookup is incomplete until this operation finishes. No fuzzy
+query fallback or automatic startup backfill is performed.
+
+## DSH audit presentation preparation
+
+Run from `src/backend/` using the live service config. `python scripts/backfill_dsh_audit_presentation.py --tenant-id 1` previews one bounded batch; add `--apply --max-batches 20` to prepare historical presentation statuses and mark conversation projection. Resume with the reported `--after-request-id`, then rerun from the start to catch late rows. The independent audit inspection task projects groups; no model bodies, policy or keys are changed.
+
+## Audit conversation hierarchy
+
+After upgrading all audit writers and preparing legacy audit status/group data,
+run from `src/backend/` using the live service's `config` environment variable:
+
+```bash
+python scripts/prepare_dsh_audit_tree.py --tenant-id 1
+python scripts/prepare_dsh_audit_tree.py --tenant-id 1 --apply --max-steps 100
+```
+
+The default is read-only. Each applied step handles at most 100 records/nodes;
+SQL checkpoints allow rerunning to continue. This rebuilds navigation only and
+never reads model bodies, replays requests, or merges audit/billing records.
+An active background lease returns BUSY; do not override it. Terminal histories
+and tenants currently in OFF mode are also processed by the independent worker.
+
+## DSH content-safety replay and retention
+
+Run `dsh_content_safety_maintenance.py` from `src/backend/`, with the same
+`config` environment variable as the live service. It uses only the shared SQL
+configuration and a strict, explicit tenant scope; it does not start Redis,
+object storage, model admission, SSO or the full application context.
+
+```bash
+export config=config.yaml
+python scripts/dsh_content_safety_maintenance.py rebuild --tenant-id 1
+python scripts/dsh_content_safety_maintenance.py rebuild --tenant-id 1 --apply --batch-size 100 --max-batches 20
+python scripts/dsh_content_safety_maintenance.py purge-details --tenant-id 1 --before 2026-10-01T00:00:00Z
+python scripts/dsh_content_safety_maintenance.py purge-details --tenant-id 1 --before 2026-10-01T00:00:00Z --apply
+python scripts/dsh_content_safety_maintenance.py purge-audit --tenant-id 1 --before 2026-10-01T00:00:00Z --apply --max-batches 20
+```
+
+All commands default to **dry-run**. It validates configuration and tenant
+existence, and prints proposed bounds without scanning or writing facts; it is
+not a count of recoverable or removable records. No retention period is enabled
+implicitly. Both purge commands require an explicit timezone-aware `--before`;
+cutoffs are normalized to UTC and exclusive. Disabled or archived tenants remain
+eligible for maintenance of retained history.
+
+`rebuild` replays only facts still present and permitted by the persisted deletion
+watermark. Each JSONL report describes a committed batch: `examined` includes
+`skipped_expired`, so examined rows must not be described as restored rows.
+Resume with `--cursor '<next_cursor>'`, using the same tenant. No retained fact
+means no reconstruction of deleted details or conversion of unknown legacy checks
+to PASSED. Group and hierarchy summaries converge through their normal worker.
+
+`purge-details` removes facts by receipt time, preserving main audit summaries and
+any existing main-cleanup watermark or cursor. `purge-audit` first commits its
+monotonic deletion watermark separately, then deletes bounded eligible main rows
+and their associated safety facts, updating affected summaries atomically. A
+failed batch rolls back while earlier batches and the watermark remain committed.
+Rerun with the same cutoff to resume; its persisted cursor is independent of the
+rebuild cursor. Running or unsettled rows are skipped and can be revisited by
+another run with the same cutoff after they finish, even after `has_more=false`.
+A report is emitted only after its batch commits; a lost report can be retried.
+
+The default is one batch of at most 100 rows; `--batch-size` accepts 1..100 and
+`--max-batches` accepts 1..10000. These operations do **not** reclaim native body
+metadata, shared objects, encryption keys, model-call records or monthly usage.
+Main cleanup does not remove unrelated unassociated safety facts. Deploy the
+retention guards for all writers before applying a main-audit deletion checkpoint.
+Exit codes: 0 success, 2 invalid arguments/request, 3 missing service database
+configuration/dependencies, 4 unknown tenant, 5 operational failure. The standalone
+CLI suppresses infrastructure logging and prints only its own JSONL and fixed,
+type-only errors; importing it does not change the host logging configuration.
+Errors omit SQL, credentials and payloads. MySQL/DM8 concurrency, interruption and
+recovery require the separate real-database acceptance; SQLite CLI tests do not
+establish those guarantees.
+
+## 工具与技能全员授权升级（f048-v6）
+
+`migrate_capability_authorization.py` 将现有内置工具及企业技能的全员可用状态转换为所属租户成员的可撤销 Grant。默认 dry-run，apply 需要 Store 确认与操作人；在发布授权模型后、业务进程停止期间执行。重复执行保留管理员的撤销结果。完整顺序见 [升级说明](../../../features/local/tools-skills-authorization/upgrade.md)。

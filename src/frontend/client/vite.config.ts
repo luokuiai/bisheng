@@ -1,0 +1,508 @@
+import { diagramAssetTargets } from '../config/diagramAssets';
+import { createFrontendProxy, frontendEnvDefinitions, createMinioWarning, loadFrontendEnv, resolveApiTarget } from '../config/vite';
+import react from '@vitejs/plugin-react';
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import * as http from 'node:http';
+import path from 'path';
+import { visualizer } from "rollup-plugin-visualizer";
+import type { Plugin } from 'vite';
+import { defineConfig } from 'vite';
+import { compression } from 'vite-plugin-compression2';
+import { nodePolyfills } from 'vite-plugin-node-polyfills';
+import { VitePWA } from 'vite-plugin-pwa';
+import { viteStaticCopy } from 'vite-plugin-static-copy';
+import { createHtmlPlugin } from 'vite-plugin-html';
+
+const clientRequire = createRequire(import.meta.url);
+
+/**
+ * Build stamp shown on the crash screen: package version plus the minute the
+ * bundle was built, e.g. `v3.0.0-beta1 (20260807-2132)`. Local time on purpose —
+ * it is read by whoever built it, alongside a release log kept in the same zone.
+ */
+function buildVersion(): string {
+  const pkg = JSON.parse(readFileSync(path.join(__dirname, 'package.json'), 'utf-8'));
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, '0');
+  const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+  return `v${pkg.version} (${stamp})`;
+}
+
+const app_env = {
+  BASE_URL: '/workspace',
+  BISHENG_HOST: '/admin'
+}
+
+const minioPathRE = /^\/(?:workspace\/)?(?:bisheng|tmp-dir)(?:\/|$)/;
+
+function minioFileProxyPlugin(minioTarget: string): Plugin {
+  const warnMinio = createMinioWarning('VITE_MINIO_PROXY_TARGET', minioTarget);
+  return {
+    name: 'bisheng:minio-file-proxy',
+    apply: 'serve',
+    configureServer(server) {
+      console.log(
+        `[bisheng:minio-proxy] dev object proxy -> ${minioTarget} ` +
+        `(host must equal backend sharepoint; 127.0.0.1 ≠ localhost)`,
+      );
+      const minioProxyMiddleware = (req, res, next) => {
+        const requestUrl = req.url || '';
+
+        if (!minioPathRE.test(requestUrl)) {
+          next();
+          return;
+        }
+
+        const rewrittenUrl = requestUrl.replace(/^\/workspace(?=\/(?:bisheng|tmp-dir)(?:\/|$))/, '');
+        const targetUrl = new URL(rewrittenUrl, minioTarget);
+        const proxyReq = http.request(
+          {
+            protocol: targetUrl.protocol,
+            hostname: targetUrl.hostname,
+            port: targetUrl.port,
+            method: req.method,
+            path: `${targetUrl.pathname}${targetUrl.search}`,
+            headers: {
+              ...req.headers,
+              host: targetUrl.host,
+            },
+          },
+          (proxyRes) => {
+            if (proxyRes.statusCode === 403) {
+              warnMinio(requestUrl);
+            }
+            res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+            proxyRes.pipe(res);
+          },
+        );
+
+        proxyReq.on('error', (error) => {
+          if (!res.headersSent) {
+            res.writeHead(502, { 'Content-Type': 'text/plain' });
+          }
+          res.end(`MinIO proxy error: ${error.message}`);
+        });
+
+        req.pipe(proxyReq);
+      };
+
+      server.middlewares.stack.unshift({
+        route: '',
+        handle: minioProxyMiddleware,
+      });
+    },
+  };
+}
+
+// https://vitejs.dev/config/
+export default defineConfig(({ command, mode }) => {
+  const env = loadFrontendEnv(mode, __dirname);
+  // MinIO object proxy for bucket paths (/bisheng/...): these must reach MinIO,
+  // NOT the backend (7860 only 404s on object keys). Override per environment via
+  // VITE_DEV_MINIO_TARGET, whose host MUST match the backend `sharepoint` config —
+  // SigV4 presigned URLs sign the Host header, so a mismatch yields 403
+  // SignatureDoesNotMatch (e.g. set http://localhost:9000 when sharepoint=localhost:9000).
+  const minioTarget = env.VITE_MINIO_PROXY_TARGET || env.VITE_DEV_MINIO_TARGET || 'http://127.0.0.1:9000';
+  const apiTarget = resolveApiTarget(env, 'VITE_DEV_API_TARGET');
+  // Per-request proxy logging is opt-in (VITE_PROXY_LOG=1): on by default it prints
+  // dozens of lines per page load and buries the warnings that matter.
+  const proxyLog = env.VITE_PROXY_LOG === '1';
+  // Module ids statically reachable from src/main.jsx, i.e. what the first screen must
+  // load anyway. Filled on the first manualChunks call (the module graph is complete by then).
+  let firstScreenModules: Set<string> | null = null;
+
+  return {
+    base: app_env.BASE_URL || '/',
+    define: {
+      ...frontendEnvDefinitions(env, ['VITE_', 'SCRIPT_', 'DOMAIN_', 'ALLOW_']),
+      __APP_ENV__: JSON.stringify(app_env),
+      // vconsole ships ONLY when explicitly requested (npm run build:vconsole,
+      // which sets VITE_ENABLE_VCONSOLE=true). A plain `npm run build` never
+      // bundles the debug console — do not hardcode this back to 'true'.
+      __VCONSOLE_ENABLED__: JSON.stringify(env.VITE_ENABLE_VCONSOLE === 'true'),
+      // Stamped at build time so a crash report names the exact build it came
+      // from. /api/v1/env carries a hardcoded version and cannot be trusted for
+      // this; the package version plus the build minute can.
+      __APP_VERSION__: JSON.stringify(buildVersion()),
+    },
+    server: {
+      host: '0.0.0.0',
+      port: 4001,
+      // Pin to 4001: fail loudly if the port is taken instead of drifting to 4002+.
+      strictPort: true,
+      proxy: {
+        '^(/workspace)?/bisheng': {
+          target: minioTarget,
+          changeOrigin: true,
+          secure: false,
+          rewrite: (path) => {
+            return path.replace(/^\/workspace/, '');
+          },
+        },
+        '/workspace/api': createFrontendProxy(apiTarget, {
+          verbose: proxyLog,
+          rewrite: (url) => url.replace(/^\/workspace/, ''),
+        }),
+        '/workspace/tmp-dir': {
+          target: minioTarget,
+          changeOrigin: true,
+          secure: false,
+          rewrite: (path) => {
+            return path.replace(/^\/workspace/, '');
+          },
+        },
+      },
+    },
+    // Set the directory where environment variables are loaded from and restrict prefixes
+    envDir: '../',
+    envPrefix: ['VITE_', 'SCRIPT_', 'DOMAIN_', 'ALLOW_'],
+    plugins: [
+      minioFileProxyPlugin(minioTarget),
+      react(),
+      nodePolyfills(),
+      VitePWA({
+        injectRegister: 'auto', // 'auto' | 'manual' | 'disabled'
+        registerType: 'autoUpdate', // 'prompt' | 'autoUpdate'
+        devOptions: {
+          enabled: false, // disable service worker registration in development mode
+        },
+        useCredentials: true,
+        includeManifestIcons: false,
+        workbox: {
+          globPatterns: [
+            '**/*.{js,css,html}',
+            'assets/favicon*.png',
+            'assets/icon-*.png',
+            'assets/apple-touch-icon*.png',
+            'assets/maskable-icon.png',
+            'manifest.webmanifest',
+          ],
+          globIgnores: ['images/**/*', '**/*.map', 'index.html'],
+          maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
+          navigateFallbackDenylist: [/^\/oauth/],
+        },
+        includeAssets: [],
+        // manifest: {
+        //   name: 'Deepseek',
+        //   short_name: 'Deepseek',
+        //   display: 'standalone',
+        //   background_color: '#000000',
+        //   theme_color: '#009688',
+        //   icons: [
+        //     {
+        //       src: 'assets/favicon-32x32.png',
+        //       sizes: '32x32',
+        //       type: 'image/png',
+        //     },
+        //     {
+        //       src: 'assets/favicon-16x16.png',
+        //       sizes: '16x16',
+        //       type: 'image/png',
+        //     },
+        //     {
+        //       src: 'assets/apple-touch-icon-180x180.png',
+        //       sizes: '180x180',
+        //       type: 'image/png',
+        //     },
+        //     {
+        //       src: 'assets/icon-192x192.png',
+        //       sizes: '192x192',
+        //       type: 'image/png',
+        //     },
+        //     {
+        //       src: 'assets/maskable-icon.png',
+        //       sizes: '512x512',
+        //       type: 'image/png',
+        //       purpose: 'maskable',
+        //     },
+        //   ],
+        // },
+      }),
+      sourcemapExclude({ excludeNodeModules: true }),
+      compression({
+        threshold: 10240,
+      }),
+      createHtmlPlugin({
+        inject: {
+          data: {
+            baseUrl: app_env.BASE_URL.replace(/\/$/, ''),
+          },
+        },
+      }),
+      viteStaticCopy({
+        targets: [
+          ...diagramAssetTargets(),
+          {
+            src: 'node_modules/pdfjs-dist/build/pdf.worker.min.js',
+            dest: './'
+          },
+          {
+            // Full CMap set for PDFs using CID-keyed, non-embedded CJK fonts
+            // (e.g. GBK-EUC-H from CEB-converted government docs) — without the
+            // matching .bcmap the text layer renders blank.
+            src: 'node_modules/pdfjs-dist/cmaps/*',
+            dest: 'cmaps/'
+          }
+        ]
+      }),
+      // visualizer({
+      //   open: true, // 打包后自动打开分析页面
+      //   filename: "stats.html",
+      // })
+    ],
+    publicDir: './public',
+    build: {
+      // pnpm workspace: deps live in ../node_modules (outside this vite root),
+      // which defeats vite-plugin-node-polyfills' node_modules exemption — its
+      // injected ESM imports land inside CJS deps (react, react-dom) and break
+      // rollup's named-export detection. Let the commonjs plugin transform
+      // mixed ESM/CJS modules so named exports survive the injection.
+      commonjsOptions: {
+        transformMixedEsModules: true,
+      },
+      sourcemap: process.env.NODE_ENV === 'development',
+      outDir: './build',
+      minify: 'terser',
+      // Strip all console.* / debugger from production bundles so no debug data
+      // (API payloads, tokens, filenames) leaks to the browser console. The
+      // vconsole debug build keeps them so its panel stays useful.
+      terserOptions: {
+        compress: {
+          drop_console: env.VITE_ENABLE_VCONSOLE !== 'true',
+          drop_debugger: true,
+        },
+      },
+      rollupOptions: {
+        preserveEntrySignatures: 'strict',
+        output: {
+          manualChunks(id: string, { getModuleInfo }) {
+            if (!firstScreenModules) {
+              firstScreenModules = new Set();
+              const root = path.join(__dirname, 'src/main.jsx');
+              if (!getModuleInfo(root)) throw new Error(`manualChunks: first-screen root not found: ${root}`);
+              const queue = [root];
+              while (queue.length) {
+                const current = queue.pop()!;
+                if (firstScreenModules.has(current)) continue;
+                firstScreenModules.add(current);
+                queue.push(...(getModuleInfo(current)?.importedIds ?? []));
+              }
+            }
+            // Rollup's CommonJS runtime helpers are shared by nearly every chunk. Left alone they
+            // land in whichever manual chunk needs them first (e.g. docx-viewer), which then gets
+            // statically imported by the first screen and drags that whole library along.
+            if (id.startsWith('\0commonjsHelpers') || id.startsWith('\0commonjs-dynamic-modules')) {
+              return 'vendor';
+            }
+            const normalizedId = id.replace(/\\/g, '/');
+            if (normalizedId.includes('node_modules')) {
+              // Libraries only reached through a lazy import are left to Rollup so they travel
+              // with that lazy chunk. The name rules below are loose substring matches (bluebird's
+              // join.js hits 'joi'); applied to lazy-only modules they would pull those modules
+              // into a first-screen chunk and the rest of their library in after them.
+              if (!firstScreenModules.has(id)) {
+                return null;
+              }
+              // High-impact chunking for large libraries
+              if (normalizedId.includes('@codesandbox/sandpack')) {
+                return 'sandpack';
+              }
+              if (normalizedId.includes('react-virtualized')) {
+                return 'virtualization';
+              }
+              if (normalizedId.includes('i18next') || normalizedId.includes('react-i18next')) {
+                return 'i18n';
+              }
+              if (normalizedId.includes('lodash')) {
+                return 'utilities';
+              }
+              if (normalizedId.includes('date-fns')) {
+                return 'date-utils';
+              }
+              if (normalizedId.includes('@dicebear')) {
+                return 'avatars';
+              }
+              // if (normalizedId.includes('react-dnd') || normalizedId.includes('react-flip-toolkit')) {
+              //   return 'react-interactions';
+              // }
+              if (normalizedId.includes('react-hook-form')) {
+                return 'forms';
+              }
+              if (normalizedId.includes('react-router-dom')) {
+                return 'routing';
+              }
+              if (
+                normalizedId.includes('qrcode.react') ||
+                normalizedId.includes('@marsidev/react-turnstile')
+              ) {
+                return 'security-ui';
+              }
+
+              if (normalizedId.includes('@codemirror/view')) {
+                return 'codemirror-view';
+              }
+              if (normalizedId.includes('@codemirror/state')) {
+                return 'codemirror-state';
+              }
+              if (normalizedId.includes('@codemirror/language')) {
+                return 'codemirror-language';
+              }
+              if (normalizedId.includes('@codemirror')) {
+                return 'codemirror-core';
+              }
+
+              if (
+                normalizedId.includes('react-markdown') ||
+                normalizedId.includes('remark-') ||
+                normalizedId.includes('rehype-')
+              ) {
+                return 'markdown-processing';
+              }
+              if (normalizedId.includes('monaco-editor') || normalizedId.includes('@monaco-editor')) {
+                return 'code-editor';
+              }
+              if (normalizedId.includes('react-window') || normalizedId.includes('react-virtual')) {
+                return 'virtualization';
+              }
+              if (
+                normalizedId.includes('zod') ||
+                normalizedId.includes('yup') ||
+                normalizedId.includes('joi')
+              ) {
+                return 'validation';
+              }
+              if (
+                normalizedId.includes('axios') ||
+                normalizedId.includes('ky') ||
+                normalizedId.includes('fetch')
+              ) {
+                return 'http-client';
+              }
+              if (
+                normalizedId.includes('react-spring') ||
+                normalizedId.includes('react-transition-group')
+              ) {
+                return 'animations';
+              }
+              if (normalizedId.includes('react-select') || normalizedId.includes('downshift')) {
+                return 'advanced-inputs';
+              }
+              if (normalizedId.includes('heic-to')) {
+                return 'heic-converter';
+              }
+
+              // Existing chunks
+              if (normalizedId.includes('@radix-ui')) {
+                return 'radix-ui';
+              }
+              if (normalizedId.includes('framer-motion')) {
+                return 'framer-motion';
+              }
+              if (normalizedId.includes('node_modules/highlight.js')) {
+                return 'markdown_highlight';
+              }
+              if (normalizedId.includes('katex') || normalizedId.includes('node_modules/katex')) {
+                return 'math-katex';
+              }
+              if (normalizedId.includes('node_modules/hast-util-raw')) {
+                return 'markdown_large';
+              }
+              if (normalizedId.includes('@tanstack')) {
+                return 'tanstack-vendor';
+              }
+              if (normalizedId.includes('@headlessui')) {
+                return 'headlessui';
+              }
+              // xlsx-populate: Excel file handling
+              if (normalizedId.includes('xlsx-populate')) {
+                return 'xlsx-populate';
+              }
+              // mammoth: DOCX rendering
+              if (normalizedId.includes('mammoth')) {
+                return 'docx-viewer';
+              }
+              // pako: zlib compression
+              if (normalizedId.includes('pako') || normalizedId.includes('node_modules/zlib')) {
+                return 'compression';
+              }
+
+              // Everything else falls into a generic vendor chunk.
+              return 'vendor';
+            }
+            // Create a separate chunk for all locale files under src/locales.
+            if (normalizedId.includes('/src/locales/')) {
+              return 'locales';
+            }
+            // Let Rollup decide automatically for any other files.
+            return null;
+          },
+          entryFileNames: 'assets/[name].[hash].js',
+          chunkFileNames: 'assets/[name].[hash].js',
+          assetFileNames: (assetInfo) => {
+            if (assetInfo.names?.[0] && /\.(woff|woff2|eot|ttf|otf)$/.test(assetInfo.names[0])) {
+              return 'assets/fonts/[name][extname]';
+            }
+            return 'assets/[name].[hash][extname]';
+          },
+        },
+        /**
+         * Ignore "use client" warning since we are not using SSR
+         * @see {@link https://github.com/TanStack/query/pull/5161#issuecomment-1477389761 Preserve 'use client' directives TanStack/query#5161}
+         */
+        onwarn(warning, warn) {
+          if (warning.message.includes('Error when using sourcemap')) {
+            return;
+          }
+          warn(warning);
+        },
+      },
+      chunkSizeWarningLimit: 1500,
+    },
+    optimizeDeps: {
+      // The shim must not be prebundled into a chunk that imports its own banner.
+      exclude: [
+        'vite-plugin-node-polyfills/shims/buffer',
+        'vite-plugin-node-polyfills/shims/global',
+        'vite-plugin-node-polyfills/shims/process',
+      ],
+    },
+    resolve: {
+      // Workspace viewers must use the app's initialized i18n hook instance.
+      dedupe: ['react-i18next'],
+      alias: {
+        // Workspace source needs absolute shim paths; use the ESM sibling of the require entry.
+        'vite-plugin-node-polyfills/shims/buffer': clientRequire.resolve('vite-plugin-node-polyfills/shims/buffer').replace(/\.cjs$/, '.js'),
+        'vite-plugin-node-polyfills/shims/global': clientRequire.resolve('vite-plugin-node-polyfills/shims/global').replace(/\.cjs$/, '.js'),
+        'vite-plugin-node-polyfills/shims/process': clientRequire.resolve('vite-plugin-node-polyfills/shims/process').replace(/\.cjs$/, '.js'),
+        '~': path.join(__dirname, 'src/'),
+        '@': path.join(__dirname, 'src/'),
+        $fonts: path.resolve(__dirname, 'public/fonts'),
+        // SUL-licensed nodebox is unused (only static/react-ts templates); stub it out of the bundle.
+        '@codesandbox/nodebox': path.resolve(__dirname, 'stubs/nodebox-stub.ts'),
+        // node-only dynamic imports (see stubs/empty-module.ts) — the polyfill
+        // plugin's `fs` alias mangles the /promises subpath under pnpm layout.
+        'node:fs/promises': path.resolve(__dirname, 'stubs/empty-module.ts'),
+        'fs/promises': path.resolve(__dirname, 'stubs/empty-module.ts'),
+      },
+    },
+  };
+});
+
+interface SourcemapExclude {
+  excludeNodeModules?: boolean;
+}
+export function sourcemapExclude(opts?: SourcemapExclude): Plugin {
+  return {
+    name: 'sourcemap-exclude',
+    transform(code: string, id: string) {
+      if (opts?.excludeNodeModules && id.includes('node_modules')) {
+        return {
+          code,
+          // https://github.com/rollup/rollup/blob/master/docs/plugin-development/index.md#source-code-transformations
+          map: { mappings: '' },
+        };
+      }
+    },
+  };
+}

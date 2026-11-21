@@ -1,0 +1,281 @@
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from test.knowledge.test_knowledge_space_service import _load_service_class
+
+
+@pytest.mark.asyncio
+async def test_approval_space_subscription_uses_approval_gate_pending():
+    from bisheng.common.models.space_channel_member import (
+        MembershipStatusEnum,
+        UserRoleEnum,
+    )
+    from bisheng.knowledge.domain.models.knowledge import AuthTypeEnum, KnowledgeTypeEnum
+
+    service = _load_service_class()(None, SimpleNamespace(user_id=42, user_name="alice", tenant_id=7))
+    service.message_service = SimpleNamespace(send_generic_approval=AsyncMock())
+    service.approval_gate = SimpleNamespace(
+        request_or_pass=AsyncMock(return_value=SimpleNamespace(decision="pending", instance_id=21, task_ids=[]))
+    )
+
+    space = SimpleNamespace(
+        id=12, user_id=1, name="研发知识空间", type=KnowledgeTypeEnum.SPACE.value, auth_type=AuthTypeEnum.APPROVAL
+    )
+
+    with (
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.KnowledgeDao.aquery_by_id",
+            new_callable=AsyncMock,
+            return_value=space,
+        ),
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.UserDepartmentDao.aget_user_primary_department",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.SpaceChannelMemberDao.async_find_member",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.QuotaService.get_effective_quota",
+            new_callable=AsyncMock,
+            return_value=-1,
+        ),
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.SpaceChannelMemberDao.async_upsert_space_member_status",
+            new_callable=AsyncMock,
+            return_value=SimpleNamespace(
+                business_id="12",
+                user_id=42,
+                user_role=UserRoleEnum.MEMBER,
+                status=MembershipStatusEnum.PENDING,
+            ),
+        ) as mock_upsert,
+    ):
+        result = await service.subscribe_space(12)
+
+    assert result == {"status": "pending", "space_id": 12}
+    mock_upsert.assert_awaited_once_with(
+        space_id=12,
+        user_id=42,
+        status=MembershipStatusEnum.PENDING,
+    )
+    service.approval_gate.request_or_pass.assert_awaited_once()
+    service.message_service.send_generic_approval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_approval_space_subscription_gate_failure_leaves_no_membership():
+    """When the approval scenario is missing/disabled the gate raises; the
+    membership must NOT be persisted.
+
+    Otherwise the leftover PENDING membership makes the early "already pending"
+    return short-circuit before the gate on the next click, masking the error
+    ("first click errors, second click succeeds"). With no scenario configured,
+    every click must fail consistently.
+    """
+    from bisheng.common.errcode.approval import ApprovalScenarioDisabledError
+    from bisheng.knowledge.domain.models.knowledge import AuthTypeEnum, KnowledgeTypeEnum
+
+    service = _load_service_class()(None, SimpleNamespace(user_id=42, user_name="alice", tenant_id=7))
+    service.approval_gate = SimpleNamespace(request_or_pass=AsyncMock(side_effect=ApprovalScenarioDisabledError()))
+
+    space = SimpleNamespace(
+        id=12, user_id=1, name="研发知识空间", type=KnowledgeTypeEnum.SPACE.value, auth_type=AuthTypeEnum.APPROVAL
+    )
+
+    with (
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.KnowledgeDao.aquery_by_id",
+            new_callable=AsyncMock,
+            return_value=space,
+        ),
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.UserDepartmentDao.aget_user_primary_department",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.SpaceChannelMemberDao.async_find_member",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.QuotaService.get_effective_quota",
+            new_callable=AsyncMock,
+            return_value=-1,
+        ),
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.SpaceChannelMemberDao.async_upsert_space_member_status",
+            new_callable=AsyncMock,
+        ) as mock_upsert,
+    ):
+        with pytest.raises(ApprovalScenarioDisabledError):
+            await service.subscribe_space(12)
+
+    service.approval_gate.request_or_pass.assert_awaited_once()
+    mock_upsert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_approval_space_subscription_direct_pass_activates_member():
+    from bisheng.common.models.space_channel_member import MembershipStatusEnum
+    from bisheng.knowledge.domain.models.knowledge import AuthTypeEnum, KnowledgeTypeEnum
+
+    login_user = SimpleNamespace(user_id=42, user_name="alice", tenant_id=7)
+    service = _load_service_class()(None, login_user)
+    service.approval_gate = SimpleNamespace(
+        request_or_pass=AsyncMock(return_value=SimpleNamespace(decision="pass", instance_id=22))
+    )
+    space = SimpleNamespace(
+        id=12, user_id=1, name="研发知识空间", type=KnowledgeTypeEnum.SPACE.value, auth_type=AuthTypeEnum.APPROVAL
+    )
+    membership = SimpleNamespace(
+        id=9, business_id="12", user_id=42, user_role="member", status=MembershipStatusEnum.REJECTED
+    )
+
+    with (
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.KnowledgeDao.aquery_by_id",
+            new_callable=AsyncMock,
+            return_value=space,
+        ),
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.UserDepartmentDao.aget_user_primary_department",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.SpaceChannelMemberDao.async_find_member",
+            new_callable=AsyncMock,
+            return_value=membership,
+        ),
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.QuotaService.get_effective_quota",
+            new_callable=AsyncMock,
+            return_value=-1,
+        ),
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.SpaceChannelMemberDao.async_upsert_space_member_status",
+            new_callable=AsyncMock,
+            return_value=membership,
+        ) as mock_upsert,
+        patch(
+            "bisheng.knowledge.domain.services.knowledge_space_service.KnowledgeSpaceService.sync_direct_space_user_permissions",
+            new_callable=AsyncMock,
+        ) as mock_sync,
+    ):
+        result = await service.subscribe_space(12)
+
+    assert result == {"status": "subscribed", "space_id": 12}
+    mock_upsert.assert_awaited_once_with(
+        space_id=12,
+        user_id=42,
+        status=MembershipStatusEnum.ACTIVE,
+    )
+    mock_sync.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_knowledge_space_subscribe_scenario_handler_updates_membership_states():
+    from bisheng.approval.domain.services.knowledge_space_subscribe_scenario_handler import (
+        KnowledgeSpaceSubscribeScenarioHandler,
+    )
+    from bisheng.common.models.space_channel_member import MembershipStatusEnum
+
+    membership = SimpleNamespace(id=1, status=MembershipStatusEnum.PENDING, user_id=42, user_role="member")
+    handler = KnowledgeSpaceSubscribeScenarioHandler(
+        find_member=AsyncMock(return_value=membership),
+        update_member=AsyncMock(side_effect=lambda row: row),
+        sync_permissions=AsyncMock(),
+    )
+
+    payload = {"space_id": 12, "space_name": "研发知识空间", "applicant_user_id": 42}
+    await handler.on_approved(instance_id=1, payload_snapshot=payload)
+    assert membership.status == MembershipStatusEnum.ACTIVE
+    handler.sync_permissions.assert_awaited_once()
+
+    membership.status = MembershipStatusEnum.PENDING
+    await handler.on_rejected(instance_id=1, payload_snapshot=payload, reason="reject")
+    assert membership.status == MembershipStatusEnum.REJECTED
+
+
+@pytest.mark.asyncio
+async def test_knowledge_space_approver_sources_keep_owner_and_manager_distinct():
+    from bisheng.approval.domain.services.knowledge_space_subscribe_scenario_handler import (
+        KnowledgeSpaceSubscribeScenarioHandler,
+    )
+
+    handler = KnowledgeSpaceSubscribeScenarioHandler(
+        find_member=AsyncMock(),
+        update_member=AsyncMock(),
+        sync_permissions=AsyncMock(),
+    )
+    req = SimpleNamespace(
+        tenant_id=7,
+        applicant_user_id=42,
+        business_resource_id="12",
+        payload_snapshot={"space_id": 12},
+    )
+
+    with patch(
+        "bisheng.approval.domain.services.knowledge_space_subscribe_scenario_handler._resolve_space_permission_roles",
+        new=AsyncMock(return_value=([11], [22])),
+    ):
+        owners = await handler.resolve_approvers(
+            {"sources": [{"type": "knowledge_space_owner"}]},
+            req,
+        )
+        managers = await handler.resolve_approvers(
+            {"sources": [{"type": "knowledge_space_manager"}]},
+            req,
+        )
+        combined = await handler.resolve_approvers(
+            {
+                "sources": [
+                    {"type": "knowledge_space_owner"},
+                    {"type": "knowledge_space_manager"},
+                ]
+            },
+            req,
+        )
+
+    assert owners == [11]
+    assert managers == [22]
+    assert combined == [11, 22]
+
+
+@pytest.mark.asyncio
+async def test_resource_role_resolver_reads_f048_effective_grants():
+    from bisheng.approval.domain.services.approver_resolver import (
+        resolve_resource_permission_role_users,
+    )
+
+    req = SimpleNamespace(tenant_id=7, applicant_user_id=42)
+    with patch(
+        "bisheng.permission.application.business_authorization.list_business_effective_direct_user_ids_by_model",
+        new=AsyncMock(
+            return_value={
+                "owner": ("11", "service-account"),
+                "manager": ("22", "11"),
+            }
+        ),
+    ) as mock_list:
+        owner_ids, manager_ids = await resolve_resource_permission_role_users(
+            req=req,
+            resource_type="knowledge_space",
+            resource_id=12,
+        )
+
+    assert owner_ids == [11]
+    assert manager_ids == [22, 11]
+    call_args = mock_list.await_args.kwargs
+    assert call_args["resource_type"] == "knowledge_space"
+    assert call_args["resource_id"] == 12
+    assert call_args["model_keys"] == ("owner", "manager")
+    assert call_args["actor"].user_id == 42
+    assert call_args["actor"].current_tenant_id == 7

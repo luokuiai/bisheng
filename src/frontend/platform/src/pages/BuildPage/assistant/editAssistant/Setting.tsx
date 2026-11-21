@@ -1,0 +1,322 @@
+// @ts-strict-ignore
+import { isNumberDraftWithinBounds } from '@/utils/fieldValidation';
+import { Button, Input, Textarea } from '@bisheng/ui';
+import AssistantSetting from "@/components/Pro/security/AssistantSetting";
+import { TitleIconBg } from "@/components/bs-comp/cardComponent";
+import KnowledgeSelect from "@/components/bs-comp/selectComponent/knowledge";
+import ToolsSheet from "@/components/bs-comp/sheets/ToolsSheet";
+import { Outlined } from "bisheng-icons";
+
+import {
+Accordion,
+AccordionContent,
+AccordionItem,
+AccordionTrigger,
+} from "@/components/bs-ui/accordion";
+
+import { InputList } from '@/components/bs-comp/formFields/InputList';
+import { locationContext } from "@/contexts/locationContext";
+import { useAssistantStore } from "@/store/assistantStore";
+import { Switch } from "@bisheng/ui";
+import { CircleMinus } from "lucide-react";
+import { useContext } from "react";
+import { useTranslation } from "react-i18next";
+import { Link } from "react-router-dom";
+import { AppHint } from "../../components/AppHint";
+import ModelSelect from "./ModelSelect";
+import Temperature from "./Temperature";
+
+export default function Setting() {
+  const { t } = useTranslation();
+
+  const { appConfig } = useContext(locationContext)
+  const { assistantState, dispatchAssistant } = useAssistantStore();
+
+  return (
+    <div
+      id="skill-scroll"
+      className="h-full w-[50%] overflow-y-auto scrollbar-hide"
+    >
+      <h1 className="border bg-background-login indent-4 text-sm leading-8 text-muted-foreground">
+        {t("build.basicConfiguration")}
+      </h1>
+      <Accordion type="multiple" className="w-full">
+        {/* Basic configuration */}
+        <AccordionItem value="item-1">
+          <AccordionTrigger>
+            <span>{t("build.modelConfiguration")}</span>
+          </AccordionTrigger>
+          <AccordionContent className="py-2">
+            <div className="mb-4 px-6">
+              <label htmlFor="model" className="bisheng-label">
+                {t("build.model")}
+              </label>
+              <ModelSelect
+                value={assistantState.model_name}
+                onChange={(val) =>
+                  dispatchAssistant("setting", { model_name: val })
+                }
+              />
+            </div>
+            <div className="mb-4 px-6">
+              <label htmlFor="slider" className="bisheng-label">
+                {t("build.temperature")}
+              </label>
+              <Temperature
+                value={assistantState.temperature}
+                onChange={(val) =>
+                  dispatchAssistant("setting", { temperature: val })
+                }
+              ></Temperature>
+            </div>
+            <div className="mb-4 px-6">
+              <label htmlFor="slider" className="bisheng-label flex gap-1">
+                {t("build.maxToken")}
+                <AppHint content={t("build.maxTokenTip")}></AppHint>
+              </label>
+              <Input value={assistantState.max_token} type="number" defaultValue={32000} min={0} onChange={(e) => { if (!isNumberDraftWithinBounds(e.currentTarget.value, { min: 0 })) return; return dispatchAssistant("setting", { max_token: Number(e.target.value) }); }} className={"mt-2"}></Input>
+            </div>
+          </AccordionContent>
+        </AccordionItem>
+        {/* Opening guide */}
+        <AccordionItem value="item-2">
+          <AccordionTrigger>
+            <span>{t("build.openingIntroduction")}</span>
+          </AccordionTrigger>
+          <AccordionContent className="py-2">
+            <div className="mb-4 px-6">
+              <label htmlFor="open" className="bisheng-label">
+                {t("build.openingStatement")}
+              </label>
+              <Textarea name="open" style={{ height: 56 }} placeholder={t("build.assistantMessageFormat")} value={assistantState.guide_word} onChange={(e) =>
+                  dispatchAssistant("setting", { guide_word: e.target.value })
+                } textareaClassName={"mt-2 min-h-[34px]"}></Textarea>
+              {assistantState.guide_word.length > 1000 && (
+                <p className="bisheng-tip mt-1">
+                  {t("build.maximumPromptLength")}
+                </p>
+              )}
+            </div>
+            <div className="mb-4 px-6">
+              <label htmlFor="open" className="bisheng-label flex gap-1">
+                {t("build.guidingQuestions")}
+                <AppHint content={t("build.recommendQuestionsForUsers")} />
+              </label>
+              <InputList
+                className="mt-2"
+                rules={[{ maxLength: 50, message: t("build.maxCharacters50") }]}
+                value={assistantState.guide_question}
+                onChange={(list) => {
+                  dispatchAssistant("setting", { guide_question: list });
+                }}
+                placeholder={t("build.enterGuidingQuestions")}
+              ></InputList>
+            </div>
+          </AccordionContent>
+        </AccordionItem>
+        {/* Content security review */}
+        {appConfig.isPro && <AssistantSetting id={assistantState.id} type={3} />}
+      </Accordion>
+      <h1 className="border-b bg-background-login indent-4 text-sm leading-8 text-muted-foreground">
+        {t("build.knowledge")}
+      </h1>
+      <Accordion type="multiple" className="w-full">
+        {/* Knowledge base */}
+        <AccordionItem value="item-1">
+          <AccordionTrigger>
+            <div className="flex flex-1 items-center justify-between">
+              <span>{t("build.knowledgeBase")}</span>
+              {/* <Popover>
+              <PopoverTrigger asChild className="group">
+                  <Button variant="link" size="sm"><TriangleRightIcon className="group-data-[state=open]:rotate-90" /> {t('build.autoCall')}</Button>
+              </PopoverTrigger>
+              <PopoverContent className="w-[560px]">
+                  <div className="flex justify-between">
+                      <label htmlFor="model" className="bisheng-label">{t('build.callingMethod')}</label>
+                      <div>
+                          <RadioCard checked={false} title={t('build.autoCall')} description={t('build.autoCallDescription')} calssName="mb-4"></RadioCard>
+                          <RadioCard checked title={t('build.onDemandCall')} description={t('build.onDemandCallDescription')} calssName="mt-4"></RadioCard>
+                      </div>
+                  </div>
+              </PopoverContent>
+          </Popover> */}
+            </div>
+          </AccordionTrigger>
+          <AccordionContent className="py-2">
+            <div className="mb-4 px-6">
+              <div className="flex gap-4">
+                <KnowledgeSelect
+                  type="file"
+                  multiple
+                  enableSpace
+                  value={assistantState.knowledge_list.map(el => ({
+                    label: el.name,
+                    value: el.id,
+                    // KnowledgeTypeEnum.SPACE = 3 → space tab; anything else → file tab (F041).
+                    type: el.type === 3 ? 'space' : 'file'
+                  }))}
+                  onChange={(vals) =>
+                    dispatchAssistant("setting", {
+                      knowledge_list: vals.map(el => ({
+                        name: el.label,
+                        id: el.value,
+                        type: el.type === 'space' ? 3 : 0
+                      }))
+                    })
+                  }
+                >
+                  {(reload) => (
+                    <div className="flex justify-between">
+                      <Link to={"/filelib"} target="_blank">
+                        <Button variant="link">
+                          <Outlined.Plus size={16} className="mr-1" />{" "}
+                          {t("build.createNewKnowledge")}
+                        </Button>
+                      </Link>
+                      <Button variant="link" onClick={() => reload(1, '')}>
+                        <Outlined.Refresh size={16} className="mr-1" /> {t("build.refresh")}
+                      </Button>
+                    </div>
+                  )}
+                </KnowledgeSelect>
+              </div>
+              {/* F041: 用户知识库权限校验 toggle — default OFF, gates knowledge-space
+                  retrieval by the runtime user's view_file (ON) vs the config author's (OFF). */}
+              <div className="mt-4 flex items-center gap-2">
+                <label className="bisheng-label flex items-center gap-1">
+                  {t("build.userAuthVerification")}
+                  <AppHint content={t("build.userAuthVerificationTips")} />
+                </label>
+                <Switch
+                  checked={!!assistantState.knowledge_auth}
+                  onCheckedChange={(checked) =>
+                    dispatchAssistant("setting", { knowledge_auth: checked })
+                  }
+                />
+              </div>
+            </div>
+          </AccordionContent>
+        </AccordionItem>
+      </Accordion>
+      <h1 className="border-b bg-background-login indent-4 text-sm leading-8 text-muted-foreground">
+        {t("build.abilities")}
+      </h1>
+      <Accordion
+        type="multiple"
+        className="w-full"
+        onValueChange={(e) =>
+          e.includes("skill") &&
+          document.getElementById("skill-scroll").scrollTo({ top: 9999 })
+        }
+      >
+        {/* Tools */}
+        <AccordionItem value="item-1">
+          <AccordionTrigger>
+            <div className="flex flex-1 items-center justify-between">
+              <span>{t("build.tools")}</span>
+              <ToolsSheet
+                select={assistantState.tool_list}
+                onSelect={(tool) =>
+                  dispatchAssistant("setting", {
+                    tool_list: [...assistantState.tool_list, tool],
+                  })
+                }
+              >
+                <Outlined.Plus
+                  className="mr-2 text-primary hover:text-primary/80 dark:text-slate-50"
+                  onClick={(e) => e.stopPropagation()}
+                ></Outlined.Plus>
+              </ToolsSheet>
+            </div>
+          </AccordionTrigger>
+          <AccordionContent>
+            <div className="px-4">
+              {assistantState.tool_list.map((tool) => (
+                <div
+                  key={tool.id}
+                  className="group mt-2 flex cursor-pointer items-center justify-between"
+                >
+                  <div className="flex items-center gap-2">
+                    <TitleIconBg id={tool.id} className="h-6 w-6 shrink-0">
+                      <Outlined.Hammer size={16} />
+                    </TitleIconBg>
+                    <p className="text-sm">{tool.name}</p>
+                  </div>
+                  <CircleMinus
+                    className="w-4 h-4 hidden text-primary group-hover:block"
+                    onClick={() =>
+                      dispatchAssistant("setting", {
+                        tool_list: assistantState.tool_list.filter(
+                          (t) => t.id !== tool.id
+                        ),
+                      })
+                    }
+                  />
+                </div>
+              ))}
+            </div>
+          </AccordionContent>
+        </AccordionItem>
+        {/* Skills */}
+        {/* <AccordionItem value="skill">
+          <AccordionTrigger>
+            <div className="flex flex-1 items-center justify-between">
+              <span className="flex items-center gap-1">
+                <span>{t("build.skill")}</span>
+                <TooltipProvider delayDuration={0}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Outlined.Question className="w-4 h-4" />
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <p className="text-slate-50">{t("build.skillDescription")}</p>
+                    </TooltipContent>
+                 </Tooltip>
+                </TooltipProvider>
+              </span>
+              <SkillSheet
+                select={assistantState.flow_list}
+                onSelect={(flow) =>
+                  dispatchAssistant("setting", {
+                    flow_list: [...assistantState.flow_list, flow],
+                  })
+                }
+              >
+                <Outlined.Plus
+                  className="mr-2 text-primary hover:text-primary/80 dark:text-slate-50"
+                  onClick={(e) => e.stopPropagation()}
+                ></Outlined.Plus>
+              </SkillSheet>
+            </div>
+          </AccordionTrigger>
+          <AccordionContent>
+            <div className="px-4">
+              {assistantState.flow_list.map((flow) => (
+                <div
+                  key={flow.id}
+                  className="group mt-2 flex cursor-pointer items-center justify-between"
+                >
+                  <div className="flex items-center gap-2">
+                    <AppAvator id={flow.name} url={flow.logo} flowType={1} className="h-7 w-7"></AppAvator>
+                    <p className="text-sm">{flow.name}</p>
+                  </div>
+                  <CircleMinus
+                    className="w-4 h-4 hidden text-primary group-hover:block"
+                    onClick={() =>
+                      dispatchAssistant("setting", {
+                        flow_list: assistantState.flow_list.filter(
+                          (t) => t.id !== flow.id
+                        ),
+                      })
+                    }
+                  />
+                </div>
+              ))}
+            </div>
+          </AccordionContent>
+        </AccordionItem> */}
+
+      </Accordion>
+    </div>
+  );
+}

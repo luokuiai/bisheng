@@ -1,0 +1,272 @@
+import { isApiError } from '@bisheng/api-client';
+import { showApiError } from '~/api/request';
+/**
+ * F035 Track H (P4): the artifact hand-off action. Every type opens a menu now —
+ * Markdown offers three local formats (original md / pdf / docx via the backend
+ * convert endpoint), other types a single "download to local" — followed, after a
+ * separator, by "save into knowledge space".
+ *
+ * The separator is load-bearing: the items above it end at the user's disk, the
+ * one below writes into a shared knowledge space, which is a different kind of
+ * commitment and must not sit flush against a download.
+ *
+ * A share-link viewer never gets the knowledge-space item: they are neither the
+ * task owner nor necessarily logged in, so the uploadable-space lookup behind it
+ * doesn't apply to them. With nothing left to choose, a non-Markdown artifact
+ * falls back to the plain one-click download button rather than a one-item menu.
+ *
+ * Three placements share the logic (`variant`):
+ *   - 'labeled' the file-list row action (design node 12221-40681): always
+ *               visible, icon + "另存为" text, right-aligned in the row. A
+ *               WORDED action doesn't read as noise when repeated down a list
+ *               the way a bare glyph did — the label is what tells a
+ *               first-time user the hand-off exists, so it must not hide
+ *               behind a hover. Used by the delivery card, the workspace
+ *               panel, and the workspace drawer.
+ *   - 'inline'  icon-only, for a SINGLE action inside a sentence (the
+ *               one-deliverable result row) where a worded button would
+ *               interrupt the copy.
+ *   - 'toolbar' preview-panel toolbar icon button.
+ */
+import { Dropdown, DropdownItem, DropdownSeparator } from '@bisheng/ui';
+import { Outlined } from 'bisheng-icons';
+import { useState } from 'react';
+import type { ChatCitation } from '~/api/chatApi';
+import { getMdDownload } from '~/api/linsight';
+import { listUploadableSpacesApi } from '~/api/messageExport';
+import { NotificationSeverity } from '~/common';
+import { useLocalize } from '~/hooks';
+import { AddToKnowledgeModal } from '~/pages/Subscription/Article/AddToKnowledgeModal';
+import { useToastContext } from '~/Providers';
+import { cn } from '~/utils';
+import { getShareTokenFromPath } from '~/utils/shareToken';
+import {
+    type ArtifactFile,
+    downloadArtifactFile,
+    getFileExtension,
+    saveConvertedBlob,
+} from './artifactUtils';
+import { downloadMarkdownArtifact } from './markdownBundle';
+import { useSaveArtifactToKnowledge } from './useSaveArtifactToKnowledge';
+
+type SaveAsVariant = 'labeled' | 'inline' | 'toolbar';
+
+interface SaveAsButtonProps {
+    file: ArtifactFile;
+    versionId: string;
+    /** Trigger placement — see the file header. Defaults to the list-row action. */
+    variant?: SaveAsVariant;
+    className?: string;
+    /**
+     * F069 P2: the run's `output_result.citations`. Lets the markdown download
+     * and the knowledge-space save bake citations into `[n]` plus a reference
+     * list; the pdf / docx conversion bakes server-side and ignores it.
+     */
+    citations?: ChatCitation[] | null;
+}
+
+const TRIGGER_BASE =
+    'flex shrink-0 items-center justify-center transition-colors focus-visible:outline-none ' +
+    'focus-visible:ring-2 focus-visible:ring-blue-500/40 disabled:cursor-not-allowed disabled:opacity-50';
+
+// `data-[state=open]` mirrors each hover rule: once the menu is up the pointer
+// has left the trigger for the floating panel, and a button that snaps back to
+// its resting grey while its own menu is open reads as "nothing is happening".
+const TRIGGER_VARIANT: Record<SaveAsVariant, string> = {
+    // Design 12221-40681: 14px glyph + 12px label, 8px/2px padding, 8px radius.
+    // No hover background — the pointer is answered by the text itself going
+    // from a resting grey to near-black, so the button never stacks a second
+    // fill on top of the row's own hover grey.
+    labeled:
+        'gap-1 rounded-lg px-2 py-0.5 text-xs leading-5 text-text-3 hover:text-text-1 ' +
+        'data-[state=open]:text-text-1',
+    // A quiet grey glyph that turns brand on its own hover — color only, no
+    // hover fill (same rule as 'labeled').
+    inline: 'size-6 rounded-md text-text-3 hover:text-blue-500 data-[state=open]:text-blue-500',
+    toolbar:
+        'size-7 rounded-lg text-text-3 hover:bg-fill-2 hover:text-blue-500 ' +
+        'data-[state=open]:bg-fill-2 data-[state=open]:text-blue-500',
+};
+
+// Glyph size per placement: 14px beside the "另存为" label and for the bare
+// action tucked into a sentence, 16px in the preview toolbar.
+const GLYPH_SIZE: Record<SaveAsVariant, string> = {
+    labeled: 'size-3.5',
+    inline: 'size-3.5',
+    toolbar: 'size-4',
+};
+
+/** Parse a JSON error blob returned by the convert endpoint (if any). */
+async function readBlobError(blob: Blob): Promise<string | null> {
+    if (!(blob instanceof Blob) || !blob.type.includes('application/json')) return null;
+    try {
+        const data = JSON.parse(await blob.text());
+        if (data.status_code && data.status_code !== 200) {
+            return data.status_message || 'export failed';
+        }
+    } catch {
+        /* not an error payload */
+    }
+    return null;
+}
+
+export function SaveAsButton({ file, versionId, variant = 'labeled', className, citations }: SaveAsButtonProps) {
+    const localize = useLocalize();
+    const { showToast } = useToastContext();
+    const [busy, setBusy] = useState(false);
+    const { pickerOpen, setPickerOpen, openPicker, saveTo, saving } =
+        useSaveArtifactToKnowledge(file, versionId, citations);
+
+    // Markdown is the only type with a local format choice (md / pdf / docx).
+    const isMarkdown = !file.directUrl && getFileExtension(file.file_name) === 'md';
+    const canSaveToKnowledge = !getShareTokenFromPath();
+    const hasMenu = isMarkdown || canSaveToKnowledge;
+    const label = hasMenu ? localize('com_linsight_save_as') : localize('com_ui_download');
+
+    const handleDownloadOriginal = async () => {
+        if (busy) return;
+        setBusy(true);
+        try {
+            // A deliverable md that references workspace images goes out as a zip
+            // (md + images); an uploaded source has no workspace images to carry.
+            if (isMarkdown && file.source !== 'upload') {
+                const kind = await downloadMarkdownArtifact(file, versionId, { citations });
+                if (kind === 'zip') {
+                    showToast?.({ message: localize('com_linsight_md_bundled_zip'), severity: NotificationSeverity.SUCCESS });
+                }
+            } else {
+                await downloadArtifactFile(file, versionId, { citations });
+            }
+        } catch (e) {
+            console.error('artifact download failed:', e);
+            if (isApiError(e)) showApiError(e);
+            else showToast?.({ message: localize('com_linsight_download_failed'), severity: NotificationSeverity.WARNING });
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    const handleExport = async (toType: 'pdf' | 'docx') => {
+        if (busy) return;
+        setBusy(true);
+        showToast?.({ message: localize('com_linsight_exporting'), severity: NotificationSeverity.SUCCESS });
+        try {
+            const res = await getMdDownload({ file_url: file.file_url, file_name: file.file_name }, toType, versionId);
+            const errMsg = res instanceof Blob ? await readBlobError(res) : null;
+            if (errMsg) throw new Error(errMsg);
+            const mime =
+                toType === 'pdf'
+                    ? 'application/pdf'
+                    : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+            const blob = res instanceof Blob ? res : new Blob([res], { type: mime });
+            saveConvertedBlob(blob, file.file_name, toType);
+            showToast?.({ message: localize('com_linsight_export_success'), severity: NotificationSeverity.SUCCESS });
+        } catch (e) {
+            console.error(`${toType} export failed:`, e);
+            if (isApiError(e)) showApiError(e);
+            else showToast?.({ message: localize('com_linsight_export_failed'), severity: NotificationSeverity.WARNING });
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    // The trigger leads with the glyph for what it actually does: "save as"
+    // wherever it opens the format/destination menu, a plain download arrow for
+    // the share-viewer fallback, which only ever downloads the file as-is.
+    const glyphSize = GLYPH_SIZE[variant];
+    const glyph =
+        busy || saving ? (
+            <Outlined.Loading className={cn(glyphSize, 'animate-spin')} />
+        ) : hasMenu ? (
+            <Outlined.FileExport className={glyphSize} />
+        ) : (
+            <Outlined.Download className={glyphSize} />
+        );
+
+    const trigger = (
+        <button
+            type="button"
+            disabled={busy || saving}
+            title={label}
+            aria-label={label}
+            className={cn(TRIGGER_BASE, TRIGGER_VARIANT[variant], className)}
+            // File rows are themselves clickable (row click = preview) and answer
+            // Enter, so the action must not bubble — otherwise downloading a file
+            // would also open it.
+            onClick={(e) => {
+                e.stopPropagation();
+                if (!hasMenu) {
+                    handleDownloadOriginal();
+                }
+            }}
+            onKeyDown={(e) => e.stopPropagation()}
+        >
+            {glyph}
+            {variant === 'labeled' && <span className="whitespace-nowrap">{label}</span>}
+        </button>
+    );
+
+    if (!hasMenu) {
+        return trigger;
+    }
+
+    return (
+        <span
+            className="contents"
+            // Portal events still bubble through the React component tree.
+            // Keep save-as interactions from triggering the file row preview.
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+        >
+            {/* File-type glyphs follow getFileTypeIcon's md/pdf/docx mapping. */}
+            <Dropdown
+                menu={
+                    <>
+                        {isMarkdown ? (
+                            <>
+                                <DropdownItem icon={<Outlined.FileEditing />} onSelect={handleDownloadOriginal}>
+                                    {localize('com_linsight.downloadAs', { format: 'Markdown' })}
+                                </DropdownItem>
+                                <DropdownItem icon={<Outlined.FilePdf />} onSelect={() => handleExport('pdf')}>
+                                    {localize('com_linsight.downloadAs', { format: 'PDF' })}
+                                </DropdownItem>
+                                <DropdownItem icon={<Outlined.FileWord />} onSelect={() => handleExport('docx')}>
+                                    {localize('com_linsight.downloadAs', { format: 'Docx' })}
+                                </DropdownItem>
+                            </>
+                        ) : (
+                            <DropdownItem icon={<Outlined.Download />} onSelect={handleDownloadOriginal}>
+                                {localize('com_linsight.downloadToLocal')}
+                            </DropdownItem>
+                        )}
+                        {canSaveToKnowledge && (
+                            <>
+                                <DropdownSeparator />
+                                <DropdownItem
+                                    icon={<Outlined.AddToKnowledgeBase />}
+                                    disabled={saving}
+                                    onSelect={openPicker}
+                                >
+                                    {localize('com_linsight.saveToKnowledge')}
+                                </DropdownItem>
+                            </>
+                        )}
+                    </>
+                }
+            >
+                {trigger}
+            </Dropdown>
+            {/* Sibling of the menu, not a child: inside the menu panel it
+                would unmount the moment the menu closes on item select. */}
+            {canSaveToKnowledge && (
+                <AddToKnowledgeModal
+                    open={pickerOpen}
+                    onOpenChange={setPickerOpen}
+                    mode="channel_sync"
+                    dataSourceApi={listUploadableSpacesApi}
+                    onSyncSelect={saveTo}
+                />
+            )}
+        </span>
+    );
+}

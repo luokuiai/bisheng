@@ -1,0 +1,602 @@
+"""Semantic contract for the F048 OpenFGA authorization model.
+
+覆盖 AC: AC-02, AC-04, AC-07, AC-08, AC-15, AC-19, AC-20, AC-21,
+AC-22, AC-26, AC-28, AC-29, AC-33, AC-36, AC-37, AC-38, AC-39,
+AC-40, AC-41, AC-45, AC-46, AC-47, AC-159, AC-161, AC-163, AC-164
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+
+import pytest
+
+from bisheng.core.openfga.authorization_model_f048 import (
+    DEFAULT_ACTION_CODES,
+    authorization_model_checksum,
+    build_authorization_model_f048,
+)
+from bisheng.permission.domain.models import ResourcePermissionMode
+from bisheng.permission.domain.schemas import VerifiedPermissionTarget
+from bisheng.permission.domain.services.model_policy import derive_permission_models
+from bisheng.permission.domain.services.resource_lifecycle_policy import build_create_plan
+from bisheng.permission.migration.f048_model_mapper import build_initial_action_release
+from scripts.reconcile_f048_visible_projection import _compile_service_account_resource_markers
+
+TupleKey = tuple[str, str, str]
+
+
+class ModelEvaluator:
+    """Small schema-1.1 evaluator for the rewrites emitted by the builder."""
+
+    def __init__(self, model: dict, tuples: Iterable[TupleKey]) -> None:
+        self._types = {definition["type"]: definition for definition in model["type_definitions"]}
+        self._tuples = set(tuples)
+
+    def check(self, user: str, relation: str, object_key: str) -> bool:
+        return self._check(user, relation, object_key, frozenset())
+
+    def _check(
+        self,
+        user: str,
+        relation: str,
+        object_key: str,
+        visited: frozenset[TupleKey],
+    ) -> bool:
+        key = (user, relation, object_key)
+        if key in visited:
+            return False
+        object_type = object_key.split(":", 1)[0]
+        rewrite = self._types[object_type]["relations"][relation]
+        return self._eval(
+            rewrite,
+            user,
+            relation,
+            object_key,
+            visited | {key},
+        )
+
+    def _eval(
+        self,
+        rewrite: dict,
+        user: str,
+        relation: str,
+        object_key: str,
+        visited: frozenset[TupleKey],
+    ) -> bool:
+        if "this" in rewrite:
+            return any(
+                tuple_relation == relation
+                and tuple_object == object_key
+                and self._matches_direct_user(
+                    user,
+                    tuple_user,
+                    visited,
+                )
+                for tuple_user, tuple_relation, tuple_object in self._tuples
+            )
+        if "computedUserset" in rewrite:
+            return self._check(
+                user,
+                rewrite["computedUserset"]["relation"],
+                object_key,
+                visited,
+            )
+        if "tupleToUserset" in rewrite:
+            tupleset_relation = rewrite["tupleToUserset"]["tupleset"]["relation"]
+            computed_relation = rewrite["tupleToUserset"]["computedUserset"]["relation"]
+            return any(
+                tuple_relation == tupleset_relation
+                and tuple_object == object_key
+                and self._check(
+                    user,
+                    computed_relation,
+                    tuple_user.split("#", 1)[0],
+                    visited,
+                )
+                for tuple_user, tuple_relation, tuple_object in self._tuples
+            )
+        if "union" in rewrite:
+            return any(self._eval(child, user, relation, object_key, visited) for child in rewrite["union"]["child"])
+        if "intersection" in rewrite:
+            return all(
+                self._eval(child, user, relation, object_key, visited) for child in rewrite["intersection"]["child"]
+            )
+        raise AssertionError(f"Unsupported rewrite: {rewrite}")
+
+    def _matches_direct_user(
+        self,
+        user: str,
+        tuple_user: str,
+        visited: frozenset[TupleKey],
+    ) -> bool:
+        if tuple_user == user:
+            return True
+        if tuple_user.endswith(":*"):
+            return user.split(":", 1)[0] == tuple_user[:-2]
+        if "#" in tuple_user:
+            userset_object, userset_relation = tuple_user.split("#", 1)
+            return self._check(
+                user,
+                userset_relation,
+                userset_object,
+                visited,
+            )
+        return False
+
+
+def _active_model_tuples(
+    *,
+    model_key: str = "editor",
+    actions: tuple[str, ...] = ("edit",),
+    grant_levels: tuple[int, ...] = (),
+    marker_subject: str = "user:*",
+) -> set[TupleKey]:
+    release = f"permission_model_release:catalog-1~{model_key}"
+    model = f"permission_model:{model_key}"
+    tuples: set[TupleKey] = {
+        (marker_subject, "active", "permission_catalog_release:catalog-1"),
+        ("permission_catalog_release:catalog-1", "catalog", release),
+        (marker_subject, "enabled_marker", release),
+        (release, "release", model),
+    }
+    tuples.update((marker_subject, f"{action}_marker", release) for action in actions)
+    tuples.update((marker_subject, f"grant_level_{level}_marker", release) for level in grant_levels)
+    return tuples
+
+
+def _resource_grant_tuples(
+    *,
+    resource: str,
+    grant: str,
+    model_key: str,
+    subject: str,
+    protected: bool = False,
+    custom: bool = True,
+    flattened_visible: bool = True,
+    marker_subject: str = "user:*",
+) -> set[TupleKey]:
+    relation = "protected_assignee" if protected else "ordinary_assignee"
+    tuples: set[TupleKey] = {
+        (f"permission_model:{model_key}", "model", grant),
+        (subject, relation, grant),
+        (grant, "grant", resource),
+        (marker_subject, "permission_enabled", resource),
+    }
+    if custom:
+        tuples.add((marker_subject, "custom_mode", resource))
+    if flattened_visible:
+        tuples.add((subject, "visible", resource))
+    return tuples
+
+
+def test_model_shape_actions_and_checksum_are_stable() -> None:
+    model = build_authorization_model_f048()
+    second = build_authorization_model_f048()
+    assert model == second
+    assert authorization_model_checksum(model) == authorization_model_checksum(second)
+    assert len(authorization_model_checksum(model)) == 64
+
+    types = {definition["type"]: definition for definition in model["type_definitions"]}
+    assert {
+        "permission_catalog_release",
+        "permission_model_release",
+        "permission_model",
+        "permission_grant",
+        "department",
+        "user_group",
+        "dashboard",
+        "knowledge_file",
+        "linsight_skill",
+    } <= set(types)
+    assert "can_preview" not in types["knowledge_file"]["relations"]
+    assert {f"can_{action}" for action in DEFAULT_ACTION_CODES} <= set(types["dashboard"]["relations"])
+
+
+def test_catalog_model_and_permission_enabled_are_all_required() -> None:
+    resource = "workflow:w1"
+    grant = "permission_grant:g1"
+    tuples = _active_model_tuples(actions=("edit",))
+    tuples |= _resource_grant_tuples(
+        resource=resource,
+        grant=grant,
+        model_key="editor",
+        subject="user:7",
+    )
+    evaluator = ModelEvaluator(build_authorization_model_f048(), tuples)
+    assert evaluator.check("user:7", "can_edit", resource)
+    assert evaluator.check("user:7", "visible", resource)
+
+    for required_tuple in (
+        ("user:*", "active", "permission_catalog_release:catalog-1"),
+        (
+            "permission_catalog_release:catalog-1",
+            "catalog",
+            "permission_model_release:catalog-1~editor",
+        ),
+        ("user:*", "permission_enabled", resource),
+    ):
+        without_required = ModelEvaluator(
+            build_authorization_model_f048(),
+            tuples - {required_tuple},
+        )
+        assert not without_required.check("user:7", "can_edit", resource)
+        assert without_required.check("user:7", "visible", resource)
+
+
+def test_service_account_direct_grant_passes_all_technical_gates() -> None:
+    resource = "knowledge_space:4255"
+    grant = "permission_grant:sa-editor"
+    subject = "service_account:5"
+    tuples = _active_model_tuples(
+        actions=("upload_file",),
+        marker_subject="service_account:*",
+    )
+    tuples |= _resource_grant_tuples(
+        resource=resource,
+        grant=grant,
+        model_key="editor",
+        subject=subject,
+        marker_subject="service_account:*",
+    )
+    evaluator = ModelEvaluator(build_authorization_model_f048(), tuples)
+
+    assert evaluator.check(subject, "visible", resource)
+    assert evaluator.check(subject, "can_upload_file", resource)
+
+    for required_tuple in (
+        ("service_account:*", "active", "permission_catalog_release:catalog-1"),
+        (
+            "service_account:*",
+            "upload_file_marker",
+            "permission_model_release:catalog-1~editor",
+        ),
+        ("service_account:*", "permission_enabled", resource),
+        ("service_account:*", "custom_mode", resource),
+    ):
+        without_required = ModelEvaluator(
+            build_authorization_model_f048(),
+            tuples - {required_tuple},
+        )
+        assert not without_required.check(subject, "can_upload_file", resource)
+
+
+@pytest.mark.parametrize("grant_resource", ["knowledge_space:137", "folder:742"])
+@pytest.mark.parametrize("model_key", ["editor", "owner"])
+def test_service_account_inherits_multilevel_actions_without_descendant_grants(grant_resource, model_key):
+    subject = "service_account:2"
+    model = next(
+        model
+        for model in derive_permission_models(build_initial_action_release()).models
+        if model.model_key == model_key
+    )
+    tuples = _active_model_tuples(model_key=model_key, actions=model.action_codes, marker_subject="service_account:*")
+    nodes = (
+        ("knowledge_space:137", None, "CUSTOM"),
+        ("folder:742", "knowledge_space:137", "CUSTOM" if grant_resource == "folder:742" else "INHERIT"),
+        ("folder:745", "folder:742", "INHERIT"),
+        ("knowledge_file:783", "folder:745", "INHERIT"),
+        ("folder:900", "folder:742", "CUSTOM"),
+        ("knowledge_file:901", "folder:900", "INHERIT"),
+        ("knowledge_file:902", "folder:742", "CUSTOM"),
+        ("folder:903", "knowledge_space:137", "INHERIT"),
+    )
+    for resource, parent, mode in nodes:
+        resource_type, resource_id = resource.split(":")
+        parent_type, parent_id = parent.split(":") if parent else (None, None)
+        plan = build_create_plan(
+            VerifiedPermissionTarget.from_business_service(
+                tenant_id=1,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                resource_version=0,
+                context_version=f"{resource}:0",
+                parent_type=parent_type,
+                parent_id=parent_id,
+            ),
+            store_id="store-1",
+            model_id="model-1",
+            operator_id=1,
+            idempotency_key=f"create:{resource}",
+            protected_deltas=(),
+            permission_mode=mode,
+        )
+        tuples.update((delta.user, delta.relation, delta.object) for delta in plan.deltas)
+    grant = "permission_grant:space-or-folder-editor"
+    # Only the selected ancestor has a grant; no descendant gets a direct grant.
+    tuples |= _resource_grant_tuples(
+        resource=grant_resource,
+        grant=grant,
+        model_key=model_key,
+        subject=subject,
+        marker_subject="service_account:*",
+    )
+    evaluator = ModelEvaluator(build_authorization_model_f048(), tuples)
+    for resource in (grant_resource, "folder:742", "folder:745", "knowledge_file:783"):
+        for relation in ("visible", "can_edit", "can_rename", "can_download", "can_move"):
+            assert evaluator.check(subject, relation, resource), (relation, resource)
+        assert evaluator.check(subject, "can_delete", resource) == (model_key == "owner")
+        assert not evaluator.check("service_account:3", "visible", resource)
+    for resource in ("folder:742", "folder:745"):
+        assert evaluator.check(subject, "can_upload_file", resource)
+        assert evaluator.check(subject, "can_create_folder", resource)
+    for resource in ("folder:900", "knowledge_file:901", "knowledge_file:902"):
+        for relation in ("visible", "can_edit", "can_rename", "can_delete"):
+            assert not evaluator.check(subject, relation, resource), (relation, resource)
+    for resource in ("knowledge_space:137", "folder:903"):
+        assert evaluator.check(subject, "visible", resource) == (grant_resource == "knowledge_space:137")
+
+    # Revoking the ancestor must remove inherited access without per-child writes.
+    revoked = ModelEvaluator(
+        build_authorization_model_f048(),
+        tuples - {(subject, "ordinary_assignee", grant), (subject, "visible", grant_resource)},
+    )
+    assert not revoked.check(subject, "visible", "knowledge_file:783")
+    assert not revoked.check(subject, "can_rename", "knowledge_file:783")
+
+    # Older data with user-only mode markers reproduces the empty SA listing.
+    resource_keys = {resource for resource, _, _ in nodes}
+    legacy_tuples = {row for row in tuples if not (row[0] == "service_account:*" and row[2] in resource_keys)}
+    legacy = ModelEvaluator(build_authorization_model_f048(), legacy_tuples)
+    assert legacy.check(subject, "visible", grant_resource)
+    assert not legacy.check(subject, "visible", "knowledge_file:783")
+    repaired_markers = _compile_service_account_resource_markers(
+        tuple(
+            ResourcePermissionMode(
+                tenant_id=1,
+                resource_type=resource.split(":")[0],
+                resource_id=resource.split(":")[1],
+                mode=mode,
+                projection_state="CURRENT",
+            )
+            for resource, _, mode in nodes
+        )
+    )
+    repaired = ModelEvaluator(build_authorization_model_f048(), legacy_tuples | repaired_markers)
+    assert repaired.check(subject, "visible", "knowledge_file:783")
+    assert repaired.check(subject, "can_rename", "knowledge_file:783")
+    assert repaired.check(subject, "can_upload_file", "folder:745")
+    assert repaired.check(subject, "can_delete", "knowledge_file:783") == (model_key == "owner")
+    assert not repaired.check(subject, "visible", "knowledge_file:901")
+    assert not repaired.check(subject, "can_rename", "knowledge_file:902")
+
+
+def test_custom_gate_blocks_ordinary_but_not_protected_assignment() -> None:
+    resource = "tool:t1"
+    ordinary_grant = "permission_grant:ordinary"
+    protected_grant = "permission_grant:protected"
+    tuples = _active_model_tuples(actions=("edit",))
+    tuples |= _resource_grant_tuples(
+        resource=resource,
+        grant=ordinary_grant,
+        model_key="editor",
+        subject="user:7",
+        custom=False,
+    )
+    tuples |= _resource_grant_tuples(
+        resource=resource,
+        grant=protected_grant,
+        model_key="editor",
+        subject="user:8",
+        protected=True,
+        custom=False,
+    )
+    evaluator = ModelEvaluator(build_authorization_model_f048(), tuples)
+    assert not evaluator.check("user:7", "can_edit", resource)
+    assert evaluator.check("user:8", "can_edit", resource)
+
+
+def test_inherit_uses_only_canonical_parent_and_projected_system_visibility_ignores_mode() -> None:
+    parent = "knowledge_space:s1"
+    child = "knowledge_file:f1"
+    grant = "permission_grant:g1"
+    tuples = _active_model_tuples(actions=("download",))
+    tuples |= _resource_grant_tuples(
+        resource=parent,
+        grant=grant,
+        model_key="editor",
+        subject="user:7",
+    )
+    tuples |= {
+        (parent, "parent", child),
+        ("user:*", "inherit_mode", child),
+        ("user:*", "permission_enabled", child),
+    }
+    evaluator = ModelEvaluator(build_authorization_model_f048(), tuples)
+    assert evaluator.check("user:7", "can_download", child)
+    assert evaluator.check("user:7", "visible", child)
+
+    custom_child = ModelEvaluator(
+        build_authorization_model_f048(),
+        tuples - {("user:*", "inherit_mode", child)} | {("user:*", "custom_mode", child)},
+    )
+    assert not custom_child.check("user:7", "can_download", child)
+    assert not custom_child.check("user:7", "visible", child)
+
+    public_reader_custom_child = ModelEvaluator(
+        build_authorization_model_f048(),
+        tuples - {("user:*", "inherit_mode", child)}
+        | {
+            ("user:*", "custom_mode", child),
+            ("user:*", "public_reader", parent),
+        },
+    )
+    assert not public_reader_custom_child.check("user:99", "visible", child)
+    assert not public_reader_custom_child.check("user:99", "can_download", child)
+
+
+def test_only_top_level_resources_use_pure_flat_visible() -> None:
+    model = build_authorization_model_f048()
+    types = {definition["type"]: definition for definition in model["type_definitions"]}
+
+    for resource_type in ("knowledge_space", "workflow"):
+        visible = types[resource_type]["relations"]["visible"]
+        assert visible["union"]["child"][0] == {"this": {}}
+        assert visible["union"]["child"][1] == {"computedUserset": {"relation": "system_visible"}}
+    for resource_type in ("folder", "knowledge_file"):
+        relations = types[resource_type]["relations"]
+        assert relations["visible"] != {"this": {}}
+        assert "inherited_visible" in relations
+        assert "system_visible" in relations
+
+
+def test_department_subtree_and_user_group_usersets_are_not_expanded() -> None:
+    resource = "channel:c1"
+    grant = "permission_grant:g1"
+    tuples = _active_model_tuples(actions=("edit",))
+    tuples |= _resource_grant_tuples(
+        resource=resource,
+        grant=grant,
+        model_key="editor",
+        subject="department:root#subtree_member",
+    )
+    tuples |= {
+        ("department:child", "child", "department:root"),
+        ("user:7", "member", "department:child"),
+        ("user:8", "member", "user_group:team"),
+        ("user_group:team#member", "ordinary_assignee", grant),
+    }
+    evaluator = ModelEvaluator(build_authorization_model_f048(), tuples)
+    assert not evaluator.check("user:7", "can_edit", resource)
+    # ModelEvaluator receives the union of stored and request-local tuples.
+    with_context = ModelEvaluator(
+        build_authorization_model_f048(),
+        tuples
+        | {
+            ("user:7", "subtree_member", "department:root"),
+            ("user:7", "subtree_member", "department:child"),
+        },
+    )
+    assert with_context.check("user:7", "can_edit", resource)
+    assert not with_context.check("user:7", "member", "department:root")
+    assert evaluator.check("user:8", "can_edit", resource)
+
+
+def test_grant_level_is_intersected_inside_the_same_grant() -> None:
+    resource = "dashboard:d1"
+    manager_grant = "permission_grant:manager"
+    unrelated_grant = "permission_grant:unrelated"
+    tuples = _active_model_tuples(
+        model_key="manager",
+        actions=("manage_permission", "edit"),
+        grant_levels=(1, 2),
+    )
+    tuples |= _active_model_tuples(
+        model_key="viewer",
+        actions=(),
+        grant_levels=(),
+    )
+    tuples |= _resource_grant_tuples(
+        resource=resource,
+        grant=manager_grant,
+        model_key="manager",
+        subject="user:7",
+    )
+    tuples |= _resource_grant_tuples(
+        resource=resource,
+        grant=unrelated_grant,
+        model_key="viewer",
+        subject="user:8",
+    )
+    evaluator = ModelEvaluator(build_authorization_model_f048(), tuples)
+    assert evaluator.check("user:7", "can_grant_level_2", resource)
+    assert not evaluator.check("user:8", "can_grant_level_2", resource)
+    assert evaluator.check("user:7", "can_edit", resource)
+    assert not evaluator.check("user:7", "can_delete", resource)
+
+
+def test_shared_system_read_is_resource_specific_and_read_only() -> None:
+    model = build_authorization_model_f048()
+    base = {
+        ("user:7", "member", "tenant:child"),
+        ("tenant:child", "shared_with", "knowledge_library:k1"),
+        ("user:*", "permission_enabled", "knowledge_library:k1"),
+        ("tenant:child", "shared_with", "knowledge_file:f1"),
+        ("user:*", "permission_enabled", "knowledge_file:f1"),
+    }
+    evaluator = ModelEvaluator(model, base)
+    assert evaluator.check("user:7", "visible", "knowledge_library:k1")
+    assert evaluator.check("user:7", "can_use", "knowledge_library:k1")
+    assert not evaluator.check("user:7", "can_edit", "knowledge_library:k1")
+    assert evaluator.check("user:7", "can_download", "knowledge_file:f1")
+    assert not evaluator.check("user:7", "can_use", "knowledge_file:f1")
+
+
+def test_visible_is_single_slot_shallow_and_has_no_ab_switch() -> None:
+    model = build_authorization_model_f048()
+    types = {definition["type"]: definition for definition in model["type_definitions"]}
+    for type_name in ("knowledge_space", "dashboard"):
+        relations = types[type_name]["relations"]
+        assert "visible" in relations
+        assert relations["visible"]["union"]["child"][0] == {"this": {}}
+        assert "ordinary_visible" not in relations
+        assert "protected_visible" not in relations
+        assert all("visible_a" not in relation and "visible_b" not in relation for relation in relations)
+        assert all("visibility_switch" not in relation for relation in relations)
+
+    for type_name in ("folder", "knowledge_file"):
+        relations = types[type_name]["relations"]
+        assert relations["visible"] != {"this": {}}
+        assert "inherited_visible" in relations
+        assert "system_visible" in relations
+        assert all("visible_a" not in relation and "visible_b" not in relation for relation in relations)
+        assert all("visibility_switch" not in relation for relation in relations)
+
+    grant_relations = types["permission_grant"]["relations"]
+    assert "ordinary_visible" not in grant_relations
+    assert "protected_visible" not in grant_relations
+
+    resource = "knowledge_space:s1"
+    evaluator = ModelEvaluator(
+        model,
+        {
+            ("department:17#member", "visible", resource),
+            ("user:7", "member", "department:17"),
+        },
+    )
+    assert evaluator.check("user:7", "visible", resource)
+
+
+def test_inactive_model_keeps_existing_visible_actions_and_manage() -> None:
+    resource = "workflow:w-inactive"
+    grant = "permission_grant:g-inactive"
+    release = "permission_model_release:catalog-1~editor"
+    tuples = _active_model_tuples(actions=("edit", "manage_permission"))
+    tuples.remove(("user:*", "enabled_marker", release))
+    tuples |= _resource_grant_tuples(
+        resource=resource,
+        grant=grant,
+        model_key="editor",
+        subject="user:7",
+    )
+
+    evaluator = ModelEvaluator(build_authorization_model_f048(), tuples)
+    assert evaluator.check("user:7", "visible", resource)
+    assert evaluator.check("user:7", "can_edit", resource)
+    assert evaluator.check("user:7", "can_manage_permission", resource)
+
+    missing_model = ModelEvaluator(
+        build_authorization_model_f048(),
+        tuples
+        - {
+            (release, "release", "permission_model:editor"),
+            ("user:7", "visible", resource),
+        },
+    )
+    assert not missing_model.check("user:7", "visible", resource)
+    assert not missing_model.check("user:7", "can_edit", resource)
+    assert not missing_model.check("user:7", "can_manage_permission", resource)
+
+
+def test_admin_identity_does_not_expand_personal_visible_set() -> None:
+    resource = "knowledge_space:private"
+    evaluator = ModelEvaluator(
+        build_authorization_model_f048(),
+        {
+            ("user:1", "super_admin", "system:root"),
+            ("user:1", "admin", "tenant:1"),
+            ("user:*", "permission_enabled", resource),
+            ("user:*", "custom_mode", resource),
+        },
+    )
+    assert not evaluator.check("user:1", "visible", resource)

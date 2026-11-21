@@ -1,0 +1,282 @@
+import { LoadingIcon } from '~/components/ui/icon/Loading';
+import { useCallback, useEffect, useRef, useState, type UIEvent } from 'react';
+import { Link } from 'react-router-dom';
+import { ModuleHomeHeader } from '~/components/ModuleHome';
+import { AgentCard } from './components/AgentCard';
+import { AppEmptyState } from './components/AppEmptyState';
+import { AppSearchBar } from './components/AppSearchBar';
+import { EmptyStateIllustration } from '~/components/illustrations';
+import { useAppCenter } from './hooks/useAppCenter';
+import { useLocalize, usePrefersMobileLayout, useWorkbenchMenuNames } from '~/hooks';
+import { ChannelBlocksArrowsIcon } from '~/components/icons/channels';
+import { cn } from '~/utils';
+
+export default function AppCenter() {
+    const localize = useLocalize();
+    // 页面标题跟随后台配置的菜单显示名称
+    const menuNames = useWorkbenchMenuNames();
+    const recentAppsHint = localize('com_app.recent_apps_hint');
+    const {
+        apps,
+        loading,
+        loadingMore,
+        loadError,
+        loadMoreError,
+        hasMore,
+        searchQuery,
+        setSearchQuery,
+        fetchApps,
+        loadMore,
+        togglePin,
+        continueChat,
+        shareApp,
+    } = useAppCenter();
+
+    // Mobile layout (≤767px) is when MainLayout shows its own centered top-bar
+    // title, so the page must drop its inline big title to avoid a duplicate.
+    const isMobileLayout = usePrefersMobileLayout();
+    const appLastOriginKey = 'app-last-origin';
+    const mainRef = useRef<HTMLElement | null>(null);
+    const appGridRef = useRef<HTMLDivElement | null>(null);
+    const loadMoreSentinelRef = useRef<HTMLDivElement | null>(null);
+    const loadMoreLockRef = useRef(false);
+    const [isMainScrolling, setIsMainScrolling] = useState(false);
+    const mainScrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+    const triggerLoadMore = useCallback(() => {
+        if (loadMoreLockRef.current || loading || loadingMore || loadMoreError || !hasMore) return;
+        loadMoreLockRef.current = true;
+        loadMore();
+    }, [hasMore, loadMore, loadMoreError, loading, loadingMore]);
+
+    const handleMainScroll = (event: UIEvent<HTMLElement>) => {
+        setIsMainScrolling(true);
+        if (mainScrollTimerRef.current) clearTimeout(mainScrollTimerRef.current);
+        mainScrollTimerRef.current = setTimeout(() => {
+            setIsMainScrolling(false);
+            mainScrollTimerRef.current = null;
+        }, 600);
+
+        const node = event.currentTarget;
+        if (node.scrollTop + node.clientHeight >= node.scrollHeight - 240) {
+            triggerLoadMore();
+        }
+    };
+
+    useEffect(() => {
+        return () => {
+            if (mainScrollTimerRef.current) clearTimeout(mainScrollTimerRef.current);
+        };
+    }, []);
+
+    useEffect(() => {
+        if (!loadingMore) loadMoreLockRef.current = false;
+    }, [loadingMore]);
+
+    const [appGridCols, setAppGridCols] = useState(() => {
+        if (typeof window === 'undefined') return 3;
+        const width = window.innerWidth;
+        const mobile = window.matchMedia('(max-width: 767px)').matches;
+        if (mobile) {
+            return width < 480 ? 1 : 2;
+        }
+        if (width < 480) return 1;
+        if (width < 600) return 2;
+        return 3;
+    });
+
+    useEffect(() => {
+        // Prevent first-render flash: when entering on mobile, clamp columns
+        // from viewport width before ResizeObserver reports container width.
+        if (typeof window !== 'undefined' && isMobileLayout) {
+            const width = window.innerWidth;
+            setAppGridCols(width < 480 ? 1 : 2);
+        }
+
+        const el = appGridRef.current;
+        if (!el || typeof ResizeObserver === 'undefined') return;
+
+        const resolveCols = (width: number) => {
+            if (width < 480) return 1;
+            if (width < 600) return 2;
+            return 3;
+        };
+
+        const update = () => {
+            const width = el.clientWidth;
+            if (isMobileLayout) {
+                setAppGridCols(width < 480 ? 1 : 2);
+                return;
+            }
+            setAppGridCols(resolveCols(width));
+        };
+
+        update();
+
+        const observer = new ResizeObserver(update);
+        observer.observe(el);
+        return () => observer.disconnect();
+    }, [apps.length, isMobileLayout]);
+
+    useEffect(() => {
+        const root = mainRef.current;
+        const target = loadMoreSentinelRef.current;
+        if (!root || !target) return;
+
+        const observer = new IntersectionObserver(
+            (entries) => {
+                if (entries[0]?.isIntersecting) triggerLoadMore();
+            },
+            { root, rootMargin: '240px 0px', threshold: 0 },
+        );
+        observer.observe(target);
+        return () => observer.disconnect();
+    }, [apps.length, triggerLoadMore]);
+
+    // Initial fetch
+    useEffect(() => {
+        fetchApps();
+    }, [fetchApps]);
+
+    // Entering app center should reset app-return origin to center.
+    // This avoids stale "home-recommended" state on another machine/session
+    // causing app-chat back action to jump to /c/new unexpectedly.
+    useEffect(() => {
+        try {
+            sessionStorage.setItem(appLastOriginKey, 'center');
+        } catch {
+            // ignore storage failures
+        }
+    }, []);
+
+    const exploreLink = (
+        <Link
+            to="/apps/explore"
+            className="flex shrink-0 items-center justify-center gap-[6px] rounded-lg px-[10px] py-[6px] transition-colors fine-pointer:hover:bg-gray-50"
+        >
+            <ChannelBlocksArrowsIcon className="size-4 text-blue-500" />
+            <span className="font-['PingFang_SC'] text-text-1 text-[12px] leading-[20px] whitespace-nowrap">
+                {localize('com_app.explore_more')}
+            </span>
+        </Link>
+    );
+
+    return (
+        <div
+            className={cn(
+                // 填满 MainLayout 白卡片；正文区单独滚动 + scroll-on-scroll（含 PC 窄屏）
+                'bg-white flex h-full min-h-0 flex-1 w-full flex-col items-center relative overflow-hidden',
+                // 与首页 MobileNav（px-4）水平对齐；顶栏由 MainLayout 提供，正文略留底距
+                isMobileLayout ? 'px-4 pb-5 pt-3' : 'px-[12px] py-[20px]',
+            )}
+        >
+            {isMobileLayout ? (
+                <>
+                    {/* H5：标题已上移到顶栏（MainLayout）。此行只保留 最近使用文案（可省略）| 探索；下一行搜索占满宽 */}
+                    <header className="flex w-full max-w-[1000px] shrink-0 items-center gap-2 min-w-0">
+                        <p
+                            className="font-['PingFang_SC'] text-[#666] text-[13px] leading-[20px] min-w-0 flex-1 truncate"
+                            title={recentAppsHint}
+                        >
+                            {recentAppsHint}
+                        </p>
+                        {exploreLink}
+                    </header>
+                    <div className="mt-3 mb-4 w-full max-w-[1000px] shrink-0 min-w-0">
+                        <AppSearchBar query={searchQuery} onSearch={setSearchQuery} forceExpanded />
+                    </div>
+                </>
+            ) : (
+                <>
+                    {/* Shared module-home frame (~/components/ModuleHome): the page's tools on
+                        the right — 应用 has nothing to create here, so that is the search alone.
+                        Discovering apps is the sidebar's 广场; the 探索更多应用 link stays on
+                        mobile only. */}
+                    <ModuleHomeHeader title={menuNames.apps}>
+                        <div className="w-auto min-w-[120px] shrink-0">
+                            <AppSearchBar query={searchQuery} onSearch={setSearchQuery} forceExpanded />
+                        </div>
+                    </ModuleHomeHeader>
+
+                    <div className="mt-4 mb-4 flex w-full max-w-[1000px] min-w-0 shrink-0 items-center gap-4 sm:gap-6">
+                        <div className="flex min-w-0 flex-1 items-center justify-start overflow-hidden">
+                            <div className="flex w-max max-w-full min-w-0 items-center gap-[24px]">
+                                <p
+                                    className="font-['PingFang_SC'] text-[#666] text-[14px] leading-[22px] min-w-0 shrink truncate"
+                                    title={recentAppsHint}
+                                >
+                                    {recentAppsHint}
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                </>
+            )}
+
+            {/* 内容区域：flex-1 内滚动，PC 窄屏与移动端一致用 scroll-on-scroll。
+                滚动区占满整宽（滚动条贴最右），内容居中约束在 1000px */}
+            <main
+                ref={mainRef}
+                className="relative flex min-h-0 w-full flex-1 flex-col items-center overflow-x-hidden overflow-y-auto scroll-on-scroll"
+                onScroll={handleMainScroll}
+                data-scrolling={isMainScrolling ? 'true' : 'false'}
+            >
+                <div className="flex w-full max-w-[1000px] flex-1 flex-col items-start gap-[14px]">
+                    {loading ? (
+                        <div className="flex w-full flex-1 flex-col items-center justify-center gap-3 text-text-3">
+                            <LoadingIcon className="size-20 text-primary" />
+                            <span className="text-sm">{localize('com_list_loading')}</span>
+                        </div>
+                    ) : loadError ? (
+                        <div className="flex w-full flex-1 items-center justify-center text-text-3">
+                            <p className="text-[14px] font-normal">{localize('com_list_load_failed')}</p>
+                        </div>
+                    ) : apps.length === 0 ? (
+                        // Empty state: fill the region and place content via flex spacers at a
+                        // region-relative height (not viewport vh): ~40% on mobile, ~45% on PC.
+                        <div className="w-full flex-1 flex flex-col items-center">
+                            <div className="flex-[8] md:flex-[9]" aria-hidden />
+                            {searchQuery ? (
+                                <>
+                                    <EmptyStateIllustration className="size-[120px] mb-4" />
+                                    <p className="text-[14px] font-normal text-text-3">{localize('com_list_no_results')}</p>
+                                </>
+                            ) : (
+                                <AppEmptyState />
+                            )}
+                            <div className="flex-[12] md:flex-[11]" aria-hidden />
+                        </div>
+                    ) : (
+                        <>
+                            <div
+                                ref={appGridRef}
+                                className="grid w-full relative items-start gap-4"
+                                style={{ gridTemplateColumns: `repeat(${appGridCols}, minmax(0, 1fr))` }}
+                            >
+                                {apps.map((agent) => (
+                                    <AgentCard
+                                        key={agent.id}
+                                        agent={agent}
+                                        isPinned={!!agent.is_pinned}
+                                        onTogglePin={togglePin}
+                                        onStartChat={continueChat}
+                                        onShare={shareApp}
+                                    />
+                                ))}
+                            </div>
+                            <div ref={loadMoreSentinelRef} className="flex h-12 w-full items-center justify-center text-[12px] text-text-4">
+                                {loadingMore
+                                    ? localize('com_list_loading_more')
+                                    : loadMoreError
+                                        ? localize('com_list_load_failed')
+                                        : !hasMore
+                                            ? localize('com_list_all_loaded')
+                                            : ''}
+                            </div>
+                        </>
+                    )}
+                </div>
+            </main>
+        </div>
+    );
+}

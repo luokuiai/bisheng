@@ -1,0 +1,113 @@
+import axios from "../request";
+
+// ============ F035 Track D/I: tenant custom skill management ============
+
+export interface SkillBrief {
+  id: number;
+  name: string;
+  display_name: string;
+  description: string;
+  enabled: boolean;
+  // Preselected in the end-user picker of every new conversation
+  default_checked: boolean;
+  source: 'manual' | 'sop_migrated';
+  create_time?: string;
+  update_time?: string;
+}
+
+export interface SkillFileEntry {
+  path: string;
+  size: number;
+}
+
+export interface SkillDetail extends SkillBrief {
+  preview: string;
+  source_text: string;
+  files: SkillFileEntry[];
+  // Import-time only: original frontmatter name when the backend auto-normalized
+  // it to a spec-legal skill ID (e.g. "Presentations" -> "presentations").
+  normalized_from?: string | null;
+}
+
+export interface SkillPage {
+  data: SkillBrief[];
+  total: number;
+}
+
+export interface SkillFormPayload {
+  display_name: string;
+  name: string;
+  description: string;
+  content: string;
+}
+
+export interface SkillUploadLimit {
+  max_size_bytes: number;
+  max_size_mb: number;
+  max_unpacked_bytes: number;
+  max_unpacked_mb: number;
+}
+
+const SKILL_BASE = '/api/v1/linsight/skill';
+
+// Business-error responses are handled by callers (silent mode) so validation
+// copy can be localized; see mapSkillError in the skill components.
+export const skillApi = {
+  /** Effective caps from 系统配置 (linsight.skill_upload_max_size_mb /
+   *  skill_unpacked_max_size_mb); the dialog pre-checks the upload cap and quotes both,
+   *  so its copy and the server agree on the numbers. */
+  getUploadLimit: (): Promise<SkillUploadLimit> => {
+    return axios.get(`${SKILL_BASE}/upload-limit`);
+  },
+
+  getSkillList: (params: { keyword?: string; enabled?: boolean; page?: number; page_size?: number }): Promise<SkillPage> => {
+    return axios.get(SKILL_BASE, { params });
+  },
+
+  getSkillDetail: (name: string): Promise<SkillDetail> => {
+    return axios.get(`${SKILL_BASE}/${encodeURIComponent(name)}`);
+  },
+
+  getSkillFile: (name: string, path: string): Promise<{ path: string; content: string }> => {
+    return axios.get(`${SKILL_BASE}/${encodeURIComponent(name)}/file`, { params: { path } });
+  },
+
+  createSkillForm: (data: SkillFormPayload): Promise<SkillDetail> => {
+    const form = new FormData();
+    Object.entries(data).forEach(([k, v]) => form.append(k, v));
+    return axios.post(SKILL_BASE, form, { silent: true } as any);
+  },
+
+  createSkillUpload: (file: File): Promise<SkillDetail> => {
+    const form = new FormData();
+    form.append('file', file);
+    return axios.post(SKILL_BASE, form, { silent: true } as any);
+  },
+
+  // Import a skill from a public GitHub directory URL (must contain SKILL.md at root).
+  importSkillFromGithub: (url: string): Promise<SkillDetail> => {
+    return axios.post(`${SKILL_BASE}/import-github`, { url }, { silent: true } as any);
+  },
+
+  updateSkillForm: (name: string, data: SkillFormPayload): Promise<SkillDetail> => {
+    const form = new FormData();
+    Object.entries(data).forEach(([k, v]) => form.append(k, v));
+    return axios.put(`${SKILL_BASE}/${encodeURIComponent(name)}`, form, { silent: true } as any);
+  },
+
+  setSkillStatus: (name: string, enabled: boolean) => {
+    return axios.patch(`${SKILL_BASE}/${encodeURIComponent(name)}/status`, { enabled });
+  },
+
+  setSkillDefaultChecked: (name: string, defaultChecked: boolean) => {
+    return axios.patch(`${SKILL_BASE}/${encodeURIComponent(name)}/default-checked`, { default_checked: defaultChecked });
+  },
+
+  deleteSkill: (name: string) => {
+    return axios.delete(`${SKILL_BASE}/${encodeURIComponent(name)}`);
+  },
+
+  slugify: (text: string): Promise<{ slug: string }> => {
+    return axios.get(`${SKILL_BASE}/slugify`, { params: { text } });
+  },
+};

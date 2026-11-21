@@ -1,0 +1,257 @@
+from bisheng.common.errcode.base import BaseErrorCode
+
+
+class FileUploadError(BaseErrorCode):
+    __doc__ = "LinsightFailed to upload documents"
+    Code: int = 11020
+    Msg: str = "Upload Failed"
+
+
+# ---------------------------------------------------------------------------
+# Task-mode FOLDER upload limits (11021–11023). Numbered next to FileUploadError
+# (11020) because they belong to the same upload family. The frontend enforces
+# the same three numbers for instant feedback; these are the server-side gate,
+# so a user normally never sees them.
+# ---------------------------------------------------------------------------
+
+
+class LinsightFolderFileCountExceededError(BaseErrorCode):
+    Code: int = 11021
+    Msg: str = "A folder upload may contain at most 100 files"
+
+
+class LinsightFolderTotalSizeExceededError(BaseErrorCode):
+    Code: int = 11022
+    Msg: str = "A folder upload may not exceed 500MB in total"
+
+
+class LinsightFolderDepthExceededError(BaseErrorCode):
+    Code: int = 11023
+    Msg: str = "Folder nesting may not exceed 10 levels"
+
+
+# Per-file ceiling on the task-mode upload endpoint. It had none until folder
+# upload made the gap material — 100 files arrive in one go, and a frontend-only
+# check is a hint, not a limit.
+class LinsightFileTooLargeError(BaseErrorCode):
+    Code: int = 11024
+    Msg: str = "The file exceeds the upload size limit"
+
+
+# The PDF preview of a task-generated .ppt/.pptx could not be produced (LibreOffice
+# failed, timed out, or rendered zero pages). The original file stays downloadable.
+class LinsightArtifactPreviewError(BaseErrorCode):
+    Code: int = 11025
+    Msg: str = "Failed to generate the slide preview"
+
+
+# Your Idea has run out of uses, please use the new invite code to activate the Idea feature
+class LinsightUseUpError(BaseErrorCode):
+    Code: int = 11030
+    Msg: str = "Your Idea has run out of uses, please use the new invite code to activate the Idea feature"
+
+
+# Failed to submit Idea User Issue
+class LinsightQuestionError(BaseErrorCode):
+    Code: int = 11040
+    Msg: str = "Failed to submit Idea User Issue"
+
+
+# Failed to initialize the Inspiration Workbench tool
+class LinsightToolInitError(BaseErrorCode):
+    Code: int = 11080
+    Msg: str = "Failed to initialize the Inspiration Workbench tool"
+
+
+# InspirationBisheng LLMRelated Errors
+class LinsightBishengLLMError(BaseErrorCode):
+    Code: int = 11090
+    Msg: str = "InspirationBisheng LLMRelated Errors"
+
+
+# F087: the task's context still exceeded the model's context window after the
+# framework compressed history and retried. Written as ``error_code`` by
+# ``classify_for_event`` for the ``context_overflow`` error type.
+class LinsightContextOverflowError(BaseErrorCode):
+    Code: int = 11075
+    Msg: str = "The task content exceeds the model's context length"
+
+
+# F087: generating the summary while compressing task history failed twice.
+# Raised by the task-mode summarization middleware; the classifier matches it by
+# class name (``common`` must not import ``linsight``), so keep the name stable.
+class LinsightContextCompressFailedError(BaseErrorCode):
+    Code: int = 11076
+    Msg: str = "Failed to compress the task history"
+
+
+# The Inspiration session version has been completed or is being executed and cannot be executed again
+class LinsightSessionVersionRunningError(BaseErrorCode):
+    Code: int = 11120
+    Msg: str = "The Inspiration session version has been completed or is being executed and cannot be executed again"
+
+
+# Failed to start the Ideas task
+class LinsightStartTaskError(BaseErrorCode):
+    Code: int = 11130
+    Msg: str = "Failed to start the Ideas task"
+
+
+# Failed to get Ideas queue queue status
+class LinsightQueueStatusError(BaseErrorCode):
+    Code: int = 11140
+    Msg: str = "Failed to get Ideas queue queue status"
+
+
+class InviteCodeInvalidError(BaseErrorCode):
+    Code: int = 11180
+    Msg: str = "The invite code you entered is invalid"
+
+
+class InviteCodeBindError(BaseErrorCode):
+    Code: int = 11190
+    Msg: str = "Additional invite codes bound"
+
+
+# ---------------------------------------------------------------------------
+# F035 灵思任务模式 · Skill 管理错误码（段位 11050–11069）
+#
+# 契约 release-contract 表 3 将 Skill 管理分配在 11050–11069 段。原占用该段的存量
+# SOP 检索/管理错误码（LinsightVectorModelError 11050 / LinsightDocSearchError 11060
+# / LinsightDocNotFoundError 11070，design §8.6「计划下线的 SOP 动态生成链路」）已
+# 随 SOP 残留代码整体移除（2026-06-17，sop_manage.py 等已删，段位腾空）。
+# Skill 错误码沿用已发布编号 11051–11058，不回迁到腾空的 11050（已发布编码不重编）。
+# ---------------------------------------------------------------------------
+
+
+# Skill frontmatter / name validation failed
+class SkillValidationError(BaseErrorCode):
+    Code: int = 11051
+    Msg: str = "Skill validation failed: invalid frontmatter or name"
+
+
+# Uploaded skill file (the .md / .zip / .skill payload itself) exceeds the configured upload limit
+class SkillFileTooLargeError(BaseErrorCode):
+    Code: int = 11052
+    Msg: str = "Skill file exceeds {limit_mb} MiB"
+
+
+# Skill not found in the current tenant
+class SkillNotFoundError(BaseErrorCode):
+    Code: int = 11053
+    Msg: str = "Skill not found"
+
+
+# No permission to operate on this skill
+class SkillPermissionError(BaseErrorCode):
+    Code: int = 11054
+    Msg: str = "No permission to operate on this skill"
+
+
+# A skill with the same name already exists in the current tenant
+# NOTE: contract originally allocated 11050 for duplicate-name; shipped as 11055
+# (11050 was occupied by a since-removed SOP code). Kept at 11055 — released error
+# codes are not renumbered.
+class SkillNameDuplicateError(BaseErrorCode):
+    Code: int = 11055
+    Msg: str = "A skill with the same name already exists"
+
+
+# ---------------------------------------------------------------------------
+# Skill import-from-GitHub errors (11056–11058). Transport/parse concerns only;
+# the downloaded directory then flows through the same create chain as upload,
+# so frontmatter/size/duplicate failures still reuse 11051/11052/11055.
+# ---------------------------------------------------------------------------
+
+
+# The pasted URL is not a parseable public GitHub directory link
+class SkillGitHubUrlInvalidError(BaseErrorCode):
+    Code: int = 11056
+    Msg: str = "Invalid GitHub URL: expecting https://github.com/{owner}/{repo}/tree/{branch}/{path}"
+
+
+# Repo/branch/path not found, network error or timeout while fetching from GitHub
+class SkillGitHubFetchError(BaseErrorCode):
+    Code: int = 11057
+    Msg: str = "Failed to fetch skill from GitHub (repo/branch/path not found or network error)"
+
+
+# GitHub API rate limit exceeded (anonymous access is capped at 60 requests/hour)
+class SkillGitHubRateLimitError(BaseErrorCode):
+    Code: int = 11058
+    Msg: str = "GitHub API rate limit exceeded, please retry later"
+
+
+# Bundle contents exceed the unpacked-size limit: sum of the extracted files (upload)
+# or of the downloaded files (GitHub import). Distinct from 11052 — that one is about
+# the uploaded payload itself, and a 7MB archive can still expand past this line, so
+# the two must not share one message ("file exceeds 10MB" on a 7MB file reads as a bug).
+# Numbered after the GitHub block to keep this file in ascending code order.
+class SkillBundleTooLargeError(BaseErrorCode):
+    Code: int = 11059
+    Msg: str = "Skill bundle exceeds {limit_mb} MiB when unpacked"
+
+
+class SkillCountLimitError(BaseErrorCode):
+    Code: int = 11061
+    Msg: str = "Personal skill count limit reached"
+
+
+class SkillStorageLimitError(BaseErrorCode):
+    Code: int = 11062
+    Msg: str = "Personal skill storage limit reached"
+
+
+class SkillArchiveEncryptedError(BaseErrorCode):
+    Code: int = 11063
+    Msg: str = "The archive is encrypted. Remove the password and choose the file again"
+
+
+class SkillVersionConflictError(BaseErrorCode):
+    Code: int = 11064
+    Msg: str = "This Skill has been updated. Refresh and try again"
+
+
+class SkillTypeMismatchError(BaseErrorCode):
+    Code: int = 11065
+    Msg: str = "The file type does not match its contents"
+
+
+class SkillImportMismatchError(BaseErrorCode):
+    Code: int = 11066
+    Msg: str = "This import was already used for a different file"
+
+
+class SkillArchiveDamagedError(BaseErrorCode):
+    Code: int = 11067
+    Msg: str = "The archive is damaged"
+
+
+class SkillManifestMissingError(BaseErrorCode):
+    Code: int = 11068
+    Msg: str = "The archive does not contain SKILL.md"
+
+
+class SkillPathEscapeError(BaseErrorCode):
+    Code: int = 11069
+    Msg: str = "The archive contains a path outside the skill directory"
+
+
+class SkillEmptyFileError(BaseErrorCode):
+    Code: int = 11071
+    Msg: str = "The file is empty"
+
+
+class SkillMultipleError(BaseErrorCode):
+    Code: int = 11072
+    Msg: str = "The archive contains more than one skill"
+
+
+class SkillManifestTooLargeError(BaseErrorCode):
+    Code: int = 11073
+    Msg: str = "SKILL.md exceeds {limit_mb} MiB"
+
+
+class SkillEntryLimitError(BaseErrorCode):
+    Code: int = 11074
+    Msg: str = "The archive contains more than {limit_count} entries"

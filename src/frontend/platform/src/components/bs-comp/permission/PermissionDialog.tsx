@@ -1,0 +1,271 @@
+import { Alert, Button } from "@bisheng/ui";
+
+import { Checkbox } from "@bisheng/ui";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/bs-ui/dialog";
+import { Tabs } from "@bisheng/ui";
+import {
+  getResourcePermissionContextApi,
+  type ApplyPermissionModeDraftResult,
+  type MutateResourceGrantsResult,
+  type PermissionGrantAssignee,
+  type ResourcePermissionContext,
+} from "@/controllers/API/permission";
+import { Loader2 } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { permissionDialogClassName, PermissionSubjectTabs } from "./PermissionSubjectLayout";
+import { AllMembersPermission } from "./AllMembersPermission";
+import { ModeHeader } from "./ModeHeader";
+import { PermissionGrantTab } from "./PermissionGrantTab";
+import { PermissionListTab } from "./PermissionListTab";
+import type { ResourceType, SubjectType } from "./types";
+
+interface PermissionDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  resourceType: ResourceType;
+  resourceId: string;
+  resourceName: string;
+  allowAllMembers?: boolean;
+}
+
+const SUBJECT_TABS: Array<{ value: SubjectType; labelKey: string }> = [
+  { value: "user", labelKey: "subject.user" },
+  { value: "department", labelKey: "subject.department" },
+  { value: "user_group", labelKey: "subject.userGroup" },
+];
+
+export function PermissionDialog({
+  open,
+  onOpenChange,
+  resourceType,
+  resourceId,
+  resourceName,
+  allowAllMembers = false,
+}: PermissionDialogProps) {
+  const { t } = useTranslation("permission");
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  const grantContentRef = useRef<HTMLDivElement | null>(null);
+  const [context, setContext] = useState<ResourcePermissionContext | null>(null);
+  const [assignees, setAssignees] = useState<PermissionGrantAssignee[]>([]);
+  const [subjectType, setSubjectType] = useState<SubjectType>("user");
+  const [grantSubjectType, setGrantSubjectType] = useState<SubjectType>("user");
+  const [grantIncludeChildren, setGrantIncludeChildren] = useState(false);
+  const [grantDialogOpen, setGrantDialogOpen] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  const loadContext = useCallback(async () => {
+    setLoading(true);
+    setFailed(false);
+    try {
+      setContext(await getResourcePermissionContextApi(resourceType, resourceId));
+    } catch {
+      setContext(null);
+      setFailed(true);
+    } finally {
+      setLoading(false);
+    }
+  }, [resourceId, resourceType]);
+
+  useEffect(() => {
+    if (!open) {
+      setContext(null);
+      setAssignees([]);
+      setGrantDialogOpen(false);
+      return;
+    }
+    setSubjectType("user");
+    setGrantSubjectType("user");
+    setGrantIncludeChildren(false);
+    void loadContext();
+  }, [loadContext, open]);
+
+  const handleModeApplied = (result: ApplyPermissionModeDraftResult) => {
+    setContext((current) =>
+      current
+        ? {
+            ...current,
+            mode: result.mode,
+            resource_version: result.resource_version,
+          }
+        : current,
+    );
+    setRefreshKey((current) => current + 1);
+  };
+
+  const handleGrantSuccess = (result: MutateResourceGrantsResult) => {
+    setContext((current) => (current ? { ...current, resource_version: result.resource_version } : current));
+    setAssignees(result.items);
+    setRefreshKey((current) => current + 1);
+    setGrantDialogOpen(false);
+  };
+
+  const canAddPermission = context?.mode === "CUSTOM" && context.can_manage_permission;
+
+  const handleContentOpenAutoFocus = useCallback((event: Event) => {
+    event.preventDefault();
+    requestAnimationFrame(() => contentRef.current?.focus({ preventScroll: true }));
+  }, []);
+
+  const handleGrantContentOpenAutoFocus = useCallback((event: Event) => {
+    event.preventDefault();
+    requestAnimationFrame(() => grantContentRef.current?.focus({ preventScroll: true }));
+  }, []);
+
+  return (
+    <>
+      <Dialog open={open} onOpenChange={onOpenChange}>
+        <DialogContent
+          ref={contentRef}
+          onOpenAutoFocus={handleContentOpenAutoFocus}
+          className={`${permissionDialogClassName} p-0`}
+        >
+          <DialogHeader className="shrink-0 px-5 pb-4 pt-5">
+            <DialogTitle>
+              {t("dialog.title")} - {resourceName}
+            </DialogTitle>
+            <DialogDescription className="sr-only">{t("dialog.description")}</DialogDescription>
+          </DialogHeader>
+
+          {loading && (
+            <div
+              className="flex min-h-56 flex-1 items-center justify-center gap-2 text-sm text-muted-foreground"
+              role="status"
+            >
+              <Loader2 aria-hidden="true" className="size-4 animate-spin" />
+              {t("dialog.loading")}
+            </div>
+          )}
+
+          {failed && !loading && (
+            <Alert type="error" className="mx-5" description={t("dialog.loadFailed")} live />
+          )}
+
+          {context && !loading && !failed && (
+            <div className="flex min-h-0 flex-1 flex-col">
+              <ModeHeader
+                resourceType={resourceType}
+                resourceId={resourceId}
+                context={context}
+                onApplied={handleModeApplied}
+              />
+
+              {allowAllMembers && (
+                <AllMembersPermission
+                  resourceType={resourceType}
+                  resourceId={resourceId}
+                  context={context}
+                  onChanged={async () => {
+                    await loadContext();
+                    setRefreshKey((value) => value + 1);
+                  }}
+                />
+              )}
+              <div className="flex min-h-0 flex-1 flex-col px-5 pb-5 pt-4">
+                <Tabs
+                  size="small"
+                  activeKey={subjectType}
+                  onChange={(value) => setSubjectType(value as SubjectType)}
+                  items={SUBJECT_TABS.map((tab) => ({
+                    key: tab.value,
+                    label: t(tab.labelKey),
+                  }))}
+                  extra={
+                    canAddPermission && (
+                      <Button
+                        type="button"
+                        className="h-8 shrink-0 rounded-[6px] px-3 text-[14px] leading-[22px]"
+                        onClick={() => {
+                          setGrantSubjectType(subjectType);
+                          setGrantIncludeChildren(false);
+                          setGrantDialogOpen(true);
+                        }}
+                      >
+                        {t("dialog.tabGrant")}
+                      </Button>
+                    )
+                  }
+                />
+                <div className="mt-3 min-h-0 flex-1 overflow-hidden p-0">
+                  <PermissionListTab
+                    resourceType={resourceType}
+                    resourceId={resourceId}
+                    context={context}
+                    refreshKey={refreshKey}
+                    fixedSubjectType={subjectType}
+                    onRosterChange={setAssignees}
+                    onMutationSuccess={handleGrantSuccess}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {context && canAddPermission && (
+        <Dialog open={grantDialogOpen} onOpenChange={setGrantDialogOpen}>
+          <DialogContent
+            ref={grantContentRef}
+            onOpenAutoFocus={handleGrantContentOpenAutoFocus}
+            className={`${permissionDialogClassName} p-5`}
+          >
+            <DialogHeader className="shrink-0">
+              <DialogTitle>
+                {t("dialog.tabGrant")} - {resourceName}
+              </DialogTitle>
+              <DialogDescription className="sr-only">
+                {t("dialog.tabGrant")} - {resourceName}
+              </DialogDescription>
+            </DialogHeader>
+
+            <div className="mt-4 flex min-h-0 flex-1 flex-col overflow-hidden">
+              <div className="flex items-center gap-3">
+                <PermissionSubjectTabs
+                  tabs={SUBJECT_TABS.map((tab) => ({ value: tab.value, label: t(tab.labelKey) }))}
+                  value={grantSubjectType}
+                  onChange={setGrantSubjectType}
+                />
+
+                {grantSubjectType === "department" && (
+                  <label className="flex shrink-0 cursor-pointer items-center gap-2 text-[14px] leading-[22px] text-[#212121]">
+                    <Checkbox
+                      className="peer"
+                      checked={grantIncludeChildren}
+                      onCheckedChange={(checked) => setGrantIncludeChildren(checked === true)}
+                    />
+                    {t("source.includeChildren")}
+                  </label>
+                )}
+              </div>
+
+              <div className="mt-4 min-h-0 flex-1 overflow-hidden">
+                <PermissionGrantTab
+                  resourceType={resourceType}
+                  resourceId={resourceId}
+                  context={context}
+                  assignees={assignees}
+                  fixedSubjectType={grantSubjectType}
+                  includeChildren={grantIncludeChildren}
+                  onIncludeChildrenChange={setGrantIncludeChildren}
+                  hideDepartmentIncludeChildrenControl
+                  legacyAddLayout
+                  showExistingAssignees={false}
+                  onSuccess={handleGrantSuccess}
+                />
+              </div>
+            </div>
+          </DialogContent>
+        </Dialog>
+      )}
+    </>
+  );
+}

@@ -1,0 +1,172 @@
+from typing import Any
+
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.documents import BaseDocumentCompressor, Document
+from langchain_core.language_models import BaseChatModel
+from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplate, SystemMessagePromptTemplate
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.tools import BaseTool
+from pydantic import BaseModel, Field
+
+from bisheng.core.ai.rerank.rrf_rerank import RRFRerank
+
+system_template = """# 任务
+你是一位知识库问答助手，遵守以下规则回答问题：
+1. 严谨、专业地回答用户的问题。
+2. 回答时须严格基于【参考文本】中的内容：
+- 如果【参考文本】中有明确与用户问题相关的文字内容，请依据相关内容进行回答；如果【参考文本】中没有任何与用户问题相关的内容，则直接回复：“没有找到相关内容”。
+- 如果相关内容中包含 markdown 格式的图片（例如 ![image](路径/IMAGE_1.png)），必须严格保留其原始 markdown 格式，不得添加引号、代码块（`或```）或其他特殊符号，也不得修改图片路径，保证可以正常渲染 markdown 图片。
+3. 当【参考文本】中的内容来源于多个不同的信息源时，若相关内容存在明显差异或冲突，请分别列出这些差异或冲突的答案；若无差异或冲突，只给出一个统一的回答即可。
+
+# 参考文本
+{context}"""
+messages = [
+    SystemMessagePromptTemplate.from_template(system_template),
+    HumanMessagePromptTemplate.from_template("{question}"),
+]
+CHAT_PROMPT = ChatPromptTemplate.from_messages(messages)
+
+
+class ToolInputSchema(BaseModel):
+    query: str = Field(description="question asked by the user.")
+
+
+class KnowledgeRetrieverTool(BaseTool):
+    name: str = "knowledge_retriever_tool"
+    description: str = "在知识库中检索与查询相关的文档内容。"
+    args_schema: type[BaseModel] = ToolInputSchema
+
+    vector_retriever: BaseRetriever | None = None
+    elastic_retriever: BaseRetriever | None = None
+    rerank: BaseDocumentCompressor | None = None
+    max_content: int = Field(default=15000, description="The max length of the combined document content.")
+    sort_by_source_and_index: bool = Field(default=False, description="Sort by document name & chunk index.")
+    rrf_weights: list[float] = Field(default=None)
+    rrf_remove_zero_score: bool = Field(default=False)
+
+    def _run(self, query: str, **kwargs: Any) -> list[Document]:
+        milvus_docs, es_docs = [], []
+        if self.vector_retriever:
+            milvus_docs = self.vector_retriever.invoke(query)
+        if self.elastic_retriever:
+            es_docs = self.elastic_retriever.invoke(query)
+
+        finally_docs = self._rrf_rerank(milvus_docs, es_docs, query)
+
+        if self.rerank:
+            finally_docs = self.rerank.compress_documents(finally_docs, query)
+        return finally_docs
+
+    async def _arun(self, query: str, **kwargs: Any) -> list[Document]:
+        milvus_docs, es_docs = [], []
+        if self.vector_retriever:
+            milvus_docs = await self.vector_retriever.ainvoke(query)
+        if self.elastic_retriever:
+            es_docs = await self.elastic_retriever.ainvoke(query)
+
+        finally_docs = self._rrf_rerank(milvus_docs, es_docs, query)
+
+        if self.rerank:
+            finally_docs = await self.rerank.acompress_documents(finally_docs, query)
+        return finally_docs
+
+    def _rrf_rerank(self, milvus_docs: list[Document], es_docs: list[Document], query: str) -> list[Document]:
+        if not milvus_docs and not es_docs:
+            return []
+        rrf_rerank = RRFRerank(
+            retrievers=[self.vector_retriever, self.elastic_retriever],
+            weights=self.rrf_weights,
+            remove_zero_score=self.rrf_remove_zero_score,
+        )
+        finally_docs = rrf_rerank.compress_documents(documents=[milvus_docs, es_docs], query=query)
+
+        # limit by max_chunk_size
+        doc_num, doc_content_sum = 0, 0
+        same_file_id = set()
+
+        for doc in finally_docs:
+            if doc_content_sum > self.max_content:
+                break
+            doc_content_sum += len(doc.page_content)
+            same_file_id.add((doc.metadata.get("document_id"), doc.metadata.get("document_name")))
+            doc_num += 1
+        finally_docs = finally_docs[:doc_num]
+
+        # sort by source and index if only one file
+        if self.sort_by_source_and_index and len(same_file_id) == 1:
+            finally_docs = sorted(
+                finally_docs, key=lambda x: (x.metadata.get("document_name", ""), x.metadata.get("chunk_index", 0))
+            )
+        return finally_docs
+
+
+class KnowledgeRagTool(BaseTool):
+    name: str
+    description: str
+    args_schema: type[BaseModel] = ToolInputSchema
+
+    llm: BaseChatModel
+    chat_prompt: ChatPromptTemplate | None = CHAT_PROMPT
+
+    vector_retriever: BaseRetriever | None = None
+    elastic_retriever: BaseRetriever | None = None
+    max_content: int = Field(default=15000, description="The max length of the combined document content.")
+    sort_by_source_and_index: bool = Field(default=False, description="Sort by document name & chunk index.")
+    rrf_weights: list[float] = Field(default=None)
+    rrf_remove_zero_score: bool = Field(default=False)
+
+    knowledge_retriever_tool: KnowledgeRetrieverTool = None
+    # F054: this retrieval source is a throwaway (a workflow input-node upload),
+    # not a knowledge-base file. Its chunks carry a UUID document id and the
+    # workflow id as knowledge id, so a citation built from them can never
+    # resolve back to a real file — the badge would render and open onto
+    # nothing. Callers that register citations skip a tool marked this way.
+    ephemeral_source: bool = False
+
+    @classmethod
+    def init_knowledge_rag_tool(cls, name: str, description: str, **kwargs) -> BaseTool:
+        llm = kwargs.pop("llm")
+        ephemeral_source = kwargs.pop("ephemeral_source", False)
+        chat_prompt = kwargs.pop("chat_prompt", CHAT_PROMPT)
+        # The retriever is an internal step of this tool, not a tool call of its
+        # own — it must stay invisible to the caller's callbacks. Dropping them
+        # here is not enough on its own (LangChain also inherits handlers from
+        # the ambient run context), so `_run`/`_arun` bypass `invoke` as well.
+        kwargs.pop("callbacks", None)
+        knowledge_retriever_tool = KnowledgeRetrieverTool(**kwargs)
+        return cls(
+            name=name,
+            description=description,
+            args_schema=ToolInputSchema,
+            llm=llm,
+            chat_prompt=chat_prompt,
+            knowledge_retriever_tool=knowledge_retriever_tool,
+            ephemeral_source=ephemeral_source,
+        )
+
+    def _run(self, query: str) -> Any:
+        # 1. retrieve documents — called directly rather than through `invoke`,
+        # which would open a nested tool run. The chat then showed a second card
+        # per search, named after the retriever instead of the knowledge base
+        # ("知识库已被删除"), and it never closed because the retriever answers
+        # with Document objects that the run-log frame could not serialize.
+        retrieval_result = self.knowledge_retriever_tool._run(query)
+        llm_inputs = self._get_llm_inputs(query, retrieval_result)
+        qa_chain = create_stuff_documents_chain(llm=self.llm, prompt=self.chat_prompt)
+        return qa_chain.invoke(llm_inputs)
+
+    async def _arun(self, query: str) -> Any:
+        retrieval_result = await self.knowledge_retriever_tool._arun(query)
+        llm_inputs = self._get_llm_inputs(query, retrieval_result)
+        qa_chain = create_stuff_documents_chain(llm=self.llm, prompt=self.chat_prompt)
+        return await qa_chain.ainvoke(llm_inputs)
+
+    def _get_llm_inputs(self, query: str, retrieval_result: Any) -> Any:
+        """Build prompt inputs from retrieved documents."""
+        source_documents = list(retrieval_result or [])
+        inputs = {
+            "context": source_documents,
+        }
+        if "question" in self.chat_prompt.input_variables:
+            inputs["question"] = query
+        return inputs

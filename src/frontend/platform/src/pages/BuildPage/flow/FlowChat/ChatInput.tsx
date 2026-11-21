@@ -1,0 +1,462 @@
+// @ts-strict-ignore
+import { ConversationComposer } from '@bisheng/chat';
+import { notification } from '@bisheng/ui';
+
+
+
+import { locationContext } from "@/contexts/locationContext";
+import { useContext,useEffect,useMemo,useRef,useState } from "react";
+import { useTranslation } from "react-i18next";
+import { useFileLoading } from "../hooks/useFileLoading";
+// import { useMessageStore } from "./messageStore";
+import { useAudioStore } from "@/components/voiceFunction/audioPlayerStore";
+import SpeechToTextComponent from "@/components/voiceFunction/speechToText";
+import { useWorkbenchRuntimeConfig } from "@/hooks/useWorkbenchRuntimeConfig";
+import { fileAcceptToInputAccept,normalizeFileAccept } from "@/util/fileAcceptUtils";
+import useFlowStore from "../flowStore";
+import ChatFiles from "./ChatFiles";
+import DragDropOverlay from "./DragDropOverlay";
+import { useMessageStore } from "./messageStore";
+import { useFileDropAndPaste } from "./useFileDropAndPaste";
+export const FileTypes = {
+    ALL: ['.PNG', '.JPEG', '.JPG', '.BMP', '.PDF', '.OFD', '.TXT', '.MD', '.HTML', '.XLS', '.XLSX', '.CSV', '.DOC', '.DOCX', '.PPT', '.PPTX'],
+    IMAGE: ['.PNG', '.JPEG', '.JPG', '.BMP'],
+    FILE: ['.PDF', '.OFD', '.TXT', '.MD', '.HTML', '.XLS', '.XLSX', '.CSV', '.DOC', '.DOCX', '.PPT', '.PPTX'],
+    MEDIA: ['.MP3', '.WAV', '.M4A', '.AAC', '.FLAC', '.OGG', '.MP4', '.MOV', '.AVI', '.MKV', '.WEBM'],
+}
+export default function ChatInput({ autoRun, wsUrl, onBeforSend, onLoad }) {
+
+    const eventTarget = useMessageStore(state => state.eventTarget)
+    const { t } = useTranslation(['bs', 'shared'])
+    const { appConfig } = useContext(locationContext)
+    const [inputLock, setInputLock] = useState({ locked: true, reason: '' })
+    const inputNodeIdRef = useRef('') // 当前输入框节点id
+    const messageIdRef = useRef('') // 当前输入框节点messageId
+    const [accepts, setAccepts] = useState('*') // 接受文件类型
+    const [uploadLock, setUploadLock] = useState(false) // 上传锁
+    const { data: linsightConfig } = useWorkbenchRuntimeConfig();
+    const { isLoading: audioOpening } = useAudioStore()
+    const [showWhenLocked] = useState(false) // 强制开启表单按钮，不限制于input锁定
+    const __store: any = useMessageStore() as any
+    const {
+        messages,
+        hisMessages,
+        chatId,
+        createSendMsg,
+        createWsMsg,
+        overWsMsg,
+        inputForm,
+        setInputForm,
+        streamWsMsg,
+        insetSeparator,
+        destory,
+        insetNodeRun, setQuestions, setInputLocked
+    } = __store
+    useEffect(() => { setInputLocked(inputLock.locked); }, [inputLock.locked, setInputLocked]);
+    const currentChatIdRef = useRef(null)
+    const inputRef = useRef(null)
+    // 停止状态
+    const [stop, setStop] = useState({
+        show: true,
+        disable: false
+    })
+    /**
+     * 记录会话切换状态，等待消息加载完成时，控制表单在新会话自动展开
+     */
+    const changeChatedRef = useRef(false)
+    useEffect(() => {
+        // console.log('message msg', messages, form);
+        if (changeChatedRef.current) {
+            changeChatedRef.current = false
+            // 新建的 form 技能,弹出窗口并锁定 input
+            // if (form && messages.length === 0 && hisMessages.length === 0) {
+            //     setInputLock({ locked: true, reason: '' })
+            //     setFormShow(true)
+            //     setShowWhenLocked(true)
+            // }
+        }
+    }, [messages, hisMessages])
+    useEffect(() => {
+        if (!chatId) return
+        if (!autoRun) return
+        // continueRef.current = false
+        // setInputLock({ locked: false, reason: '' })
+        // console.log('message chatid', messages, form, chatId);
+        // setShowWhenLocked(false)
+        currentChatIdRef.current = chatId
+        // changeChatedRef.current = true
+        // setFormShow(false)
+        createWebSocket().then(() => {
+            // 切换会话默认发送一条空消息(action, input)
+            const wsMsg = onBeforSend((messages.length === 0 && hisMessages.length === 0) || chatId.startsWith('test') ? 'init_data' : 'check_status', {})
+            sendWsMsg(wsMsg)
+        })
+    }, [chatId])
+    // 销毁
+    useEffect(() => {
+        return () => {
+            destory()
+            if (wsRef.current) {
+                wsRef.current.close()
+            }
+        }
+    }, [])
+    const handleSendClick = async () => {
+        if (fileUploading) return
+        // 解除锁定状态下 form 按钮开放的状态
+        // setShowWhenLocked(false)
+        // 关闭引导词
+        // setShowGuideQuestion(false)
+        // 收起表单
+        // formShow && setFormShow(false)
+        // setFormShow(false)
+        const [filePath, fileNames] = getFileIds().reduce((acc, cur) => {
+            acc[0].push(cur.path)
+            acc[1].push(cur.name)
+            return acc
+        }, [[], []])
+        // 文件拼接入消息
+        const _value = inputRef.current.value
+        if (_value.trim() === '' && filePath.length === 0) return
+        const value = fileNames.length > 0 ? fileNames.join('\n') + '\n' + _value : _value;
+        const event = new Event('input', { bubbles: true, cancelable: true });
+        inputRef.current.value = ''
+        inputRef.current.dispatchEvent(event); // 触发调节input高度
+        // const contunue = continueRef.current ? 'continue' : ''
+        // continueRef.current = false
+        const wsMsg = onBeforSend('input', {
+            nodeId: inputNodeIdRef.current,
+            msg: value,
+            files: filePath,
+            category: "question",
+            extra: '',
+            message_id: messageIdRef.current,
+            source: 0
+        })
+        // msg to store
+        createSendMsg(value)
+        // 锁定 input
+        setInputLock({ locked: true, reason: '' })
+        await createWebSocket()
+        sendWsMsg(wsMsg)
+        // 滚动聊天到底
+
+        setQuestions([])
+    }
+    const sendWsMsg = async (msg) => {
+        try {
+            wsRef.current.send(JSON.stringify(msg))
+        } catch (error) {
+            notification.open({ type: 'error', title: String('There was an error sending the message'), description: String(error.message ?? '') });
+        }
+    }
+    const wsRef = useRef(null)
+    const reRunStateRef = useRef(false)
+    const createWebSocket = () => {
+        // 单例
+        if (wsRef.current) return Promise.resolve('ok');
+        const isSecureProtocol = window.location.protocol === "https:";
+        const webSocketProtocol = isSecureProtocol ? "wss" : "ws";
+        return new Promise((res, rej) => {
+            try {
+                const ws = new WebSocket(`${webSocketProtocol}://${wsUrl}`)
+                wsRef.current = ws
+                // websocket linsen
+                ws.onopen = () => {
+                    console.log("WebSocket connection established!");
+                    res('ok')
+                };
+                ws.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+                    // 过滤一些不需要的数据
+                    if ((data.category === 'end_cover' && data.type !== 'end_cover')) {
+                        return
+                    }
+                    if (data.type === 'begin') {
+                        setStop({ show: true, disable: false })
+                    } else if (data.type === 'close' && data.category === 'processing') {
+                        if (!reRunStateRef.current) {
+                            // 重试时阻止关闭stop
+                            setStop({ show: false, disable: false })
+                        }
+                        reRunStateRef.current = false
+                    }
+                    // const errorMsg = data.category === 'error' ? data.intermediate_steps : ''
+                    // // 异常类型处理，提示
+                    // if (errorMsg) return setInputLock({ locked: true, reason: errorMsg })
+                    // // 拦截会话串台
+                    if (data.chat_id && currentChatIdRef.current && currentChatIdRef.current !== data.chat_id) return
+                    handleWsMessage(data);
+                    ['begin', 'close'].includes(data.type) && onLoad()
+                    // if ('close' === data.type) {
+                    //     setAutogenStop(false)
+                    // }
+                }
+                ws.onclose = (event) => {
+                    console.log('error event :>> ', event);
+                    // wsRef.current = null
+                    // console.error('链接手动断开 event :>> ', event);
+                    // setStop({ show: false, disable: false })
+                    // if ([1005, 1008, 1009].includes(event.code)) {
+                    //     setInputLock({ locked: true, reason: event.reason })
+                    // } else {
+                    //     if (event.reason) {
+                    //         toast({
+                    //             title: t('prompt'),
+                    //             variant: 'error',
+                    //             description: event.reason
+                    //         });
+                    //     }
+                    //     setInputLock({ locked: true, reason: '' })
+                    // }
+                    // event.reason && addNotification({
+                    //     type: 'error',
+                    //     title: '运行异常',
+                    //     description: event.reason
+                    // })
+                };
+                ws.onerror = (ev) => {
+                    wsRef.current = null
+                    // setStop({ show: false, disable: false })
+                    console.error('链接异常error', ev);
+                    // toast({
+                    //     title: `${t('chat.networkError')}:`,
+                    //     variant: 'error',
+                    //     description: [
+                    //         t('chat.networkErrorList1'),
+                    //         t('chat.networkErrorList2'),
+                    //         t('chat.networkErrorList3')
+                    //     ]
+                    // });
+                    setInputLock({ locked: true, reason: '' })
+                };
+            } catch (err) {
+                console.error('创建链接异常', err);
+                rej(err)
+            }
+        })
+    }
+    const setRunCache = useFlowStore(state => state.setRunCache)
+    const addNotification = useFlowStore((state) => state.addNotification);
+    // 接受 ws 消息
+    const handleWsMessage = (data) => {
+        if (data.category === 'error') {
+            const { status_code, status_message, data: params } = data.message
+            if (status_code === 500) {
+                setInputLock({ locked: true, reason: data.message.message })
+            } else {
+                // 特殊状态吗支持输入框展示reason
+                const reason = [10421, 13002, 13010].includes(status_code) ? t(`api_errors:${status_code}`, params) : ' '
+                setInputLock({ locked: true, reason })
+            }
+            // 记录
+            const errorMsg = status_code == 500 ? status_message || data.message.message : t(`api_errors:${status_code}`, { ...(params || {}), defaultValue: status_message || t('api_errors:fallback') })
+            addNotification({
+                type: 'error',
+                title: 'runtime error',
+                description: errorMsg
+            })
+            return notification.open({ type: 'error', description: String(errorMsg ?? '') });
+        } else if (data.category === 'node_run') {
+            inputNodeIdRef.current = data.message.node_id
+            // 缓存运行结果,用于[单节点运行]自动填写参数
+            if (data.type === 'end' && data.message.input_data) {
+                setRunCache(data.message.node_id
+                    , data.message.input_data)
+            }
+            insetNodeRun(data)
+            return sendNodeLogEvent(data)
+        } else if (data.category === "guide_word") {
+            data.message.msg = data.message.guide_word
+        } else if (data.category === 'input') {
+            const { node_id, input_schema } = data.message
+            inputNodeIdRef.current = node_id
+            messageIdRef.current = data.message_id
+            // 限制文件类型
+            if (input_schema.tab === 'dialog_input') {
+                const schemaItem = input_schema.value?.find(el => el?.key === 'dialog_file_accept')
+                const uploadSwithItem = input_schema.value?.find(el => el?.key === 'user_input_file')
+                setUploadLock(uploadSwithItem ? uploadSwithItem.value : true)
+                const fileAccept = schemaItem?.value
+                const kinds = normalizeFileAccept(fileAccept, {
+                    mediaEnabled: !!appConfig.enableMediaUpload,
+                })
+                const acceptStr = fileAcceptToInputAccept(kinds)
+                setAccepts(acceptStr || '*')
+            }
+            // 待用户输入
+            input_schema.tab === 'form_input' ? setInputForm(input_schema) : setInputLock({ locked: false, reason: '' })
+            setTimeout(() => {
+                inputRef.current.focus()
+            }, 60);
+            return
+        } else if (data.category === 'guide_question') {
+            return setQuestions(data.message.guide_question.filter(q => q))
+        } else if (data.category === 'stream_msg') {
+            streamWsMsg(data)
+        } else if (data.category === 'end_cover' && data.type === 'end_cover') {
+            setInputLock({ locked: true, reason: '' })
+            sendWsMsg({ "action": "stop" });
+            return overWsMsg(data)
+            // return handleRestartClick()
+        }
+        if (data.type === 'close' && data.category === 'processing') {
+            insetSeparator(t('chat.chatEndMessage'))
+            setInputLock((prev) => (prev.reason ? prev : { locked: true, reason: '' }))
+            // 重启会话按钮,接收close确认后端处理结束后重启会话
+            if (restartCallBackRef.current[data.chat_id]) {
+                restartCallBackRef.current[data.chat_id]()
+                restartCallBackRef.current[data.chat_id] = null
+            }
+        } else if (data.type === 'over') {
+            createWsMsg(data)
+        }
+    }
+    // 日志广播->nodes
+    const sendNodeLogEvent = (data) => {
+        const { node_id } = data.message
+        const isError = !!data.message.reason
+        const event = new CustomEvent('nodeLogEvent', {
+            detail: {
+                nodeId: node_id,
+                action: isError ? '' : data.type === 'start' ? 'loading' : 'success',
+                data: isError ? [[{ key: 'error', type: 'params', value: data.message.reason }]] : data.message.log_data // 缓存TODO
+            }
+        })
+        window.dispatchEvent(event)
+    }
+    // 触发发送消息事件（重试、表单）
+    useEffect(() => {
+        const handleCustomEvent = (e) => {
+            if (!showWhenLocked && inputLock.locked) return console.error('弹窗已锁定，消息无法发送')
+            const { send, message } = e.detail
+            inputRef.current.value = message
+            if (send) handleSendClick()
+        }
+        const handleOutPutEvent = async (e) => {
+            const { nodeId, data, message } = e.detail
+            const { flow_id, chat_id } = onBeforSend('flowInfo', {})
+            await createWebSocket()
+            sendWsMsg({
+                action: 'input',
+                flow_id,
+                chat_id,
+                data: {
+                    [nodeId]: {
+                        data,
+                        message: JSON.stringify({
+                            ...message.message,
+                            input_msg: Object.values(data)[0],
+                            hisValue: Object.values(data)[0]
+                        }),
+                        message_id: message.message_id
+                    }
+                }
+            })
+        }
+        const handleSendForm = async (e) => {
+            const { data, msg } = e.detail
+            setInputForm(null)
+            createSendMsg(msg)
+            await createWebSocket()
+            const { flow_id, chat_id } = onBeforSend('flowInfo', {})
+            sendWsMsg({
+                action: 'input',
+                flow_id,
+                chat_id,
+                data: {
+                    [inputNodeIdRef.current]: {
+                        data,
+                        message: msg,
+                        message_id: messageIdRef.current,
+                        category: 'question',
+                        extra: '',
+                        source: 0
+                    }
+                }
+            })
+        }
+        eventTarget.addEventListener('inputFormEvent', handleSendForm)
+        eventTarget.addEventListener('outputMsgEvent', handleOutPutEvent)
+        eventTarget.addEventListener('userResendMsgEvent', handleCustomEvent)
+        return () => {
+            eventTarget.removeEventListener('inputFormEvent', handleSendForm)
+            eventTarget.removeEventListener('outputMsgEvent', handleOutPutEvent)
+            eventTarget.removeEventListener('userResendMsgEvent', handleCustomEvent)
+        }
+    }, [inputLock.locked, showWhenLocked])
+    // stop click
+    // const handleStopClick = () => {
+    //     if (stop.disable) return
+    //     setStop({ show: true, disable: true });
+    //     setInputLock({ locked: true, reason: '' })
+    //     sendWsMsg({ "action": "stop" });
+    // }
+    // restart
+    const restartCallBackRef = useRef({})
+    const [restarted, setRestarted] = useState(false)
+    const handleRestartClick = () => {
+        sendWsMsg({ "action": "stop" });
+        setInputForm(null)
+        setRestarted(true)
+        const chatId = currentChatIdRef.current.startsWith('test') ? '' : currentChatIdRef.current
+        restartCallBackRef.current[chatId] = () => {
+            createWebSocket().then(() => {
+                setRestarted(false)
+                const data = onBeforSend('refresh_flow', {})
+                sendWsMsg(data)
+            })
+        }
+        // wsRef.current?.close()
+        // wsRef.current = null
+        // stop.show && insetSeparator(t('chat.chatEndMessage'))
+        // setTimeout(() => {
+        //     createWebSocket().then(() => {
+        //         sendWsMsg(onBeforSend('init_data', {}))
+        //     })
+        // }, 300);
+        if (stop.show) {
+            reRunStateRef.current = true
+        }
+    }
+    const placholder = useMemo(() => {
+        // if (inputForm) {
+        //     return '      点击刷新按钮可开启新对话'
+        // }
+        const reason = inputLock.reason || ' '
+        return inputLock.locked ? reason : t('chat.inputPlaceholder')
+    }, [inputForm, inputLock])
+    // 文件上传状态
+    const { fileUploading, getFileIds, loadingChange } = useFileLoading(inputLock.locked)
+    const handleSpeechRecognition = (text) => {
+        console.log('text', text);
+        if (!showWhenLocked && inputLock.locked) return;
+        if (!inputRef.current) return;
+        // 将识别结果追加到当前输入框内容后
+        const currentValue = inputRef.current.value;
+        inputRef.current.value = currentValue + text;
+        // 触发input事件以更新UI（如自动调整高度）
+        const event = new Event('input', { bubbles: true, cancelable: true });
+        inputRef.current.dispatchEvent(event);
+    };
+    // handle drop and paste
+    const inputFilesRef = useRef(null)
+    const { isDragging, handlePaste } = useFileDropAndPaste({
+        enabled: !inputLock.locked,
+        onFilesReceived: (files) => {
+            inputFilesRef.current?.upload(files);
+        }
+    });
+    return <div className="absolute bottom-0 w-full z-10">
+        <ConversationComposer inputRef={inputRef} canExecute inputDisabled={inputLock.locked}
+            busy={fileUploading || audioOpening} hasAttachments={getFileIds().length > 0}
+            showRestart={!stop.show} restartDisabled={restarted}
+            labels={{ attach: t('shared:app_chat.attach'), send: t('shared:app_chat.send'), stop: t('shared:app_chat.stop'), restart: t('chat.runNewWorkflow') }}
+            placeholder={placholder} hint={appConfig.dialogTips} onSend={handleSendClick} onRestart={handleRestartClick}
+            onAttach={!inputLock.locked && uploadLock ? () => inputFilesRef.current?.openPicker() : undefined} attachmentDisabled={audioOpening}
+            onPaste={handlePaste} overlay={isDragging ? <DragDropOverlay /> : undefined}
+            voice={linsightConfig?.asr_model?.id ? <SpeechToTextComponent inline disabled={inputLock.locked} onChange={handleSpeechRecognition} /> : undefined}
+            attachments={!inputLock.locked && uploadLock ? <ChatFiles ref={inputFilesRef} accepts={accepts}
+                disabled={audioOpening} v={location.href.indexOf('/chat/flow/') === -1 ? 'v1' : 'v2'} onChange={loadingChange} /> : undefined} />
+    </div>;
+}

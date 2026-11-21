@@ -1,0 +1,134 @@
+// @ts-strict-ignore
+import { notification } from '@bisheng/ui';
+
+import { getOfficeTokenApi } from "@/controllers/API/flow";
+import { getOfficeReachableUrl } from "@/utils/officeUrl";
+import i18next from "i18next";
+import { useContext, useEffect } from "react";
+import { useTranslation } from "react-i18next";
+import { locationContext } from "../../../contexts/locationContext";
+
+export default function Word({ data, workflow }) {
+    const { appConfig } = useContext(locationContext);
+    const { t } = useTranslation("flow");
+
+    const wordUrl = appConfig.officeUrl;
+    // The document server POSTs this callback itself — in local dev override the
+    // origin via VITE_OFFICE_PUBLIC_ORIGIN (see utils/officeUrl).
+    const backUrl = getOfficeReachableUrl(workflow ? "/api/v1/workflow/report/callback" : "/api/v1/report/callback");
+
+    const editorConfig = {
+        // Editor width
+        width: "100%",
+        // Editor height
+        height: "100%",
+        // Editor type: word (document), cell (spreadsheet), slide (PPT)
+        documentType: "word",
+        // Document config
+        document: {
+            // File type
+            fileType: "docx",
+            // Document identifier
+            key: data.key,
+            // Document URL, absolute path
+            url: data.path,
+            // Document title
+            title: "bisheng.docx",
+            permissions: {
+                changeHistory: true,
+                comment: true,
+                copy: true,
+                download: true,
+                edit: true,
+                print: true,
+                reader: true,
+                rename: false,
+                review: true,
+            },
+        },
+        editorConfig: {
+            callbackUrl: backUrl,
+            lang: i18next.language === "zh-Hans" ? "zh-CN" : "en",
+            mode: "edit",
+            customization: {
+                anonymous: { request: false, label: "" },
+                comments: false,
+                customer: false,
+                help: false,
+                chat: false,
+                about: false,
+                features: { spellcheck: false },
+                forcesave: true,
+                hideRightMenu: true,
+                rightMenu: true,
+                unit: "cm",
+                uiTheme: "theme-dark",
+                logo: {
+                    image: location.origin + __APP_ENV__.BASE_URL + "/assets/bisheng/logo.jpeg",
+                    imageDark: location.origin + __APP_ENV__.BASE_URL + "/assets/bisheng/logo.jpeg",
+                    url: "https://example.com",
+                },
+            },
+            plugins: {
+                autostart: ["asc.{D2A0F3BE-CC8D-4956-BCD9-6CBEA6E8960E}"],
+                // pluginsData: ['ommon-plugins/config.json']
+            },
+            user: {
+                group: "Group1",
+                id: "001",
+                name: "",
+            },
+        },
+    };
+
+    const createEditor = (config) => {
+        window.editor = new window.DocsAPI.DocEditor("bsoffice", config);
+    };
+
+    // Sign editorConfig with JWT and then create editor
+    const initEditor = async () => {
+        const finalConfig = { ...editorConfig };
+        try {
+            const res = await getOfficeTokenApi(editorConfig);
+            if (res.token) {
+                finalConfig.token = res.token;
+            }
+        } catch (e) {
+            // If token request fails, proceed without token (for non-JWT setups)
+            console.warn("Failed to get OnlyOffice JWT token, proceeding without it:", e);
+        }
+        createEditor(finalConfig);
+    };
+
+
+    useEffect(() => {
+        if (window.DocsAPI) {
+            initEditor();
+        } else {
+            if (!wordUrl) {
+                notification.open({ type: "error", title: String(t("wordEditorLoadFailed") ?? ''), description: String(t("checkOfficeServiceConfig") ?? '') });
+            }
+            const script = document.createElement("script");
+            script.src = wordUrl + "/web-apps/apps/api/documents/api.js"; // OnlyOffice editor service
+            script.onload = initEditor;
+            document.head.appendChild(script);
+            script.onerror = () => {
+                notification.open({ type: "error", title: String(t("wordEditorLoadFailed") ?? ''), description: String(t("checkOfficeServiceConfig") ?? '') });
+            };
+        }
+
+        return () => {
+            console.log("destroyEditor :>> ");
+            window.editor?.destroyEditor();
+        };
+    }, []);
+
+    return (
+        <div className="relative w-full h-full">
+            <div className="absolute bg-[#252525] left-0 top-0 h-[26px] leading-[26px] w-full text-gray-400 text-center text-xs">
+                ctrl+s to save
+            </div>
+            <div id="bsoffice"></div>
+        </div>
+    );
+}

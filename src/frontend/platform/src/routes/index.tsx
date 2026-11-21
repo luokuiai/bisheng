@@ -1,0 +1,273 @@
+// @ts-strict-ignore
+import { lazy, useEffect } from "react";
+import { Navigate, createBrowserRouter } from "react-router-dom";
+import MainLayout from "../layout/MainLayout";
+import { LoginPage } from "../pages/LoginPage/login";
+import { ResetPwdPage } from "../pages/LoginPage/resetPwd";
+import Page403 from "../pages/Page403";
+import Page404 from "../pages/Page404";
+import MenuPermissionPlaceholder from "../pages/MenuPermissionPlaceholder";
+import { AppNumType } from "../types/app";
+import RouteErrorBoundary from "./RouteErrorBoundary";
+import EditorPage from "@/pages/Dashboard/editor";
+import SharePage from "@/pages/Dashboard/share";
+
+// Load page components lazily.
+const DshLogin = lazy(() => import('@/pages/DshLogin').then(module => ({ default: module.DshLogin })));
+const Templates = lazy(() => import("@/pages/BuildPage/appTemps"));
+const Apps = lazy(() => import("@/pages/BuildPage/apps"));
+const HostedAppDetail = lazy(() => import("@/pages/BuildPage/hostedApp"));
+const AppRuntimeGuide = lazy(() => import("@/pages/AppRuntimeGuide"));
+const EditAssistantPage = lazy(() => import("@/pages/BuildPage/assistant/editAssistant"));
+const WorkBenchPage = lazy(() => import("@/pages/BuildPage/bench/DialogueWork"));
+const FlowPage = lazy(() => import("@/pages/BuildPage/flow"));
+const SkillToolsPage = lazy(() => import("@/pages/BuildPage/tools"));
+const DataSetPage = lazy(() => import("@/pages/DataSetPage"));
+const EvaluatingPage = lazy(() => import("@/pages/EvaluationPage"));
+const EvaluatingCreate = lazy(() => import("@/pages/EvaluationPage/EvaluationCreate"));
+const KnowledgePage = lazy(() => import("@/pages/KnowledgePage"));
+const AdjustFilesUpload = lazy(() => import("@/pages/KnowledgePage/AdjustFilesUpload"));
+const FilesPage = lazy(() => import("@/pages/KnowledgePage/detail"));
+const FilesUpload = lazy(() => import("@/pages/KnowledgePage/filesUpload"));
+const QasPage = lazy(() => import("@/pages/KnowledgePage/qas"));
+const LabelPage = lazy(() => import("@/pages/LabelPage"));
+const TaskAppChats = lazy(() => import("@/pages/LabelPage/taskAppChats"));
+const TaskApps = lazy(() => import("@/pages/LabelPage/taskApps"));
+const LogPage = lazy(() => import("@/pages/LogPage").then(module => ({ default: module.LogPage })));
+const AppChatDetail = lazy(() => import("@/pages/LogPage/useAppLog/appChatDetail"));
+const DailyChatDetail = lazy(() => import("@/pages/LogPage/useAppLog/dailyChatDetail"));
+const Doc = lazy(() => import("@/pages/ModelPage/doc"));
+const Finetune = lazy(() => import("@/pages/ModelPage/finetune").then(module => ({ default: module.Finetune })));
+const Management = lazy(() => import("@/pages/ModelPage/manage"));
+const Report = lazy(() => import("@/pages/Report"));
+const SystemPage = lazy(() => import("@/pages/SystemPage"));
+const ApprovalPage = lazy(() => import("@/pages/ApprovalPage"));
+const ResoucePage = lazy(() => import("@/pages/resoucePage"));
+const Dashboard = lazy(() => import("@/pages/Dashboard"));
+const TenantPage = lazy(() => import("@/pages/TenantPage"));
+const TenantSelect = lazy(() => import("@/pages/LoginPage/TenantSelect"));
+const DshPage = lazy(() => import("@/pages/DshPage"));
+
+const baseConfig = {
+  //@ts-ignore
+  basename: __APP_ENV__.BASE_URL
+}
+
+const RedirectToExternalLink = () => {
+  useEffect(() => {
+    const path = import.meta.env.DEV ? '/admin' : '/workspace/'
+    window.location.href = window.location.origin + path;
+  }, []);
+
+  return null;
+};
+
+// Redirect standalone chat routes to client app (separate SPA at /workspace)
+const RedirectToClient = () => {
+  useEffect(() => {
+    window.location.replace('/workspace' + window.location.pathname + window.location.search);
+  }, []);
+
+  return null;
+};
+
+const privateRouter = [
+  { path: "/desktop-login", element: <DshLogin />, errorElement: <RouteErrorBoundary /> },
+  { path: "/", element: <RedirectToExternalLink /> },
+  {
+    path: "/",
+    element: <MainLayout />,
+    errorElement: <RouteErrorBoundary />,
+    children: [
+      // Normalize the legacy /admin redirect before userContext chooses the landing page.
+      { path: "admin", element: <Navigate to="/label" replace /> },
+      { path: "filelib", element: <KnowledgePage />, permission: 'knowledge', },
+      { path: "filelib/:id", element: <FilesPage />, permission: 'knowledge', },
+      { path: "filelib/upload/:id", element: <FilesUpload />, permission: 'knowledge', },
+      { path: "filelib/adjust/:fileId", element: <AdjustFilesUpload />, permission: 'knowledge', },
+      { path: "filelib/qalib/:id", element: <QasPage />, permission: 'knowledge', },
+      { path: "build/apps", element: <Apps />, permission: 'build', },
+      // F054 hosted-application detail. Rides the existing `build`
+      // permission on purpose: AC-58 forbids a new menu or permission point.
+      { path: "build/apps/:appId", element: <HostedAppDetail />, permission: 'build', },
+      // @ts-ignore
+      { path: "build/tools", element: <SkillToolsPage />, permission: 'build', },
+      { path: "build/dsh", element: <Navigate to="/dsh?tab=plugins" replace /> },
+      { path: "build/client", element: <WorkBenchPage />, permission: 'workstation' },
+      { path: "build", element: <Navigate to="apps" replace /> },
+      { path: "build/temps/:type", element: <Templates />, permission: 'create_app', },
+      { path: "model/management", element: <Management />, permission: 'model' },
+      { path: "model/finetune", element: <Finetune />, permission: 'model' },
+      { path: "model", element: <Navigate to="management" replace /> },
+      { path: "dsh", element: <DshPage />, permission: 'sys' },
+      { path: "sys", element: <SystemPage />, permission: 'sys' },
+      { path: "approval", element: <ApprovalPage />, permission: 'sys' },
+      { path: "log", element: <LogPage />, permission: "log" },
+      { path: "log/chatlog/:fid/:cid/:type", element: <AppChatDetail />, permission: "log" },
+      { path: "log/chatlog/:cid", element: <DailyChatDetail />, permission: "log" },
+      { path: "evaluation", element: <EvaluatingPage />, permission: 'evaluation' },
+      { path: "evaluation/create", element: <EvaluatingCreate />, permission: 'evaluation' },
+      { path: "dataset", element: <DataSetPage />, permission: 'dataset' },
+      { path: "label", element: <LabelPage />, permission: 'mark_task' },
+      { path: "label/:id", element: <TaskApps />, permission: 'mark_task' },
+      { path: "label/chat/:id/:fid/:cid/:type", element: <TaskAppChats />, permission: 'mark_task' },
+      { path: "dashboard", element: <Dashboard />, permission: 'board' },
+      { path: "tenant", element: <TenantPage />, permission: 'sys' },
+      { path: "department", element: <Navigate to="/sys" replace /> },
+      { path: "menu-pending", element: <MenuPermissionPlaceholder /> },
+    ],
+  },
+  { path: "dashboard/:id", element: <EditorPage />, errorElement: <RouteErrorBoundary />, permission: 'board', },
+  { path: "dashboard/share/:boardId", element: <SharePage />, errorElement: <RouteErrorBoundary /> },
+  { path: "model/doc", element: <Doc />, errorElement: <RouteErrorBoundary /> },
+  {
+    path: "/flow/:id/",
+    errorElement: <RouteErrorBoundary />,
+    children: [
+      { path: "", element: <FlowPage /> }
+    ]
+  },
+  {
+    path: "/assistant/:id/",
+    errorElement: <RouteErrorBoundary />,
+    children: [
+      { path: "", element: <EditAssistantPage /> }
+    ]
+  },
+  {
+    path: "/resouce/:cid/:mid",
+    errorElement: <RouteErrorBoundary />,
+    element: <ResoucePage />
+  },
+  // Standalone chat pages — redirect to client app (/workspace)
+  { path: "/chat/assistant/auth/:id/", element: <RedirectToClient />, errorElement: <RouteErrorBoundary /> },
+  { path: "/chat/flow/auth/:id/", element: <RedirectToClient />, errorElement: <RouteErrorBoundary /> },
+  { path: "/chat/flow/:id/", element: <RedirectToClient />, errorElement: <RouteErrorBoundary /> },
+  { path: "/chat/assistant/:id/", element: <RedirectToClient />, errorElement: <RouteErrorBoundary /> },
+  { path: "/report/:id/", element: <Report />, errorElement: <RouteErrorBoundary /> },
+  { path: "/reset", element: <ResetPwdPage />, errorElement: <RouteErrorBoundary /> },
+  // Backdoor login: also exposed inside privateRouter so an authenticated user
+  // navigating here (e.g. to switch accounts) does not fall into the * -> /404 trap.
+  { path: "/admin-login", element: <LoginPage forceLocal />, errorElement: <RouteErrorBoundary /> },
+  { path: "/403", element: <Page403 /> },
+  { path: "/404", element: <Page404 /> },
+  // F054 AC-30: only reachable when nginx has no `location /apps/` — i.e. the
+  // app-factory runtime layer is not deployed. With it deployed, the longer
+  // prefix takes the request and this never matches. Must be declared before
+  // the catch-all, which would otherwise send it to /404.
+  { path: "/apps/*", element: <AppRuntimeGuide />, errorElement: <RouteErrorBoundary /> },
+  { path: "*", element: <Navigate to="/404" replace /> }
+]
+
+/** Match the role menu third_id: /sys uses permission sys, stored as system_config. */
+function hasRoutePermission(permissions: string[], key: string) {
+  if (key === "sys") {
+    return permissions.includes("sys") || permissions.includes("system_config")
+  }
+  return permissions.includes(key)
+}
+
+/**
+ * Convert the backend web_menu value into route permissions.
+ *
+ * - Child tenant admins receive every admin route except tenant management. Their backend web_menu
+ *   still comes from a regular role, while business APIs retain tenant and resource authorization.
+ */
+const CHILD_ADMIN_ROUTE_PERMISSIONS = [
+  "board",
+  "build",
+  "create_app",
+  "knowledge",
+  "dataset",
+  "model",
+  "evaluation",
+  "mark_task",
+  "log",
+  "sys",
+  "workstation",
+] as const
+
+export function resolveRoutePermissions(user: {
+  web_menu?: string[]
+  is_department_admin?: boolean | null
+  is_child_admin?: boolean | null
+}): string[] {
+  let perms = user.web_menu ?? []
+  if (user.is_child_admin) {
+    const missing = CHILD_ADMIN_ROUTE_PERMISSIONS.filter((permission) => !perms.includes(permission))
+    if (missing.length) perms = [...perms, ...missing]
+  }
+  return perms
+}
+
+const ADMIN_LANDING_ROUTES = [
+  { key: "board", path: "/dashboard" },
+  { key: "build", path: "/build/apps" },
+  { key: "knowledge", path: "/filelib" },
+  { key: "dataset", path: "/dataset" },
+  { key: "model", path: "/model/management" },
+  { key: "evaluation", path: "/evaluation" },
+  { key: "mark_task", path: "/label" },
+  { key: "sys", path: "/sys" },
+] as const
+
+export function resolveAdminLandingPath(permissions: string[], menuApprovalMode: boolean): string {
+  const target = ADMIN_LANDING_ROUTES.find((item) => permissions.includes(item.key))
+  if (target) return target.path
+  return menuApprovalMode ? "/menu-pending?menu=board" : "/menu-pending"
+}
+
+export const getPrivateRouter = (
+  permissions: string[],
+  opts?: { menuApprovalMode?: boolean },
+) => {
+  // Builds a fresh route tree; `privateRouter` itself is never touched. It used
+  // to write the filtered children back into the shared table, and those copies
+  // had already lost their `permission` key — so from the second build on (the
+  // router is rebuilt whenever `user` changes) nested routes were no longer
+  // filtered at all, while top-level ones still were. That asymmetry let a user
+  // reach a list page they should not see and then hit /404 on its top-level
+  // editor route.
+  const filterMenuItem = (routes) =>
+    routes.reduce((res, cur) => {
+      const { permission, children, ...other } = cur
+      const next = children?.length ? { ...other, children: filterMenuItem(children) } : { ...other }
+
+      if (permission && !hasRoutePermission(permissions, permission)) {
+        if (opts?.menuApprovalMode) {
+          res.push({ ...next, element: <MenuPermissionPlaceholder /> })
+        }
+        return res
+      }
+
+      res.push(next)
+      return res
+    }, [])
+
+  return createBrowserRouter(permissions ? filterMenuItem(privateRouter) : [],
+    baseConfig)
+}
+
+export const getAdminRouter = () => {
+  return createBrowserRouter(privateRouter,
+    baseConfig)
+}
+
+export const publicRouter = createBrowserRouter([
+  { path: "/desktop-login", element: <DshLogin />, errorElement: <RouteErrorBoundary /> },
+  { path: "/", element: <LoginPage />, errorElement: <RouteErrorBoundary /> },
+  // Backdoor entry: bypasses SSO auto-redirect when redirect_login_url is configured.
+  { path: "/admin-login", element: <LoginPage forceLocal />, errorElement: <RouteErrorBoundary /> },
+  { path: "/reset", element: <ResetPwdPage />, errorElement: <RouteErrorBoundary /> },
+  { path: "/chat/:id/", element: <RedirectToClient />, errorElement: <RouteErrorBoundary /> },
+  { path: "/chat/flow/:id/", element: <RedirectToClient />, errorElement: <RouteErrorBoundary /> },
+  { path: "/chat/assistant/:id/", element: <RedirectToClient />, errorElement: <RouteErrorBoundary /> },
+  { path: "/resouce/:cid/:mid", element: <ResoucePage />, errorElement: <RouteErrorBoundary /> },
+  { path: "/tenant-select", element: <TenantSelect />, errorElement: <RouteErrorBoundary /> },
+  { path: "/403", element: <Page403 /> },
+  // F054 AC-30 — the logged-out half: without this the guide URL would show a
+  // login page, which tells the visitor nothing about why the app is missing.
+  { path: "/apps/*", element: <AppRuntimeGuide />, errorElement: <RouteErrorBoundary /> },
+  { path: "*", element: <LoginPage /> }
+],
+  baseConfig)

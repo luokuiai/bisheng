@@ -1,0 +1,373 @@
+"""Deliverable selection must not depend on the answer text or on walk order.
+
+The legacy rule in ``get_final_result_file`` accepted a file as a deliverable when
+its path was under ``output/`` **OR its name appeared verbatim in the model's final
+answer**. That second clause failed in both directions:
+
+* too weak — a model that finishes with "最终交付物是一个 Excel 格式的文件" (no file
+  name) matched nothing, so a real deliverable was dropped and the result panel fell
+  back to a synthesized ``报告.md`` that contradicted the answer;
+* too strong — an uploaded source the model merely referenced was promoted to
+  deliverable, and because ``os.walk`` is top-down the root-level source outranked
+  the real ``output/`` file and became the "已为您整理好 X" headline.
+
+The replacement is structural: the ``output/`` zone, falling back to "files this run
+created" (diffed against a start-of-task baseline), never ``scratch/``/``uploads/``,
+ordered newest-first.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+
+from bisheng.linsight.domain.utils import (
+    read_file_directory,
+    select_deliverables,
+    snapshot_file_fingerprints,
+    snapshot_file_paths,
+)
+
+
+def _detail(rel_path: str, *, mtime: float = 0.0, root: str = "/ws") -> dict:
+    return {
+        "file_name": os.path.basename(rel_path),
+        "file_path": os.path.join(root, rel_path),
+        "rel_path": rel_path,
+        "file_mtime": mtime,
+        "file_md5": "md5-" + rel_path,
+        "file_id": "id-" + rel_path,
+    }
+
+
+def _names(selected: list[dict]) -> list[str]:
+    return [f["rel_path"] for f in selected]
+
+
+# ---------------------------------------------------------------------------
+# criterion 1: the output/ zone
+# ---------------------------------------------------------------------------
+def test_output_zone_files_are_the_deliverables():
+    details = [
+        _detail("需求文档.md"),
+        _detail("output/报告.xlsx"),
+        _detail("scratch/tmp.png"),
+    ]
+    assert _names(select_deliverables(details)) == ["output/报告.xlsx"]
+
+
+def test_scratch_uploads_and_skills_are_never_deliverables():
+    """Even with output/ empty and everything newly created, intermediate state,
+    the user's own sources and provisioned skill bundles stay out of the panel."""
+    details = [_detail("scratch/step1.csv"), _detail("uploads/source.md"), _detail("skills/xlsx/SKILL.md")]
+    baseline: set[str] = set()
+    assert select_deliverables(details, baseline_paths=baseline) == []
+
+
+def test_deepagents_spill_never_becomes_the_result():
+    """Regression (114, 2026-08-14): deepagents writes its own overflow through the
+    same WorkspaceBackend — offloaded tool results into ``large_tool_results/`` and
+    evicted history into ``conversation_history/``. The looping session that day ended
+    with an empty ``output/``, so had it hit recursion_limit instead of being stopped
+    by hand, criterion 2 would have handed the user a raw tool dump as the deliverable.
+    Worse, an offloaded file is named after a tool_call_id and usually has NO
+    extension, which sorts it AHEAD of any real .png chart."""
+    details = [
+        _detail("large_tool_results/bisheng_code_interpreter:0", mtime=9.0),
+        _detail("conversation_history/db2b91b9d14d492da265e75715aa65bd.md", mtime=8.0),
+    ]
+    assert select_deliverables(details, baseline_paths=set()) == []
+
+    # a real chart alongside the spill wins, and wins alone
+    details.append(_detail("output/chart.png", mtime=1.0))
+    assert _names(select_deliverables(details, baseline_paths=set())) == ["output/chart.png"]
+
+
+def test_provisioned_skill_bundles_never_become_the_result():
+    """Regression (114, 2026-07-28): skill bundles are copied into the workspace at
+    task START — after the baseline snapshot — so criterion 2 saw ~100 SKILL.md /
+    themes.md files as "created this run". A task whose code interpreter produced
+    nothing then delivered 104 skill files, headlined "已为您整理好 SKILL.md 等 104
+    个文件". Provisioned bundles are inputs, exactly like uploads/."""
+    details = [_detail(f"skills/skill-{i}/SKILL.md", mtime=float(i)) for i in range(104)]
+    assert select_deliverables(details, baseline_paths=set()) == []
+
+    # and a real deliverable alongside them wins cleanly, with no bundle noise
+    details.append(_detail("output/报告.xlsx", mtime=1.0))
+    assert _names(select_deliverables(details, baseline_paths=set())) == ["output/报告.xlsx"]
+
+
+def test_output_zone_wins_over_newer_root_file():
+    """Criteria are ordered, not merged: a newer root file does not displace the
+    output/ deliverable."""
+    details = [
+        _detail("output/报告.xlsx", mtime=100.0),
+        _detail("draft.txt", mtime=999.0),
+    ]
+    assert _names(select_deliverables(details, baseline_paths=set())) == ["output/报告.xlsx"]
+
+
+# ---------------------------------------------------------------------------
+# criterion 2: files this run created
+# ---------------------------------------------------------------------------
+def test_run_created_file_outside_output_is_still_delivered():
+    """A deliverable written to an off-contract path is still a deliverable —
+    this is what used to depend on the model naming the file in its answer."""
+    details = [_detail("卢旺达市场工程基线.xlsx", mtime=10.0)]
+    assert _names(select_deliverables(details, baseline_paths=set())) == ["卢旺达市场工程基线.xlsx"]
+
+
+def test_preexisting_upload_source_is_not_a_deliverable():
+    """The exact false positive the answer-match clause produced: a prefetched
+    upload source sitting at the working-dir root."""
+    details = [_detail("需求文档.md", mtime=10.0)]
+    baseline = {os.path.join("/ws", "需求文档.md")}
+    assert select_deliverables(details, baseline_paths=baseline) == []
+
+
+def test_answer_text_has_no_influence():
+    """select_deliverables takes no answer argument at all — mentioning a source
+    file in the final message can no longer promote it."""
+    details = [_detail("需求文档.md", mtime=10.0), _detail("output/报告.md", mtime=1.0)]
+    baseline = {os.path.join("/ws", "需求文档.md")}
+    assert _names(select_deliverables(details, baseline_paths=baseline)) == ["output/报告.md"]
+
+
+def test_without_baseline_the_second_criterion_is_skipped():
+    """No baseline (older sessions / defensive callers) => do not guess. Returning
+    the whole working dir would deliver the user's own uploads back to them."""
+    details = [_detail("需求文档.md", mtime=10.0)]
+    assert select_deliverables(details, baseline_paths=None) == []
+
+
+# ---------------------------------------------------------------------------
+# ordering: type first, recency second — [0] is the frontend's headline file
+# ---------------------------------------------------------------------------
+def test_same_type_files_are_ordered_newest_first():
+    details = [
+        _detail("output/a.md", mtime=1.0),
+        _detail("output/c.md", mtime=3.0),
+        _detail("output/b.md", mtime=2.0),
+    ]
+    assert _names(select_deliverables(details)) == ["output/c.md", "output/b.md", "output/a.md"]
+
+
+def test_report_outranks_the_charts_it_generated_last():
+    """The exact case recency-only ordering gets wrong: a task writes its report,
+    then renders charts into output/. Newest is a PNG; the deliverable is not."""
+    details = [
+        _detail("output/报告.docx", mtime=100.0),
+        _detail("output/chart1.png", mtime=200.0),
+        _detail("output/chart2.png", mtime=300.0),
+    ]
+    assert _names(select_deliverables(details))[0] == "output/报告.docx"
+
+
+def test_type_ranking_orders_document_sheet_unknown_image():
+    details = [
+        _detail("output/pic.png", mtime=50.0),
+        _detail("output/bundle.zip", mtime=50.0),
+        _detail("output/data.xlsx", mtime=50.0),
+        _detail("output/report.pdf", mtime=50.0),
+    ]
+    assert _names(select_deliverables(details)) == [
+        "output/report.pdf",
+        "output/data.xlsx",
+        "output/bundle.zip",
+        "output/pic.png",
+    ]
+
+
+def test_unknown_extension_still_outranks_an_image():
+    """A .zip/.ipynb can legitimately BE the deliverable; a chart never is."""
+    details = [_detail("output/chart.png", mtime=999.0), _detail("output/export.zip", mtime=1.0)]
+    assert _names(select_deliverables(details))[0] == "output/export.zip"
+
+
+def test_missing_mtime_sorts_last_without_crashing():
+    details = [{"file_name": "x.md", "file_path": "/ws/output/x.md", "rel_path": "output/x.md"}]
+    details.append(_detail("output/y.md", mtime=5.0))
+    assert _names(select_deliverables(details)) == ["output/y.md", "output/x.md"]
+
+
+def test_rel_path_falls_back_to_basename_when_absent():
+    """Defensive: a caller-built detail dict without rel_path must not crash, and a
+    bare basename reads as a root-level file (no zone)."""
+    details = [{"file_name": "x.md", "file_path": "/ws/x.md", "file_mtime": 1.0}]
+    assert select_deliverables(details, baseline_paths=set())[0]["file_name"] == "x.md"
+
+
+# ---------------------------------------------------------------------------
+# the inputs those criteria rely on
+# ---------------------------------------------------------------------------
+def test_snapshot_file_paths_lists_absolute_paths(tmp_path):
+    (tmp_path / "a.md").write_text("a")
+    (tmp_path / "output").mkdir()
+    (tmp_path / "output" / "b.md").write_text("b")
+
+    snap = snapshot_file_paths(str(tmp_path))
+
+    assert snap == {str(tmp_path / "a.md"), str(tmp_path / "output" / "b.md")}
+
+
+def test_snapshot_file_paths_tolerates_missing_dir():
+    assert snapshot_file_paths("/tmp/definitely-not-a-linsight-dir-xyz") == set()
+    assert snapshot_file_paths("") == set()
+
+
+def test_snapshot_file_fingerprints_maps_path_to_md5(tmp_path):
+    (tmp_path / "output").mkdir()
+    target = tmp_path / "output" / "b.md"
+    target.write_text("hello")
+
+    snap = snapshot_file_fingerprints(str(tmp_path))
+
+    assert list(snap) == [str(target)]
+    assert snap[str(target)] == hashlib.md5(b"hello").hexdigest()
+
+
+def test_snapshot_file_fingerprints_tolerates_missing_dir():
+    assert snapshot_file_fingerprints("/tmp/definitely-not-a-linsight-dir-xyz") == {}
+    assert snapshot_file_fingerprints("") == {}
+
+
+def test_unmodified_output_leftover_is_not_this_run_deliverable():
+    """Follow-up turn inherits output/report.md. Same md5 as start → not a write."""
+    leftover = _detail("output/milvus_status_report.md", mtime=10.0)
+    leftover["file_md5"] = "same-bytes"
+    baseline = {leftover["file_path"]: "same-bytes"}
+    assert select_deliverables([leftover], baseline_paths=baseline) == []
+
+
+def test_overwritten_output_file_is_still_a_deliverable():
+    """write_file on the same path changes md5 — that is this run's report."""
+    rewritten = _detail("output/milvus_status_report.md", mtime=20.0)
+    rewritten["file_md5"] = "new-bytes"
+    baseline = {rewritten["file_path"]: "old-bytes"}
+    assert _names(select_deliverables([rewritten], baseline_paths=baseline)) == ["output/milvus_status_report.md"]
+
+
+def test_leftover_output_dropped_when_this_run_also_wrote_output():
+    """A new chart next to last turn's report: deliver the chart, not the old report."""
+    leftover = _detail("output/report.md", mtime=10.0)
+    leftover["file_md5"] = "old"
+    chart = _detail("output/chart.png", mtime=20.0)
+    chart["file_md5"] = "new"
+    baseline = {leftover["file_path"]: "old"}
+    assert _names(select_deliverables([leftover, chart], baseline_paths=baseline)) == ["output/chart.png"]
+
+
+def test_follow_up_turn_delivers_only_its_own_file():
+    """Turn 3 "再做一个word文档" inherits turns 1-2's output/; only the docx is new."""
+    inherited = [
+        _detail("output/就业方式.pptx", mtime=1.0),
+        _detail("output/就业方式.html", mtime=2.0),
+        _detail("output/就业方式.xlsx", mtime=3.0),
+        _detail("output/就业方式.md", mtime=4.0),
+    ]
+    baseline = {info["file_path"]: info["file_md5"] for info in inherited}
+    docx = _detail("output/就业方式.docx", mtime=9.0)
+    assert _names(select_deliverables([*inherited, docx], baseline_paths=baseline)) == ["output/就业方式.docx"]
+
+
+def test_leftover_chart_linked_by_fresh_report_is_kept(tmp_path):
+    """The md preview resolves ![](charts/a.png) against the delivered file list."""
+    root = str(tmp_path)
+    os.makedirs(os.path.join(root, "output", "charts"))
+    report = _detail("output/report.md", mtime=20.0, root=root)
+    with open(report["file_path"], "w", encoding="utf-8") as f:
+        f.write("# 报告\n\n![趋势](charts/a.png)\n")
+    linked = _detail("output/charts/a.png", mtime=10.0, root=root)
+    unlinked = _detail("output/charts/b.png", mtime=10.0, root=root)
+    old_deck = _detail("output/deck.pptx", mtime=10.0, root=root)
+    baseline = {info["file_path"]: info["file_md5"] for info in (linked, unlinked, old_deck)}
+    selected = select_deliverables([report, linked, unlinked, old_deck], baseline_paths=baseline)
+    assert _names(selected) == ["output/report.md", "output/charts/a.png"]
+
+
+def test_leftover_linked_by_workspace_relative_path_is_kept(tmp_path):
+    root = str(tmp_path)
+    os.makedirs(os.path.join(root, "output"))
+    page = _detail("output/page.html", mtime=20.0, root=root)
+    with open(page["file_path"], "w", encoding="utf-8") as f:
+        f.write('<img src="output/chart.png">')
+    chart = _detail("output/chart.png", mtime=10.0, root=root)
+    baseline = {chart["file_path"]: chart["file_md5"]}
+    assert _names(select_deliverables([page, chart], baseline_paths=baseline)) == [
+        "output/page.html",
+        "output/chart.png",
+    ]
+
+
+def test_fresh_binary_deliverable_keeps_no_leftovers():
+    """Only markdown/html are scanned for links; a fresh xlsx pulls nothing in."""
+    sheet = _detail("output/data.xlsx", mtime=20.0)
+    chart = _detail("output/chart.png", mtime=10.0)
+    baseline = {chart["file_path"]: chart["file_md5"]}
+    assert _names(select_deliverables([sheet, chart], baseline_paths=baseline)) == ["output/data.xlsx"]
+
+
+def test_path_only_baseline_still_keeps_output_zone():
+    """set[str] cannot tell overwrite from leftover; keep historical criterion 1."""
+    leftover = _detail("output/report.md", mtime=10.0)
+    leftover["file_md5"] = "same"
+    assert _names(select_deliverables([leftover], baseline_paths={leftover["file_path"]})) == ["output/report.md"]
+
+
+async def test_read_file_directory_carries_zone_and_mtime(tmp_path):
+    (tmp_path / "output").mkdir()
+    (tmp_path / "output" / "报告.md").write_text("hi")
+
+    details = await read_file_directory(str(tmp_path))
+
+    assert len(details) == 1
+    assert details[0]["rel_path"] == os.path.join("output", "报告.md")
+    assert details[0]["file_mtime"] > 0
+    # and that detail flows straight into selection as an output/ deliverable
+    assert _names(select_deliverables(details)) == [os.path.join("output", "报告.md")]
+
+
+# ---------------------------------------------------------------------------
+# a draft and its rendering: the rendering is the deliverable
+# ---------------------------------------------------------------------------
+def test_rendered_docx_outranks_its_newer_markdown_draft():
+    """The office skills write 报告.md, then build 报告.docx from it. The draft is
+    often the newer file, but the user asked for Word."""
+    details = [
+        _detail("output/报告.docx", mtime=100.0),
+        _detail("output/报告.md", mtime=200.0),
+    ]
+    assert _names(select_deliverables(details)) == ["output/报告.docx", "output/报告.md"]
+
+
+def test_draft_follows_its_rendering_even_across_type_ranks():
+    details = [
+        _detail("output/汇报.md", mtime=300.0),
+        _detail("output/汇报.pptx", mtime=100.0),
+        _detail("output/chart.png", mtime=400.0),
+    ]
+    assert _names(select_deliverables(details)) == ["output/汇报.pptx", "output/汇报.md", "output/chart.png"]
+
+
+def test_markdown_without_a_rendered_sibling_keeps_its_rank():
+    details = [
+        _detail("output/分析.md", mtime=200.0),
+        _detail("output/附录.docx", mtime=100.0),
+    ]
+    assert _names(select_deliverables(details)) == ["output/分析.md", "output/附录.docx"]
+
+
+def test_an_image_with_the_same_stem_does_not_demote_the_report():
+    details = [
+        _detail("output/趋势.md", mtime=100.0),
+        _detail("output/趋势.png", mtime=200.0),
+    ]
+    assert _names(select_deliverables(details)) == ["output/趋势.md", "output/趋势.png"]
+
+
+def test_same_stem_in_another_directory_is_not_a_sibling():
+    details = [
+        _detail("output/报告.md", mtime=200.0),
+        _detail("output/draft/报告.docx", mtime=100.0),
+    ]
+    assert _names(select_deliverables(details)) == ["output/报告.md", "output/draft/报告.docx"]

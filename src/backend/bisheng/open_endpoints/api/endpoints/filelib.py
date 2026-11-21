@@ -1,0 +1,885 @@
+import json
+import os
+from typing import Literal
+
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from loguru import logger
+from starlette.concurrency import run_in_threadpool
+from starlette.responses import FileResponse
+
+from bisheng.api.services import knowledge_imp
+from bisheng.api.v1.schemas import ChunkInput, ExcelRule, KnowledgeFileOne, KnowledgeFileProcess, resp_200
+from bisheng.app_publish.domain.services.capability_bus_service import (
+    CapabilityBusService,
+    hosted_app_access_user,
+)
+from bisheng.common.constants.enums.telemetry import BaseTelemetryTypeEnum
+from bisheng.common.errcode.http_error import NotFoundError
+from bisheng.common.errcode.knowledge import KnowledgeTypeNotSupportedError
+from bisheng.common.services import telemetry_service
+from bisheng.core.cache.utils import async_file_download, save_download_file
+from bisheng.core.logger import trace_id_var
+from bisheng.knowledge.api.dependencies import (
+    get_knowledge_document_repository,
+    get_knowledge_document_version_repository,
+    get_knowledge_file_repository,
+)
+from bisheng.knowledge.domain.models.knowledge import (
+    AuthTypeEnum,
+    KnowledgeCreate,
+    KnowledgeDao,
+    KnowledgeRead,
+    KnowledgeTypeEnum,
+    KnowledgeUpdate,
+)
+from bisheng.knowledge.domain.models.knowledge_file import QAKnoweldgeDao, QAKnowledgeUpsert
+from bisheng.knowledge.domain.repositories.interfaces.knowledge_document_repository import KnowledgeDocumentRepository
+from bisheng.knowledge.domain.repositories.interfaces.knowledge_document_version_repository import (
+    KnowledgeDocumentVersionRepository,
+)
+from bisheng.knowledge.domain.repositories.interfaces.knowledge_file_repository import KnowledgeFileRepository
+from bisheng.knowledge.domain.schemas.retrieval_facade import (
+    HOSTED_APP_ACTOR_KIND,
+    RetrievalIdentity,
+    RetrievalRequest,
+)
+from bisheng.knowledge.domain.services.knowledge_service import KnowledgeService
+from bisheng.knowledge.domain.services.knowledge_space_service import KnowledgeSpaceService
+from bisheng.knowledge.domain.services.retrieval_facade_service import RetrievalFacadeService
+from bisheng.llm.domain.services.llm import LLMService
+from bisheng.open_api.domain.context import get_current_open_api_principal
+from bisheng.open_api.domain.scopes import open_api_scope
+from bisheng.open_endpoints.domain.schemas.filelib import (
+    APIAddQAParam,
+    APIAppendQAParam,
+    QueryQAParam,
+    RetrieveChunk,
+    RetrieveReq,
+    RetrieveResp,
+)
+from bisheng.open_endpoints.domain.utils import get_open_api_operator, get_open_api_operator_async
+from bisheng.role.domain.services.quota_service import QuotaService
+from bisheng.utils.util import sync_func_to_async
+
+# build router
+router = APIRouter(prefix="/filelib", tags=["OpenAPI", "Knowledge"])
+
+
+_KB_TYPES = (KnowledgeTypeEnum.NORMAL.value, KnowledgeTypeEnum.QA.value)
+
+
+def _qa_with_knowledge_access(qa_id: int, *, login_user, action: str):
+    """Resolve a QA row and authorize its owning library before it is exposed or changed."""
+
+    qa = QAKnoweldgeDao.get_qa_knowledge_by_primary_id(qa_id)
+    if qa is None:
+        raise NotFoundError.http_exception()
+    knowledge = KnowledgeService.judge_knowledge_access(login_user, qa.knowledge_id, action)
+    return qa, knowledge
+
+
+def _ensure_qa_knowledge(knowledge) -> None:
+    """QA pairs can only be written into a QA knowledge base."""
+
+    if knowledge.type != KnowledgeTypeEnum.QA.value:
+        raise KnowledgeTypeNotSupportedError.http_exception()
+
+
+def _normalize_qa_knowledge_id(value: object) -> int | None:
+    """Normalize legacy QA foreign keys without mapping malformed values to a resource."""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str):
+        normalized = value.strip()
+        if normalized.isdecimal():
+            knowledge_id = int(normalized)
+            return knowledge_id if knowledge_id > 0 else None
+    return None
+
+
+def _decode_qa_answers(value: object) -> list[str] | None:
+    """Decode the historical JSON field while isolating malformed legacy rows."""
+
+    if isinstance(value, list):
+        answers = value
+    elif isinstance(value, str):
+        try:
+            answers = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    else:
+        return None
+    if not isinstance(answers, list) or any(not isinstance(answer, str) for answer in answers):
+        return None
+    return answers
+
+
+def _build_space_service(
+    request: Request,
+    login_user,
+    version_repo: KnowledgeDocumentVersionRepository | None = None,
+    doc_repo: KnowledgeDocumentRepository | None = None,
+    knowledge_file_repo: KnowledgeFileRepository | None = None,
+) -> KnowledgeSpaceService:
+    """Build a KnowledgeSpaceService bound to the resolved acting identity.
+
+    Mirrors the v1 DI factory but uses the F030 resolved operator (default
+    operator or 代用户) instead of a JWT login. Repos are request-scoped Depends.
+    """
+    svc = KnowledgeSpaceService(
+        request=request,
+        login_user=login_user,
+        knowledge_file_repo=knowledge_file_repo,
+    )
+    svc.version_repo = version_repo
+    svc.doc_repo = doc_repo
+    return svc
+
+
+@router.post("/", status_code=200)
+@open_api_scope("knowledge:write")
+async def create(
+    request: Request,
+    knowledge: KnowledgeCreate,
+    version_repo: KnowledgeDocumentVersionRepository = Depends(get_knowledge_document_version_repository),
+    doc_repo: KnowledgeDocumentRepository = Depends(get_knowledge_document_repository),
+):
+    """Create a knowledge resource (F030 facade, dispatch by ``type``).
+
+    Types 0/1 create document or QA libraries through KnowledgeService;
+    type 3 creates a knowledge space through KnowledgeSpaceService with the
+    workbench embedding model. Type 2 and invalid values are unsupported.
+    """
+    login_user = await get_open_api_operator_async()
+    if knowledge.type in _KB_TYPES:
+        # auth_type / is_released only apply to knowledge spaces (AD-07);
+        # force defaults so they have no effect on knowledge bases.
+        knowledge.auth_type = AuthTypeEnum.PUBLIC
+        knowledge.is_released = False
+        if knowledge.model is None or not str(knowledge.model).strip():
+            # Same default as the platform create dialog (GET /api/v1/llm/knowledge).
+            # When the tenant has no default either, acreate_knowledge raises 10901.
+            knowledge_llm = await LLMService.aget_knowledge_llm(tenant_id=login_user.tenant_id)
+            knowledge.model = str(knowledge_llm.embedding_model_id) if knowledge_llm.embedding_model_id else None
+        db_knowledge = await KnowledgeService.acreate_knowledge(request, login_user, knowledge)
+        # Enrich to the unified KnowledgeRead (user_name + concrete actions), matching
+        # the list/update output. The creator owns the KB → full permission ids.
+        result = (await KnowledgeService.aconvert_knowledge_read(login_user, [db_knowledge]))[0]
+        return resp_200(result)
+    if knowledge.type == KnowledgeTypeEnum.SPACE.value:
+        space_svc = _build_space_service(request, login_user, version_repo, doc_repo)
+        space = await space_svc.create_knowledge_space(
+            name=knowledge.name,
+            description=knowledge.description,
+            auth_type=knowledge.auth_type,
+            is_released=knowledge.is_released,
+        )
+        # Spaces use a different permission model than KBs; populate user_name and
+        # the creator's effective space actions for a consistent output.
+        result = KnowledgeRead(
+            **space.model_dump(),
+            user_name=login_user.user_name,
+            actions=sorted(
+                await space_svc._get_effective_actions(
+                    "knowledge_space",
+                    space.id,
+                )
+            ),
+        )
+        return resp_200(result)
+    raise KnowledgeTypeNotSupportedError.http_exception()
+
+
+@router.put("/", status_code=200)
+@open_api_scope("knowledge:write")
+async def update_knowledge(
+    *,
+    request: Request,
+    knowledge: KnowledgeUpdate,
+    version_repo: KnowledgeDocumentVersionRepository = Depends(get_knowledge_document_version_repository),
+    doc_repo: KnowledgeDocumentRepository = Depends(get_knowledge_document_repository),
+):
+    """Update name/description of a knowledge resource (F030, dispatch by row.type)."""
+    login_user = await get_open_api_operator_async()
+    row = await KnowledgeDao.aquery_by_id(knowledge.knowledge_id)
+    if not row:
+        raise NotFoundError.http_exception()
+    if row.type == KnowledgeTypeEnum.SPACE.value:
+        space_svc = _build_space_service(request, login_user, version_repo, doc_repo)
+        # Only name/description are mutable here (AD-06). Preserve is_released
+        # (update_knowledge_space defaults it to False) and empty description on
+        # missing to match KB semantics / doc (AD-09).
+        updated = await space_svc.update_knowledge_space(
+            space_id=knowledge.knowledge_id,
+            name=knowledge.name,
+            description=knowledge.description if knowledge.description is not None else "",
+            is_released=row.is_released,
+        )
+        return resp_200(updated)
+    if row.type in _KB_TYPES:
+        # update_knowledge is sync and uses run_async_safe internally; run it in a
+        # threadpool so it is not invoked on the endpoint's running event loop.
+        updated = await run_in_threadpool(KnowledgeService.update_knowledge, request, login_user, knowledge)
+        return resp_200(updated)
+    raise KnowledgeTypeNotSupportedError.http_exception()
+
+
+@router.get("/", status_code=200)
+@open_api_scope("knowledge:read")
+async def get_knowledge(
+    *,
+    request: Request,
+    knowledge_type: int = Query(default=KnowledgeTypeEnum.NORMAL.value, alias="type"),
+    name: str | None = None,
+    sort_by: str = Query(default="update_time"),
+    page_size: int | None = 10,
+    cursor: str | None = Query(default=None),
+    version_repo: KnowledgeDocumentVersionRepository = Depends(get_knowledge_document_version_repository),
+    doc_repo: KnowledgeDocumentRepository = Depends(get_knowledge_document_repository),
+):
+    """List knowledge resources by ``type`` (F030 cursor pagination, INV-6).
+
+    Identity delegation is supplied only through ``X-On-Behalf-Of``.
+    Response is ``PageInfiniteCursorData`` (data/page_size/has_more/next_cursor).
+    """
+    login_user = await get_open_api_operator_async()
+    if knowledge_type in _KB_TYPES:
+        page = await KnowledgeService.get_knowledge(
+            request,
+            login_user,
+            KnowledgeTypeEnum(knowledge_type),
+            name=name,
+            sort_by=sort_by,
+            page_size=page_size,
+            cursor=cursor,
+        )
+        return resp_200(page)
+    if knowledge_type == KnowledgeTypeEnum.SPACE.value:
+        space_svc = _build_space_service(request, login_user, version_repo, doc_repo)
+        page = await space_svc.alist_mine_and_joined_cursor(
+            name=name,
+            page_size=page_size,
+            cursor=cursor,
+        )
+        return resp_200(page)
+    raise KnowledgeTypeNotSupportedError.http_exception()
+
+
+@router.delete("/{knowledge_id}", status_code=200)
+@open_api_scope("knowledge:write")
+async def delete_knowledge_api(
+    *,
+    request: Request,
+    knowledge_id: int,
+    version_repo: KnowledgeDocumentVersionRepository = Depends(get_knowledge_document_version_repository),
+    doc_repo: KnowledgeDocumentRepository = Depends(get_knowledge_document_repository),
+):
+    """Delete a knowledge resource (F030, dispatch by row.type).
+
+    Knowledge space (3) → ``KnowledgeSpaceService.delete_space`` (cascade child
+    files/folders + ReBAC tuple cleanup + members). Knowledge base (0/1) →
+    ``KnowledgeService.delete_knowledge``.
+    """
+    login_user = await get_open_api_operator_async()
+    row = await KnowledgeDao.aquery_by_id(knowledge_id)
+    if not row:
+        raise NotFoundError.http_exception()
+    if row.type == KnowledgeTypeEnum.SPACE.value:
+        space_svc = _build_space_service(request, login_user, version_repo, doc_repo)
+        await space_svc.delete_space(knowledge_id)
+        return resp_200(message="knowledge deleted successfully")
+    if row.type in _KB_TYPES:
+        await run_in_threadpool(KnowledgeService.delete_knowledge, request, login_user, knowledge_id)
+        return resp_200(message="knowledge deleted successfully")
+    raise KnowledgeTypeNotSupportedError.http_exception()
+
+
+# Empty all knowledge resource contents (keep the resource itself).
+@router.delete("/clear/{knowledge_id}", status_code=200)
+@open_api_scope("knowledge:write")
+async def clear_knowledge_files(
+    *,
+    request: Request,
+    knowledge_id: int,
+    version_repo: KnowledgeDocumentVersionRepository = Depends(get_knowledge_document_version_repository),
+    doc_repo: KnowledgeDocumentRepository = Depends(get_knowledge_document_repository),
+):
+    """Clear a knowledge resource's contents (F030, dispatch by row.type).
+
+    Knowledge space (3) → ``KnowledgeSpaceService.clear_space`` (remove child
+    files/folders + child tuples, keep the space). Knowledge base (0/1) →
+    ``KnowledgeService.delete_knowledge(only_clear=True)``.
+    """
+    login_user = await get_open_api_operator_async()
+    row = await KnowledgeDao.aquery_by_id(knowledge_id)
+    if not row:
+        raise NotFoundError.http_exception()
+    if row.type == KnowledgeTypeEnum.SPACE.value:
+        space_svc = _build_space_service(request, login_user, version_repo, doc_repo)
+        await space_svc.clear_space(knowledge_id)
+        return resp_200(message="knowledge clear successfully")
+    if row.type in _KB_TYPES:
+        await run_in_threadpool(KnowledgeService.delete_knowledge, request, login_user, knowledge_id, only_clear=True)
+        return resp_200(message="knowledge clear successfully")
+    raise KnowledgeTypeNotSupportedError.http_exception()
+
+
+@router.post("/file/{knowledge_id}")
+@open_api_scope("knowledge:write")
+async def upload_file(
+    request: Request,
+    knowledge_id: int,
+    split_mode: Literal["auto", "custom", "hierarchical"] | None = Form(default="auto"),
+    separator: list[str] | None = Form(
+        default=None, description="Split text rule, If not passed on, it is the default"
+    ),
+    separator_rule: list[Literal["before", "after"]] | None = Form(
+        default=None, description="Segmentation before or after the segmentation rule;before/after"
+    ),
+    chunk_size: int | None = Form(default=None, description="Split text length, default if not passed"),
+    chunk_overlap: int | None = Form(default=None, description="Split text overlap length, default if not passed"),
+    hierarchy_level: int | None = Form(default=3, ge=1, le=6, description="Max heading level to keep: 1-6"),
+    append_title: bool | None = Form(default=False),
+    max_chunk_size: int | None = Form(default=1000, ge=1, description="Max chunk length in hierarchical mode"),
+    callback_url: str | None = Form(default=None, description="Return URL"),
+    file_url: str | None = Form(default=None, description="File URL"),
+    file: UploadFile | None = File(default=None, description="Upload file"),
+    background_tasks: BackgroundTasks = None,
+    retain_images: int | None = Form(default=1, ge=0, le=1, description="Keep document image: 0 or 1"),
+    force_ocr: int | None = Form(default=0, ge=0, le=1, description="Enable OCR: 0 or 1"),
+    enable_formula: int | None = Form(default=1, ge=0, le=1, description="LaTeX formula recognition: 0 or 1"),
+    filter_page_header_footer: int | None = Form(default=0, ge=0, le=1, description="Filter header/footer: 0 or 1"),
+    excel_rule: ExcelRule | None = Form(default={}, description="excel rule"),
+    parent_id: int | None = Form(
+        default=None, description="Target folder id; knowledge-space only, must exist. Ignored for knowledge bases."
+    ),
+    version_repo: KnowledgeDocumentVersionRepository = Depends(get_knowledge_document_version_repository),
+    doc_repo: KnowledgeDocumentRepository = Depends(get_knowledge_document_repository),
+):
+    """Upload a file to a knowledge resource (F030 facade, dispatch by row.type).
+
+    Knowledge base (0/1) → existing parse/split/ingest pipeline (``parent_id``
+    ignored). Knowledge space (3) → ``KnowledgeSpaceService.add_file`` which
+    natively places the file under ``parent_id`` (must exist, else 18010).
+    """
+    if file:
+        file_name = file.filename
+        if not file_name:
+            raise HTTPException(status_code=400, detail="file name must be not empty")
+        # Cache Local
+        file_path = await sync_func_to_async(save_download_file)(file.file, "bisheng", file_name)
+    elif not file_url:
+        raise HTTPException(status_code=400, detail="file or file_url is required")
+    else:
+        try:
+            file_path, file_name = await async_file_download(file_url)
+        except ValueError as exc:
+            # async_file_download raises ValueError only for caller-side causes:
+            # malformed URL, a disallowed local path, or a remote host that is
+            # unreachable or answers non-200. Storage errors still surface as 5xx.
+            raise HTTPException(status_code=400, detail=f"file_url cannot be downloaded: {exc}") from exc
+
+    loging_user = await get_open_api_operator_async()
+
+    db_knowledge = await KnowledgeDao.aquery_by_id(knowledge_id)
+    if not db_knowledge:
+        raise NotFoundError.http_exception()
+
+    # Knowledge space: delegate to the space file-add path (handles parent_id).
+    if db_knowledge.type == KnowledgeTypeEnum.SPACE.value:
+        space_svc = _build_space_service(request, loging_user, version_repo, doc_repo)
+        res = await space_svc.add_file(
+            knowledge_id=knowledge_id,
+            file_path=[file_path],
+            parent_id=parent_id,
+        )
+        return resp_200(data=res[0])
+
+    if db_knowledge.type not in _KB_TYPES:
+        raise KnowledgeTypeNotSupportedError.http_exception()
+
+    # Knowledge base: unchanged parse/split/ingest pipeline (parent_id ignored).
+    req_data = KnowledgeFileProcess(
+        knowledge_id=knowledge_id,
+        split_mode=split_mode,
+        separator=separator,
+        separator_rule=separator_rule,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        hierarchy_level=hierarchy_level,
+        append_title=append_title,
+        max_chunk_size=max_chunk_size,
+        retain_images=retain_images,
+        force_ocr=force_ocr,
+        enable_formula=enable_formula,
+        filter_page_header_footer=filter_page_header_footer,
+        callback_url=callback_url,
+        file_list=[KnowledgeFileOne(file_path=file_path, excel_rule=excel_rule)],
+    )
+
+    upload_limit_bytes = await QuotaService.get_knowledge_space_upload_limit_bytes(loging_user)
+    res = await KnowledgeService.aprocess_knowledge_file(
+        request=request,
+        login_user=loging_user,
+        background_tasks=background_tasks,
+        req_data=req_data,
+        upload_limit_bytes=upload_limit_bytes,
+    )
+    return resp_200(data=res[0])
+
+
+@router.delete("/file/{file_id}", status_code=200)
+@open_api_scope("knowledge:write")
+def delete_knowledge_file(request: Request, file_id: int):
+    """Delete files in the Knowledge Base"""
+    login_user = get_open_api_operator()
+    KnowledgeService.delete_knowledge_file(request, login_user, [file_id])
+    return resp_200()
+
+
+@router.post("/delete_file", status_code=200)
+@open_api_scope("knowledge:write")
+def delete_file_batch_api(request: Request, file_ids: list[int]):
+    """Bulk delete knowledge file information"""
+    login_user = get_open_api_operator()
+    KnowledgeService.delete_knowledge_file(request, login_user, file_ids)
+    return resp_200()
+
+
+@router.get("/file/list", status_code=200)
+@open_api_scope("knowledge:read")
+async def get_filelist(
+    request: Request,
+    knowledge_id: int,
+    parent_id: int | None = None,
+    keyword: str | None = None,
+    status: list[int] = Query(default=None),
+    page_size: int = Query(default=10, ge=1),
+    cursor: str | None = Query(default=None),
+    version_repo: KnowledgeDocumentVersionRepository = Depends(get_knowledge_document_version_repository),
+    doc_repo: KnowledgeDocumentRepository = Depends(get_knowledge_document_repository),
+    knowledge_file_repo: KnowledgeFileRepository = Depends(get_knowledge_file_repository),
+):
+    """List files of a knowledge resource (F030 cursor pagination, dispatch by row.type).
+
+    Knowledge base (0/1) → flat cursor list (``aget_knowledge_files_cursor``,
+    ``parent_id`` ignored). Knowledge space (3) → hierarchical cursor list
+    (``list_space_children``) under ``parent_id`` (root when omitted).
+    """
+    login_user = await get_open_api_operator_async()
+    db_knowledge = await KnowledgeDao.aquery_by_id(knowledge_id)
+    if not db_knowledge:
+        raise NotFoundError.http_exception()
+
+    if db_knowledge.type == KnowledgeTypeEnum.SPACE.value:
+        space_svc = _build_space_service(request, login_user, version_repo, doc_repo, knowledge_file_repo)
+        if keyword:
+            # Keyword search over the space → offset-based search adapted to cursor.
+            page = await space_svc.asearch_space_children_cursor(
+                knowledge_id,
+                parent_id=parent_id,
+                keyword=keyword,
+                file_status=status,
+                page_size=page_size,
+                cursor=cursor,
+            )
+        else:
+            # No keyword → native cursor folder listing under parent_id.
+            page = await space_svc.list_space_children(
+                knowledge_id,
+                parent_id=parent_id,
+                file_status=status,
+                cursor=cursor,
+                page_size=page_size,
+            )
+        # writeable: whether the acting user can write to the target container.
+        writeable = await space_svc.can_write_space_container(knowledge_id, parent_id)
+        data = page.model_dump()
+        data["writeable"] = writeable
+        return resp_200(data=data)
+
+    if db_knowledge.type not in _KB_TYPES:
+        raise KnowledgeTypeNotSupportedError.http_exception()
+
+    page, writeable = await KnowledgeService.aget_knowledge_files_cursor(
+        request,
+        login_user,
+        knowledge_id,
+        file_name=keyword,
+        status=status,
+        page_size=page_size,
+        cursor=cursor,
+    )
+    data = page.model_dump()
+    data["writeable"] = writeable
+    return resp_200(data=data)
+
+
+@router.post("/chunks")
+@open_api_scope("knowledge:write")
+async def post_chunks(
+    request: Request,
+    knowledge_id: int = Form(...),
+    metadata: str = Form(...),
+    split_mode: Literal["auto", "custom", "hierarchical"] | None = Form(default="auto"),
+    separator: list[str] | None = Form(default=None),
+    separator_rule: list[str] | None = Form(default=None),
+    chunk_size: int | None = Form(default=None),
+    chunk_overlap: int | None = Form(default=None),
+    hierarchy_level: int | None = Form(default=3, ge=1, le=6, description="Max heading level to keep: 1-6"),
+    append_title: bool | None = Form(default=False),
+    max_chunk_size: int | None = Form(default=1000, ge=1, description="Max chunk length in hierarchical mode"),
+    file: UploadFile = File(...),
+):
+    """Upload files to the knowledge base and sync the interface"""
+    file_name = file.filename
+    if not file_name:
+        raise HTTPException(status_code=400, detail="file name must be not empty")
+    file_path = await sync_func_to_async(save_download_file)(file.file, "bisheng", file_name)
+
+    login_user = await get_open_api_operator_async()
+
+    req_data = KnowledgeFileProcess(
+        knowledge_id=knowledge_id,
+        split_mode=split_mode,
+        separator=separator,
+        separator_rule=separator_rule,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        hierarchy_level=hierarchy_level,
+        append_title=append_title,
+        max_chunk_size=max_chunk_size,
+        file_list=[KnowledgeFileOne(file_path=file_path)],
+    )
+
+    upload_limit_bytes = await QuotaService.get_knowledge_space_upload_limit_bytes(login_user)
+    res = await run_in_threadpool(
+        KnowledgeService.sync_process_knowledge_file,
+        request,
+        login_user,
+        req_data,
+        upload_limit_bytes=upload_limit_bytes,
+    )
+    return resp_200(data=res[0])
+
+
+@router.post("/chunks_string")
+@open_api_scope("knowledge:write")
+async def post_string_chunks(request: Request, document: ChunkInput):
+    """Write caller-prepared text into a document knowledge base as one file."""
+
+    db_knowledge = await KnowledgeDao.aquery_by_id(document.knowledge_id)
+    if not db_knowledge:
+        raise NotFoundError.http_exception()
+    # The chunks use the document knowledge base schema; QA libraries and
+    # knowledge spaces store files differently.
+    if db_knowledge.type != KnowledgeTypeEnum.NORMAL.value:
+        raise KnowledgeTypeNotSupportedError.http_exception()
+
+    # String saved to file
+    content = "\n\n".join([doc.page_content for doc in document.documents])
+    content_bytes = bytes(content, encoding="utf-8")
+    file_name = document.documents[0].metadata.get("source")
+    file_path = await sync_func_to_async(save_download_file)(content_bytes, "bisheng", file_name)
+
+    login_user = await get_open_api_operator_async()
+
+    req_data = KnowledgeFileProcess(
+        knowledge_id=document.knowledge_id,
+        separator=["\n\n"],
+        separator_rule=["after"],
+        file_list=[KnowledgeFileOne(file_path=file_path)],
+    )
+
+    upload_limit_bytes = await QuotaService.get_knowledge_space_upload_limit_bytes(login_user)
+    knowledge, failed_files, process_files, _ = await KnowledgeService.asave_knowledge_file(
+        login_user,
+        req_data,
+        upload_limit_bytes=upload_limit_bytes,
+    )
+    if failed_files:
+        # Duplicate file (same name or content): HTTP 200, status=3, remark has new/old names.
+        return resp_200(data=failed_files[0])
+
+    res = await KnowledgeService.aingest_text_chunks(login_user, knowledge, process_files[0], document.documents)
+
+    return resp_200(data=res)
+
+
+@router.get("/download_statistic")
+@open_api_scope("knowledge:read", modes=("S",))
+def download_statistic_file(
+    file_path: str = Query(
+        ...,
+        pattern=r"^/app/data/[^.]*\.log$",
+        description="Absolute path of a .log file under /app/data/; no '.' outside the extension",
+    ),
+):
+    # The pattern rejects any other directory, extension or a '..' segment (HTTP 400).
+    if not os.path.isfile(file_path):
+        raise NotFoundError.http_exception()
+
+    file_name = os.path.basename(file_path)
+    return FileResponse(file_path, filename=file_name)
+
+
+@router.post("/add_qa")
+@open_api_scope("knowledge:write")
+def add_qa(*, knowledge_id: int = Body(embed=True), data: list[APIAddQAParam] = Body(embed=True)):
+    # Seed the tenant ContextVar (multi-tenant safe) — QAKnowledge is tenant-aware.
+    login_user = get_open_api_operator()
+    knowledge = KnowledgeService.judge_knowledge_access(login_user, knowledge_id, "edit")
+    _ensure_qa_knowledge(knowledge)
+    logger.info("add_qa_data knowledge_id={} size={}", knowledge_id, len(data))
+    res = []
+    for item in data:
+        qa_insert = QAKnowledgeUpsert(
+            knowledge_id=knowledge_id,
+            questions=[item.question],
+            answers=item.answer,
+            user_id=login_user.user_id,
+            extra_meta=json.dumps(item.extra),
+            source=3,
+        )
+
+        res.append(knowledge_imp.add_qa(knowledge, qa_insert))
+
+    return resp_200(res)
+
+
+@router.post("/add_relative_qa")
+@open_api_scope("knowledge:write")
+def append_qa(*, knowledge_id: int = Body(embed=True), data: APIAppendQAParam = Body(embed=True)):
+    # Seed the tenant ContextVar (multi-tenant safe) — QAKnowledge is tenant-aware.
+    login_user = get_open_api_operator()
+    qa_db, knowledge = _qa_with_knowledge_access(data.id, login_user=login_user, action="edit")
+    if qa_db.knowledge_id != knowledge_id:
+        raise NotFoundError.http_exception()
+    _ensure_qa_knowledge(knowledge)
+
+    t = qa_db.dict()
+    t["answers"] = json.loads(t["answers"])
+    qa_insert = QAKnowledgeUpsert.validate(t)
+    qa_insert.questions.extend(data.relative_questions)
+
+    return resp_200(knowledge_imp.add_qa(knowledge, qa_insert))
+
+
+@router.delete("/qa/{qa_id}", status_code=200)
+@open_api_scope("knowledge:write")
+def delete_qa_data(*, qa_id: int, question: str | None = None):
+    """Deleteqa Question to Information"""
+    # Seed the tenant ContextVar before any tenant-aware read/write.
+    login_user = get_open_api_operator()
+    qa, knowledge = _qa_with_knowledge_access(qa_id, login_user=login_user, action="edit")
+
+    # A QA pair cannot exist without a question: removing the last one deletes the whole pair.
+    keep_pair = False
+    if question:
+        remaining_questions = [q for q in qa.questions if q != question]
+        keep_pair = bool(remaining_questions)
+
+    if keep_pair:
+        qa.questions = remaining_questions
+        QAKnoweldgeDao.update(qa)
+    else:
+        QAKnoweldgeDao.delete_batch([qa_id])
+        telemetry_service.log_event_sync(
+            user_id=login_user.user_id,
+            event_type=BaseTelemetryTypeEnum.DELETE_KNOWLEDGE_FILE,
+            trace_id=trace_id_var.get(),
+        )
+    knowledge_imp.delete_vector_data(knowledge, file_ids=[qa_id])
+    if keep_pair:
+        knowledge_imp.QA_save_knowledge(knowledge, qa)
+    return resp_200()
+
+
+@router.post("/update_qa", status_code=200)
+@open_api_scope("knowledge:write")
+def update_qa(
+    *,
+    id: int = Body(embed=True),
+    question: str | None = Body(default=None, embed=True),
+    original_question: str | None = Body(default=None, embed=True),
+    answer: list[str] | None = Body(default=None, embed=True),
+):
+    """Deleteqa Question to Information"""
+    # Seed the tenant ContextVar before any tenant-aware read/write.
+    login_user = get_open_api_operator()
+    qa, knowledge = _qa_with_knowledge_access(id, login_user=login_user, action="edit")
+
+    if original_question and question is None:
+        raise HTTPException(status_code=400, detail="question is required with original_question")
+    if original_question:
+        qa.questions = [question if q == original_question else q for q in qa.questions]
+    elif question is not None:
+        qa.questions = [question]
+    if answer:
+        qa.answers = json.dumps(answer, ensure_ascii=False)
+    QAKnoweldgeDao.update(qa)
+
+    # The index stores the answer in each question's metadata, so a new answer
+    # needs the same rebuild as a new question.
+    if question or answer:
+        knowledge_imp.delete_vector_data(knowledge, file_ids=[id])
+        knowledge_imp.QA_save_knowledge(knowledge, qa)
+    return resp_200()
+
+
+@router.get("/detail_qa", status_code=200)
+@open_api_scope("knowledge:read")
+def detail_qa(*, id: int):
+    """Get questions on information"""
+    # Seed the tenant ContextVar before the tenant-aware read.
+    login_user = get_open_api_operator()
+    qa, _knowledge = _qa_with_knowledge_access(id, login_user=login_user, action="visible")
+    return resp_200(qa)
+
+
+@router.post("/retrieve")
+# ``hosted_app=True`` — the one route of the seven under ``knowledge:read`` that
+# a hosted application may reach, because it is the only one routed through the
+# capability bus (declared whitelist ∩ the visitor's own visibility). The other
+# six execute as the application's owner and are refused at the gate with 26052.
+@open_api_scope("knowledge:read", hosted_app=True)
+async def retrieve_chunks(
+    request: Request,
+    req: RetrieveReq,
+    version_repo: KnowledgeDocumentVersionRepository = Depends(get_knowledge_document_version_repository),
+):
+    """Retrieve top-k chunks across one or more knowledge bases (no LLM generation).
+
+    Designed for external retrieval-tool integrations. Delegation is supplied
+    only through ``X-On-Behalf-Of``.
+
+    F052: this runs on ``RetrievalFacadeService`` — the same code the MCP search
+    tool, the hosted runtime and the SDK use — so "what this credential can
+    retrieve" has one answer regardless of which door it came through. The
+    request and response shapes are unchanged; the errors are not. A knowledge
+    base that is missing, ungranted or of an unsupported type now answers with
+    one 26321 instead of three distinguishable refusals, and a permission
+    outage surfaces as itself (503 / 25021) rather than being relabelled as a
+    credential-validation outage.
+
+    F055: a **hosted application** does not reach the facade directly. Its
+    credential authorises the application, not a person, so the call is routed
+    through the capability bus, which supplies the declared whitelist and the
+    identity of the visitor named by ``X-BiSheng-Access-Token``. Without that
+    header there is no access user and the retrieval is refused outright
+    (AC-52) — there is no owner to fall back to.
+    """
+
+    # Argument validation that used to live inside ``aretrieve_chunks``. It has
+    # to stay on this face: ``tag_match_mode="ALL"`` is a documented 400 (it is
+    # not implemented), and silently treating it as ``"ANY"`` would return a
+    # *wider* set than asked for with no way for the caller to notice. Same for
+    # a filter naming a knowledge base outside ``knowledge_base_ids`` — dropping
+    # it quietly means the caller's narrowing never happened.
+    tag_filters = None
+    if req.filters and req.filters.knowledge_base_filters:
+        target_ids = set(req.knowledge_base_ids)
+        tag_filters = {}
+        for one in req.filters.knowledge_base_filters:
+            if one.knowledge_base_id not in target_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"filter references kb_id {one.knowledge_base_id} not present in knowledge_base_ids",
+                )
+            if one.tag_match_mode != "ANY":
+                raise HTTPException(status_code=400, detail="tag_match_mode=ALL is not yet supported")
+            tag_filters[one.knowledge_base_id] = list(one.tags)
+
+    principal = get_current_open_api_principal()
+    if principal is not None and principal.actor_kind == HOSTED_APP_ACTOR_KIND:
+        result = await CapabilityBusService.retrieve(
+            app_id=principal.subject_ref or "",
+            access_user_id=hosted_app_access_user(request, principal),
+            query=req.query,
+            knowledge_ids=req.knowledge_base_ids,
+            top_k=req.top_k,
+            max_content=req.max_content,
+            tag_filters=tag_filters,
+            credential_id=principal.credential_id,
+            version_repo=version_repo,
+        )
+    else:
+        identity = RetrievalIdentity.from_open_api_principal(principal) if principal is not None else None
+        result = await RetrievalFacadeService.retrieve(
+            identity,
+            RetrievalRequest(
+                query=req.query,
+                knowledge_ids=req.knowledge_base_ids,
+                top_k=req.top_k,
+                max_content=req.max_content,
+                tag_filters=tag_filters,
+            ),
+            version_repo=version_repo,
+        )
+
+    chunks = [
+        RetrieveChunk(
+            content=chunk.content,
+            knowledge_id=chunk.knowledge_id,
+            document_id=chunk.document_id,
+            document_name=chunk.document_name,
+            chunk_index=chunk.chunk_index,
+            document_update_time=chunk.document_update_time,
+        )
+        for chunk in result.chunks
+    ]
+    return resp_200(data=RetrieveResp(chunks=chunks, total=len(chunks)))
+
+
+@router.post("/query_qa", status_code=200)
+@open_api_scope("knowledge:read")
+def query_qa(QueryQAParam: QueryQAParam):
+    """Return visible QA rows while tolerating invalid legacy records."""
+
+    # Seed the tenant ContextVar before the tenant-aware read.
+    login_user = get_open_api_operator()
+    # Every QA source is returned (0 unknown, 1 manual, 2 audit, 3 API, 4 batch import).
+    qa_list = QAKnoweldgeDao.query_by_condition_v1(
+        create_start=QueryQAParam.timeRange[0], create_end=QueryQAParam.timeRange[1]
+    )
+    candidates = []
+    invalid_resource_count = 0
+    for qa in qa_list or []:
+        knowledge_id = _normalize_qa_knowledge_id(getattr(qa, "knowledge_id", None))
+        if knowledge_id is None:
+            invalid_resource_count += 1
+            continue
+        candidates.append((qa, knowledge_id))
+
+    knowledge_ids = list(dict.fromkeys(knowledge_id for _, knowledge_id in candidates))
+    action_map = {}
+    if knowledge_ids:
+        action_map = KnowledgeService.permission_service.get_knowledge_action_map_sync(
+            login_user,
+            knowledge_ids,
+            ["visible"],
+        )
+
+    visible_qa = []
+    invalid_answers_count = 0
+    for qa, knowledge_id in candidates:
+        if "visible" not in action_map.get(knowledge_id, set()):
+            continue
+        answers = _decode_qa_answers(getattr(qa, "answers", None))
+        if answers is None:
+            invalid_answers_count += 1
+            continue
+        qa.answers = answers
+        visible_qa.append(qa)
+
+    if invalid_resource_count or invalid_answers_count:
+        logger.warning(
+            "query_qa filtered legacy rows: invalid_resource_count={} invalid_answers_count={}",
+            invalid_resource_count,
+            invalid_answers_count,
+        )
+
+    return resp_200(visible_qa)

@@ -1,0 +1,278 @@
+// @ts-strict-ignore
+import { isNumberDraftWithinBounds } from '@/utils/fieldValidation';
+import { Button, Input, Select, toast } from '@bisheng/ui';
+import { Outlined } from "bisheng-icons";
+
+
+
+import { Label } from "@/components/bs-ui/label";
+import { useSelectLabels } from "@/components/bs-comp/formFields/useSelectLabels";
+
+import { ModelFieldHint } from "../ModelFieldHint";
+import { generateUUID } from "@/components/bs-ui/utils";
+import { RadioGroup, Radio as RadioGroupItem } from "@bisheng/ui";
+import { getAssistantModelEnvelope, updateAssistantModelConfig } from "@/controllers/API/finetune";
+import { FallbackBlockedBanner, InheritedBadge } from "../SystemConfigBanners";
+import { useSystemConfigEnvelope } from "../useSystemConfigEnvelope";
+import { showApiError } from "@/controllers/request";
+import uniqBy from "lodash-es/uniqBy";
+
+import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { useQueryClient } from "@tanstack/react-query";
+import { ModelSelect } from "./KnowledgeModel";
+
+
+
+const executorTypeOptions = [
+    { value: "function call", label: "Function call" },
+    { value: "ReAct", label: "ReAct" },
+]
+
+const ModelRow = ({ item, index, llmOptions, updateField, deleteRow }) => {
+    const { t } = useTranslation('model')
+    const selectLabels = useSelectLabels()
+    const yesNoOptions = [
+        { value: "1", label: t('model.yes') },
+        { value: "0", label: t('model.no') },
+    ]
+
+    return <div className="grid mb-4 items-center" style={{ gridTemplateColumns: "repeat(2, 1fr) 80px 110px 76px 90px 40px" }}>
+        <div className="pr-2">
+            <ModelSelect
+                label={''}
+                value={item.model_id}
+                options={llmOptions}
+                onChange={(val) => updateField(index, 'model_id', val)}
+            />
+        </div>
+        <div className="pr-2">
+            <Select
+                {...selectLabels}
+                aria-label={t('model.assistantExecutionMode')}
+                options={executorTypeOptions}
+                value={item.agent_executor_type || null}
+                onChange={(val) => { if (val != null) updateField(index, 'agent_executor_type', String(val)) }}
+            />
+        </div>
+        <div className="pr-2">
+            <Select
+                {...selectLabels}
+                aria-label={t('model.streamingOutput')}
+                options={yesNoOptions}
+                value={item.streaming ? "1" : "0"}
+                onChange={(val) => updateField(index, 'streaming', val === "1")}
+            />
+        </div>
+        <div className="pr-2">
+            <Input type="number" value={item.knowledge_max_content} onChange={(e) => { if (!isNumberDraftWithinBounds(e.currentTarget.value, { min: 1, max: 15000 })) return; return updateField(index, 'knowledge_max_content', Math.min(parseInt(e.target.value), 15000)); }} min={1} max={15000} />
+        </div>
+        <div className="pr-2">
+            <Select
+                {...selectLabels}
+                aria-label={t('model.reorderAfterRetrieval')}
+                options={yesNoOptions}
+                value={item.knowledge_sort_index ? "1" : "0"}
+                onChange={(val) => updateField(index, 'knowledge_sort_index', val === "1")}
+            />
+        </div>
+        <div className="m-auto">
+            <RadioGroup value={item.default ? "1" : "0"} onValueChange={(val) => updateField(index, 'default', val === "1")}>
+                <RadioGroupItem value="1"></RadioGroupItem>
+            </RadioGroup>
+        </div>
+        <div className="m-auto">
+            <Outlined.Delete className="text-gray-500 cursor-pointer size-4" onClick={() => deleteRow(index)} />
+        </div>
+    </div>
+};
+
+const defaultValue = {
+    llm_list: [{
+        model_id: null,
+        agent_executor_type: "function call",
+        knowledge_max_content: 15000,
+        knowledge_sort_index: false,
+        default: true,
+        streaming: false
+    }],
+    auto_llm: {
+        model_id: null,
+        agent_executor_type: "function call",
+        knowledge_max_content: 0,
+        knowledge_sort_index: false,
+        default: false,
+        streaming: false
+    }
+}
+
+export default function AssisModel({ llmOptions, onBack }) {
+    const [form, setForm] = useState({ ...defaultValue });
+    const { t } = useTranslation('model')
+    const selectLabels = useSelectLabels()
+    const queryClient = useQueryClient()
+
+    const { config, loading, inheritedFromRoot, fallbackBlocked, clearInherited: markEdited } =
+        useSystemConfigEnvelope<any>(getAssistantModelEnvelope)
+
+    useEffect(() => {
+        if (!config) return
+        setForm({
+            llm_list: config.llm_list || defaultValue.llm_list,
+            auto_llm: config.auto_llm || { ...defaultValue.auto_llm }
+        })
+    }, [config]);
+
+    const updateField = (index, field, value) => {
+        markEdited();
+        const updatedList = form.llm_list.map((item, i) => {
+            if (i === index) {
+                return { ...item, [field]: value };
+            } else if (field === 'default' && value === true) {
+                return { ...item, default: false };
+            }
+            return item;
+        });
+
+        setForm({ ...form, llm_list: updatedList });
+    };
+
+    const updateAutoLLMField = (field, value) => {
+        markEdited();
+        setForm({ ...form, auto_llm: { ...form.auto_llm, [field]: value } });
+    };
+
+    const addNewRow = () => {
+        const newRow = {
+            model_id: Date.now(),
+            agent_executor_type: "function call",
+            knowledge_max_content: 15000,
+            knowledge_sort_index: false,
+            default: !form.llm_list.length,
+            streaming: true
+        };
+        setForm({
+            ...form,
+            llm_list: [...form.llm_list, newRow]
+        });
+    };
+
+    const deleteRow = (index) => {
+        let target = null
+        const updatedList = form.llm_list.filter((_, i) => {
+            if (i === index) {
+                target = _
+                return false
+            }
+            return true
+        }).map((item, i) => {
+            if (target.default && i === 0) return { ...item, default: true };
+            return item;
+        });
+        setForm({ ...form, llm_list: updatedList });
+    };
+
+
+    const handleSave = () => {
+        console.log('Form data to save:', form);
+        if (form.llm_list.some(el => el.model_id === null)) {
+            return toast.show({ type: 'error', message: String(t('model.assistantInferenceModel') + t('bs:required')) })
+        }
+        if (form.auto_llm.model_id === null) {
+            return toast.show({ type: 'error', message: String(t('model.assistantAutoOptimizationModel') + t('bs:required')) })
+        }
+        const uniqueList = uniqBy(form.llm_list, 'model_id');
+        if (uniqueList.length !== form.llm_list.length) {
+            return toast.show({ type: 'error', message: String(t('model.assistantInferenceModelRepetition') ?? '') })
+        }
+
+        void updateAssistantModelConfig(form).then(() => {
+            toast.show({ type: 'success', message: String(t('model.saveSuccess') ?? '') })
+            // The root QueryClient sets refetchOnMount: false globally, so
+            // invalidateQueries only marks the entry stale and the workbench
+            // dropdown still serves cached data on next mount. removeQueries
+            // drops the cache entirely, forcing a fresh fetch on next read.
+            queryClient.removeQueries({ queryKey: ['QueryAssistantModelsKey'] })
+        }).catch(showApiError);
+    };
+
+    if (loading) return <div className="absolute w-full h-full top-0 left-0 flex justify-center items-center z-10 bg-[rgba(255,255,255,0.6)] dark:bg-blur-shared">
+        <Outlined.Loading  className="size-4 animate-spin"/>
+    </div>
+
+    return (
+        <div className="w-[70vw] mx-auto pt-2">
+            <FallbackBlockedBanner visible={fallbackBlocked} />
+            <div className="mb-6">
+                <span className="pl-1">
+                    {t('model.assistantInferenceModel')}
+                    <InheritedBadge visible={inheritedFromRoot} />
+                </span>
+                <div className="mt-2 border p-4 rounded-md bg-muted">
+                    <div className="grid mb-4 items-center" style={{ gridTemplateColumns: "repeat(2, 1fr) 80px 110px 68px 90px 40px" }}>
+                        <Label className="bisheng-label">{t('model.model')}<span className="text-red-500 text-xs">*</span></Label>
+                        <Label className="bisheng-label inline-flex items-center">
+                            <span>{t('model.assistantExecutionMode')}</span>
+                            <ModelFieldHint className="ml-1" content={t('model.assistantExecutionModeTooltip')} />
+                        </Label>
+                        <Label className="bisheng-label">{t('model.streamingOutput')}</Label>
+                        <Label className="bisheng-label inline-flex items-center">
+                            <span>{t('model.assistantKnowledgeBaseMaxCharacters')}</span>
+                            <ModelFieldHint className="ml-1" content={t('model.assistantKnowledgeBaseMaxCharactersTooltip')} />
+                        </Label>
+                        <Label className="bisheng-label inline-flex items-center">
+                            <span>{t('model.reorderAfterRetrieval')}</span>
+                            <ModelFieldHint className="ml-1" content={t('model.reorderAfterRetrievalTooltip')} />
+                        </Label>
+                        <Label className="bisheng-label text-center">{t('model.setAsDefault')}</Label>
+                        <div></div>
+                    </div>
+                    {form.llm_list.map((item, index) => (
+                        <ModelRow
+                            key={generateUUID(6)} // more render
+                            item={item}
+                            index={index}
+                            llmOptions={llmOptions}
+                            updateField={updateField}
+                            deleteRow={deleteRow}
+                        />
+                    ))}
+                    <Button variant="outlined" size="medium" onClick={addNewRow} color="default" iconOnly>
+                        <Outlined.Plus className="size-5" />
+                    </Button>
+                </div>
+            </div>
+            <div className="">
+                <span className="pl-1">{t('model.assistantAutoOptimizationModel')}</span>
+                <div className="mt-2 border p-4 rounded-md bg-muted">
+                    <div className="grid grid-cols-4 gap-2">
+                        <Label className="bisheng-label">{t('model.model')}<span className="text-red-500 text-xs">*</span></Label>
+                        <Label className="bisheng-label">{t('model.streamingOutput')}</Label>
+                    </div>
+                    <div className="grid grid-cols-4 gap-2 mt-4">
+                        <ModelSelect
+                            label={''}
+                            value={form.auto_llm.model_id}
+                            options={llmOptions}
+                            onChange={(val) => updateAutoLLMField('model_id', val)}
+                        />
+                        <Select
+                            {...selectLabels}
+                            aria-label={t('model.streamingOutput')}
+                            options={[
+                                { value: "1", label: t('model.yes') },
+                                { value: "0", label: t('model.no') },
+                            ]}
+                            value={form.auto_llm.streaming ? "1" : "0"}
+                            onChange={(val) => updateAutoLLMField('streaming', val === "1")}
+                        />
+                    </div>
+                </div>
+            </div>
+            <div className="mt-10 text-center space-x-6">
+                <Button variant="outlined" onClick={onBack} color="default">{t('model.cancel')}</Button>
+                <Button disabled={!config} onClick={handleSave}>{t('model.save')}</Button>
+            </div>
+        </div>
+    );
+}

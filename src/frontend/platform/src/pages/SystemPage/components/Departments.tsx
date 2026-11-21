@@ -1,0 +1,282 @@
+import { departmentDisplayName } from "@/components/bs-comp/department/departmentDisplayName";
+import { Button } from '@bisheng/ui';
+import { LazyDepartmentTree, useLazyDepartmentTree } from "@/components/bs-comp/department";
+
+import { locationContext } from "@/contexts/locationContext";
+import { userContext } from "@/contexts/userContext";
+import { getDepartmentApi } from "@/controllers/API/department";
+import { handleUiRequest, showApiError } from "@/controllers/request";
+import { CreateDepartmentDialog } from "@/pages/DepartmentPage/components/CreateDepartmentDialog";
+import { DepartmentSettings } from "@/pages/DepartmentPage/components/DepartmentSettings";
+import { DepartmentTrafficControl } from "@/pages/DepartmentPage/components/DepartmentTrafficControl";
+import { MemberTable } from "@/pages/DepartmentPage/components/MemberTable";
+import { MountTenantDialog } from "@/pages/DepartmentPage/components/MountTenantDialog";
+import { DepartmentTreeNode } from "@/types/api/department";
+import { Tabs, Tag } from "@bisheng/ui";
+import { Outlined } from "bisheng-icons";
+
+import { useCallback, useContext, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+
+export default function Departments() {
+  const { t } = useTranslation();
+  const { appConfig } = useContext(locationContext);
+  const { user } = useContext(userContext);
+  /** Match organization sync: only platform super admins. */
+  const isSuperAdmin = user?.role === "admin";
+  const showTrafficControlTab = isSuperAdmin && appConfig.isPro;
+  const multiTenantEnabled = !!appConfig?.multiTenantEnabled;
+
+  // F038: lazy management nav tree (see DepartmentPage/index for the rationale).
+  const tree = useLazyDepartmentTree({ includeArchived: true, autoExpandRoots: true });
+
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [selectedSnapshot, setSelectedSnapshot] = useState<DepartmentTreeNode | null>(null);
+  const selectedDept = (selectedId != null ? tree.getNode(selectedId) : null) ?? selectedSnapshot;
+  const selectedDeptId = selectedDept?.dept_id ?? null;
+
+  const [createOpen, setCreateOpen] = useState(false);
+  const [createParentId, setCreateParentId] = useState<number | null>(null);
+  const [mountTarget, setMountTarget] = useState<{ id: number; name: string } | null>(null);
+  const [membersRefreshSignal, setMembersRefreshSignal] = useState(0);
+  const [memberHighlightUserId, setMemberHighlightUserId] = useState<number | null>(null);
+  const rowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+
+  const [leftPaneWidth, setLeftPaneWidth] = useState(280);
+  const isResizingRef = useRef(false);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  const selectNode = useCallback((node: DepartmentTreeNode) => {
+    setSelectedId(node.id);
+    setSelectedSnapshot(node);
+  }, []);
+
+  useEffect(() => {
+    if (selectedId == null && tree.rootIds.length > 0) {
+      const first = tree.getNode(tree.rootIds[0]);
+      if (first) selectNode(first);
+    }
+  }, [tree.rootIds, selectedId, tree, selectNode]);
+
+  const handleCreateClick = useCallback((parentId?: number) => {
+    setCreateParentId(parentId ?? null);
+    setCreateOpen(true);
+  }, []);
+
+  const handleCreated = useCallback(() => {
+    setCreateOpen(false);
+    void tree.reloadLayer(createParentId).catch(showApiError);
+  }, [tree, createParentId]);
+
+  const handleMarkAsTenant = useCallback((deptId: number, deptName: string) => {
+    setMountTarget({ id: deptId, name: deptName });
+  }, []);
+
+  const handleMounted = useCallback(() => {
+    setMountTarget(null);
+    void tree.refreshAll().catch(showApiError);
+  }, [tree]);
+
+  const handleTreeChange = useCallback(
+    async (removedDeptId?: string) => {
+      // Await the refresh first so, when the removed dept was selected, the
+      // auto-select effect picks the FRESH first root — not the stale one.
+      await tree.refreshAll();
+      setMembersRefreshSignal((n) => n + 1);
+      if (removedDeptId && selectedDeptId === removedDeptId) {
+        setSelectedId(null);
+        setSelectedSnapshot(null);
+      }
+    },
+    [tree, selectedDeptId],
+  );
+
+  const handleLocateMemberFromGlobal = useCallback(
+    async ({ primaryDeptDeptId, userId }: { primaryDeptDeptId: string; userId: number }) => {
+      setMemberHighlightUserId(userId);
+      const detail = await getDepartmentApi(primaryDeptDeptId);
+      if (!detail) return;
+      await tree.reveal(detail.id);
+      const node = tree.getNode(detail.id);
+      if (node) selectNode(node);
+      window.setTimeout(() => {
+        rowRefs.current.get(primaryDeptDeptId)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      }, 80);
+    },
+    [tree, selectNode],
+  );
+
+  const handleMemberHighlightConsumed = useCallback(() => setMemberHighlightUserId(null), []);
+
+  const renderRowSuffix = useCallback(
+    (node: DepartmentTreeNode) => (
+      <>
+        {node.is_tenant_root && (
+          <span title={t("bs:tenant.mountedBadge")}>
+            <Tag size="small" color="brand" className="mr-1 shrink-0">
+              {t("bs:tenant.mountedTag")}
+            </Tag>
+          </span>
+        )}
+        {node.status !== "archived" && (
+          <Button variant="text" size="small" className="hidden h-5 w-5 shrink-0 items-center justify-center rounded hover:bg-gray-200 group-hover:flex" onClick={(e) => {
+              e.stopPropagation();
+              handleCreateClick(node.id);
+            }} title={t("bs:department.create")} color="default">
+            <Outlined.Plus className="h-3.5 w-3.5" />
+          </Button>
+        )}
+      </>
+    ),
+    [handleCreateClick, t],
+  );
+
+  useEffect(() => {
+    const handleMouseMove = (event: MouseEvent) => {
+      if (!isResizingRef.current) return;
+      const container = containerRef.current;
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+      const relativeX = event.clientX - rect.left;
+      const MIN_WIDTH = 240;
+      const MAX_WIDTH = Math.min(520, Math.max(MIN_WIDTH, rect.width - 320));
+      setLeftPaneWidth(Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, relativeX)));
+    };
+
+    const stopResizing = () => {
+      isResizingRef.current = false;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", stopResizing);
+
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", stopResizing);
+    };
+  }, []);
+
+  return (
+    <div ref={containerRef} className="flex h-[calc(100vh-140px-var(--license-banner-h,0px))]">
+      {/* Left tree panel */}
+      <div className="flex min-w-[240px] flex-col border-r pr-4 pt-2" style={{ width: leftPaneWidth }}>
+        <LazyDepartmentTree
+          controller={tree}
+          selectedDeptId={selectedDeptId}
+          onSelect={selectNode}
+          renderRowSuffix={renderRowSuffix}
+          rowRef={(deptId, el) => {
+            if (el) rowRefs.current.set(deptId, el);
+            else rowRefs.current.delete(deptId);
+          }}
+        />
+        <Button variant="text" size="small" className="mt-4 w-full rounded-md border border-dashed border-gray-300 py-2 text-sm text-gray-500 hover:border-primary hover:text-primary" onClick={() => handleCreateClick()} color="default">
+          + {t("bs:department.create")}
+        </Button>
+      </div>
+
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        className="w-1 cursor-col-resize bg-transparent hover:bg-border"
+        onMouseDown={() => {
+          isResizingRef.current = true;
+          document.body.style.cursor = "col-resize";
+          document.body.style.userSelect = "none";
+        }}
+      />
+
+      {/* Right panel */}
+      <div className="min-w-0 flex-1 overflow-auto pl-4 pt-2">
+        {selectedDept ? (
+          <div className="w-full">
+            <h3 className="mb-3 text-base font-semibold">{departmentDisplayName(selectedDept, t("bs:department.defaultOrganization"))}</h3>
+            <Tabs
+              defaultActiveKey="members"
+              className="w-full [&>div:first-child]:shrink-0 [&>[role=tabpanel][data-state=active]]:flex [&>[role=tabpanel]]:min-h-0 [&>[role=tabpanel]]:flex-1 [&>[role=tabpanel]]:flex-col [&>[role=tabpanel]]:overflow-hidden [&>[role=tabpanel]>div]:mt-2"
+              items={[
+                {
+                  key: "members",
+                  label: <> {t("bs:department.members")} </>,
+                  children: (
+                    <>
+                      {" "}
+                      <div>
+                        <MemberTable
+                          deptId={selectedDept.dept_id}
+                          deptName={selectedDept.name}
+                          dept={selectedDept}
+                          isArchived={selectedDept.status === "archived"}
+                          onChanged={handleUiRequest(handleTreeChange)}
+                          membersRefreshSignal={membersRefreshSignal}
+                          highlightUserId={memberHighlightUserId}
+                          onHighlightConsumed={handleMemberHighlightConsumed}
+                          onRequestLocateMember={handleUiRequest(handleLocateMemberFromGlobal)}
+                        />
+                      </div>
+                    </>
+                  ),
+                },
+                {
+                  key: "settings",
+                  label: <> {t("bs:department.settings")} </>,
+                  children: (
+                    <>
+                      {" "}
+                      <div>
+                        <DepartmentSettings
+                          dept={selectedDept}
+                          onChanged={handleUiRequest(handleTreeChange)}
+                          onMarkAsTenant={multiTenantEnabled && user?.is_global_super ? handleMarkAsTenant : undefined}
+                        />
+                      </div>
+                    </>
+                  ),
+                },
+                ...(showTrafficControlTab
+                  ? [
+                      {
+                        key: "traffic-control",
+                        label: <> {t("bs:department.trafficControl")} </>,
+                        children: (
+                          <>
+                            {" "}
+                            <div>
+                              <DepartmentTrafficControl dept={selectedDept} />
+                            </div>
+                          </>
+                        ),
+                      },
+                    ]
+                  : []),
+              ]}
+            />
+          </div>
+        ) : (
+          <div className="flex h-full items-center justify-center text-muted-foreground">
+            {t("bs:department.selectDept")}
+          </div>
+        )}
+      </div>
+
+      {createOpen && (
+        <CreateDepartmentDialog
+          defaultParentId={createParentId}
+          onCreated={handleCreated}
+          onClose={() => setCreateOpen(false)}
+        />
+      )}
+
+      {mountTarget && (
+        <MountTenantDialog
+          deptId={mountTarget.id}
+          deptName={mountTarget.name}
+          onMounted={handleMounted}
+          onClose={() => setMountTarget(null)}
+        />
+      )}
+    </div>
+  );
+}

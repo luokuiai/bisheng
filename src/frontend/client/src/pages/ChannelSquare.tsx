@@ -1,0 +1,482 @@
+import { useQueryClient } from "@tanstack/react-query";
+import { refreshChannelState, useChannelStateRefresh } from "./Subscription/hooks/useChannelStateRefresh";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type UIEvent } from "react";
+import { EmptyStateIllustration } from "~/components/illustrations";
+import { Outlined } from "bisheng-icons";
+import { SearchInput } from "@bisheng/ui";
+import { ChannelSquareCard } from "./ChannelSquareCard";
+import { useToastContext } from "~/Providers";
+import { NotificationSeverity } from "~/common";
+import { getChannelSquareApi, subscribeManagerChannelApi } from "~/api/channels";
+import { LoadingIcon } from "~/components/ui/icon/Loading";
+import { useLocalize, useMediaQuery } from "~/hooks";
+import { cn } from "~/utils";
+
+type SquareStatus = "join" | "joined" | "pending" | "private";
+
+interface SquareChannel {
+  id: string;
+  title: string;
+  description: string;
+  creator: string;
+  creatorAvatars?: string[]; // 最多 3 个信息源头像
+  articleCount: number;
+  subscriberCount: number;
+  status: SquareStatus;
+  visibility?: "public" | "private" | "review";
+  isHighlighted?: boolean;
+}
+
+const CHANNEL_PAGE_SIZE = 20;
+
+function mergeChannelsById(existing: SquareChannel[], incoming: SquareChannel[]) {
+  const seenIds = new Set(existing.map((channel) => channel.id));
+  return [
+    ...existing,
+    ...incoming.filter((channel) => {
+      if (seenIds.has(channel.id)) return false;
+      seenIds.add(channel.id);
+      return true;
+    }),
+  ];
+}
+
+interface ChannelSquareProps {
+  onBack?: () => void;
+  title?: string;
+  subtitle?: string;
+  searchPlaceholder?: string;
+  emptyText?: string;
+  joinToastPrefix?: string;
+  onPreviewChannel?: (id: string) => void;
+  /** Override the list-fetch API (default: getChannelSquareApi) */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  fetchApi?: (params: { keyword?: string; page: number; page_size: number }) => Promise<any>;
+  /** Override the subscribe API (default: subscribeManagerChannelApi) */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  subscribeApi?: (id: string) => Promise<any>;
+  /** Bump to force a full reload of the square list (e.g. after subscribe in preview drawer). */
+  refreshKey?: number;
+  /** H5: render the top bar (hamburger). The 频道/广场 toggle is a persistent
+   *  single instance rendered above both views (Subscription/index), not here. */
+  isH5?: boolean;
+  /** H5: open the mobile system menu (hamburger). */
+  onOpenMobileNav?: () => void;
+}
+
+function ChannelSquare({
+  title,
+  subtitle,
+  searchPlaceholder,
+  emptyText,
+  joinToastPrefix,
+  onPreviewChannel,
+  fetchApi,
+  subscribeApi,
+  refreshKey = 0,
+  isH5 = false,
+  onOpenMobileNav,
+}: ChannelSquareProps) {
+  const queryClient = useQueryClient();
+  const loadedPageRef = useRef(1);
+  const refreshInFlightRef = useRef(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [page, setPage] = useState(1);
+  const [hasMorePage, setHasMorePage] = useState(true);
+  const [allChannels, setAllChannels] = useState<SquareChannel[]>([]);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [initialError, setInitialError] = useState(false);
+  const [loadMoreError, setLoadMoreError] = useState(false);
+  const allChannelsRef = useRef<SquareChannel[]>([]);
+  const requestSeqRef = useRef(0);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const loadMoreRef = useRef<HTMLDivElement | null>(null);
+  const loadMoreLockRef = useRef(false);
+  const { showToast } = useToastContext();
+  const localize = useLocalize();
+  const [joiningId, setJoiningId] = useState<string | null>(null);
+
+  // 卡片每行列数自适应，与应用广场保持一致：lg+ 3 列，md 2 列，窄屏 1 列
+  const isAtLeast768 = useMediaQuery("(min-width: 768px)");
+  const isAtLeast1024 = useMediaQuery("(min-width: 1024px)");
+  const squareCols = useMemo(() => {
+    if (isAtLeast1024) return 3;
+    if (isAtLeast768) return 2;
+    return 1;
+  }, [isAtLeast768, isAtLeast1024]);
+
+  const tTitle = title || localize("com_subscription.explore_channel_plaza");
+  const tSubtitle = subtitle || localize("com_subscription.explore_more_channel");
+  const tSearchPlaceholder = searchPlaceholder || localize("com_subscription.enter_channel_search");
+  const tEmptyText = emptyText || localize("com_list_no_results");
+  const tJoinPrefix = joinToastPrefix || localize("applied_join_channel");
+  const noDescriptionText = localize("com_knowledge.no_description");
+
+  const updateAllChannels = useCallback((updater: (prev: SquareChannel[]) => SquareChannel[]) => {
+    setAllChannels((prev) => {
+      const next = updater(prev);
+      allChannelsRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const handleJoinChannel = (channelId: string) => {
+    const target = allChannels.find((c) => c.id === channelId);
+    if (!target || target.status !== "join" || joiningId) return;
+
+    (async () => {
+      try {
+        setJoiningId(channelId);
+        const res: any = subscribeApi
+          ? await subscribeApi(channelId)
+          : await subscribeManagerChannelApi({ channel_id: channelId });
+        const root = res;
+        const statusCode = root?.status_code ?? root?.code;
+        if (statusCode && statusCode !== 200) {
+          const msg =
+            root?.status_message ||
+            root?.message ||
+            localize("channel_subscribe_failed") ||
+            localize("com_knowledge.operation_failed_retry");
+          throw new Error(msg);
+        }
+        if ((res?.data ?? res) === "subscribed") {
+          showToast({
+            message: localize("subscribe_success"),
+            severity: NotificationSeverity.SUCCESS
+          });
+        } else {
+          showToast({
+            message: localize("com_subscription.apply_sent"),
+            severity: NotificationSeverity.SUCCESS
+          });
+        }
+        // 与服务端对齐订阅态（含需审核频道的 pending），避免仅乐观更新与接口不一致
+        await refreshChannelState(queryClient);
+        await load(1, true);
+      } catch {
+        updateAllChannels((prev) =>
+          prev.map((c) => (c.id === channelId ? { ...c, status: target.status } : c))
+        );
+      } finally {
+        setJoiningId(null);
+      }
+    })();
+  };
+
+  const handleSearch = (e) => {
+    const next = e.target.value ?? "";
+    if (next.length > 40) {
+      showToast({
+        message: localize("com_subscription.maximum_character"),
+        severity: NotificationSeverity.WARNING
+      });
+      setSearchQuery(next.slice(0, 40));
+      return;
+    }
+    setSearchQuery(next);
+  };
+
+  const load = useCallback(
+    async (nextPage: number, silent = false) => {
+      const isFirstPage = nextPage === 1;
+      const requestId = ++requestSeqRef.current;
+
+      if (isFirstPage && !silent) {
+        loadedPageRef.current = 1;
+        setInitialLoading(true);
+        setLoadingMore(false);
+        setInitialError(false);
+        setLoadMoreError(false);
+        loadMoreLockRef.current = false;
+        allChannelsRef.current = [];
+        setAllChannels([]);
+      } else {
+        setLoadMoreError(false);
+      }
+
+      try {
+        const fetchPage = (pageNumber: number) => (fetchApi ?? getChannelSquareApi)({
+          keyword: searchQuery.trim() || undefined,
+          page: pageNumber,
+          page_size: CHANNEL_PAGE_SIZE,
+        });
+        const pagesToRefresh = silent ? loadedPageRef.current : 1;
+        const responses = await Promise.all(
+          Array.from({ length: pagesToRefresh }, (_, index) => fetchPage(silent ? index + 1 : nextPage)),
+        );
+        const first = responses[0];
+        const firstPayload = first.data ?? first;
+        const res = silent ? {
+          data: {
+            ...firstPayload,
+            data: responses.flatMap((response) => {
+              const payload = response.data ?? response;
+              return payload.data ?? payload.list ?? [];
+            }),
+          },
+        } : first;
+        if (requestId !== requestSeqRef.current) return;
+
+        const root: any = res;
+        const payload = root.data ?? root;
+        const list = (payload?.data || payload?.list || []) as any[];
+        const mapped: SquareChannel[] = list
+          .map((item: any) => {
+            const rawId = item.id ?? item.channel_id;
+            if (!rawId) return null;
+            const sourceInfos: any[] = Array.isArray(item.source_infos) ? item.source_infos : [];
+            const avatars = sourceInfos
+              .map((s) => s.source_icon)
+              .filter(Boolean)
+              .slice(0, 3);
+
+            return {
+              id: String(rawId),
+              title: String(item.name ?? item.title ?? ""),
+              description: String(item.description ?? item.desc ?? "") || noDescriptionText,
+              creator: String(item.creator ?? item.creator_name ?? ""),
+              creatorAvatars: avatars,
+              articleCount: Number(item.article_count ?? item.articleCount ?? 0),
+              subscriberCount: Number(item.subscriber_count ?? item.subscriberCount ?? 0),
+              visibility: item.visibility as "public" | "private" | "review" | undefined,
+              status: (() => {
+                const subStatus = String(item.subscription_status ?? "");
+                // 后端约定：not_subscribed=订阅，subscribed=已订阅，pending=申请中。
+                // rejected 不是独立状态：驳回后可再次申请，按「订阅」处理。
+                if (subStatus === "subscribed") return "joined";
+                if (subStatus === "pending") return "pending";
+                if (subStatus === "rejected" || subStatus === "not_subscribed") return "join";
+                return (item.status as SquareStatus) || "join";
+              })(),
+              isHighlighted: Boolean(item.isHighlighted ?? item.highlight)
+            } as SquareChannel;
+          })
+          .filter((c): c is SquareChannel => c !== null);
+
+        const rawTotal = payload?.total ?? root?.total;
+        const total = Number(rawTotal);
+        const hasExplicitTotal = rawTotal !== undefined && rawTotal !== null && Number.isFinite(total);
+        const previous = isFirstPage ? [] : allChannelsRef.current;
+        const nextChannels = isFirstPage ? mapped : mergeChannelsById(previous, mapped);
+        const uniqueAddedCount = nextChannels.length - previous.length;
+
+        if (hasExplicitTotal && nextChannels.length < total && (mapped.length === 0 || (!isFirstPage && uniqueAddedCount === 0))) {
+          if (isFirstPage) {
+            allChannelsRef.current = [];
+            setAllChannels([]);
+            setInitialError(true);
+          } else {
+            setLoadMoreError(true);
+          }
+          setHasMorePage(false);
+          return;
+        }
+
+        setInitialError(false);
+        setLoadMoreError(false);
+        allChannelsRef.current = nextChannels;
+        setAllChannels(nextChannels);
+        setHasMorePage(hasExplicitTotal ? nextChannels.length < total : mapped.length >= CHANNEL_PAGE_SIZE);
+        loadedPageRef.current = silent ? pagesToRefresh : nextPage;
+        setPage(loadedPageRef.current);
+      } catch {
+        if (requestId !== requestSeqRef.current || silent) return;
+        if (isFirstPage) {
+          allChannelsRef.current = [];
+          setAllChannels([]);
+          setInitialError(true);
+        } else {
+          setLoadMoreError(true);
+        }
+        setHasMorePage(false);
+      } finally {
+        if (requestId === requestSeqRef.current && isFirstPage) setInitialLoading(false);
+      }
+    },
+    [fetchApi, noDescriptionText, searchQuery]
+  );
+
+  // 根据搜索词 / 外部刷新信号加载频道广场数据
+  useEffect(() => {
+    load(1);
+  }, [searchQuery, load, refreshKey]);
+
+  useChannelStateRefresh(() => {
+    if (initialLoading || loadingMore || joiningId || refreshInFlightRef.current) return;
+    refreshInFlightRef.current = true;
+    void load(1, true).finally(() => { refreshInFlightRef.current = false; });
+  });
+
+  const visibleChannels = allChannels;
+
+  const handleLoadMore = useCallback(() => {
+    if (loadMoreLockRef.current || initialLoading || loadingMore || loadMoreError || !hasMorePage) return;
+    loadMoreLockRef.current = true;
+    setLoadingMore(true);
+    load(page + 1).finally(() => {
+      setLoadingMore(false);
+      loadMoreLockRef.current = false;
+    });
+  }, [hasMorePage, initialLoading, load, loadMoreError, loadingMore, page]);
+
+  const handleListScroll = useCallback(
+    (e: UIEvent<HTMLDivElement>) => {
+      const node = e.currentTarget;
+      const threshold = 60;
+      if (node.scrollTop + node.clientHeight >= node.scrollHeight - threshold) {
+        handleLoadMore();
+      }
+    },
+    [handleLoadMore]
+  );
+
+  useEffect(() => {
+    const root = scrollRef.current;
+    const target = loadMoreRef.current;
+    if (!root || !target) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) handleLoadMore();
+      },
+      { root, rootMargin: "60px 0px", threshold: 0 }
+    );
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [handleLoadMore, visibleChannels.length]);
+
+  return (
+    <div className="h-full w-full flex flex-col bg-white overflow-hidden">
+      {/* H5 顶部栏：侧栏按钮。频道/广场 切换器为跨视图常驻单实例（见 Subscription/index）。
+          底色与下方头部带一致（brand 5%）并跟随主题，让顶栏与广场头部连成一片（仅移动端·广场）。 */}
+      {isH5 ? (
+        <div className="shrink-0 bg-blue-500/[0.05] pt-[calc(env(safe-area-inset-top,0px)+8px)]">
+          <div className="relative flex h-11 items-center px-4">
+            {onOpenMobileNav ? (
+              <button
+                type="button"
+                aria-label={localize("com_nav_open_sidebar")}
+                onClick={onOpenMobileNav}
+                className="inline-flex size-5 shrink-0 items-center justify-center text-text-1"
+              >
+                <Outlined.SidebarMenu className="size-5" />
+              </button>
+            ) : (
+              <div className="size-5 shrink-0" aria-hidden />
+            )}
+            {/* 频道/广场 切换器为跨视图常驻单实例（见 Subscription/index），
+                屏幕居中悬浮在此行之上，这里不再各自渲染。 */}
+          </div>
+        </div>
+      ) : null}
+      {/* 头部区域 */}
+      <div
+        className="w-full relative overflow-hidden border-b border-[#F0F1F5] bg-blue-500/[0.05]"
+      >
+        {/* Decorative scattered icons — kept from the original banner art, recolored
+            via a brand-tinted mask layer so they follow the blue ⇄ green theme. */}
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0 bg-blue-200"
+          style={{
+            WebkitMaskImage: `url(${__APP_ENV__.BASE_URL}/assets/channel/bgchannel-icons.svg)`,
+            maskImage: `url(${__APP_ENV__.BASE_URL}/assets/channel/bgchannel-icons.svg)`,
+            WebkitMaskSize: "cover",
+            maskSize: "cover",
+            WebkitMaskPosition: "center",
+            maskPosition: "center",
+            WebkitMaskRepeat: "no-repeat",
+            maskRepeat: "no-repeat",
+          }}
+        />
+
+        {/* 主要内容 */}
+        <div className="relative mx-auto flex w-full max-w-[1140px] flex-col items-center justify-center px-4 pb-6 pt-7">
+
+          <h1 className="mb-1 text-[26px] font-semibold text-blue-500">
+            {tTitle}
+          </h1>
+          <p className="text-[13px] text-text-3">
+            {tSubtitle}
+          </p>
+        </div>
+      </div>
+
+      {/* 频道列表区域 */}
+      <div
+        ref={scrollRef}
+        className="flex-1 flex flex-col overflow-y-auto scrollbar-os bg-white"
+        onScroll={handleListScroll}
+      >
+        <div className={cn("mx-auto mb-6 mt-6 w-full max-w-[480px]", isH5 && "px-4")}>
+          {/* Spec search field (@bisheng/ui): magnifier prefix, Enter is a no-op
+              here because the filter is realtime via onChange. */}
+          <SearchInput
+            placeholder={tSearchPlaceholder}
+            value={searchQuery}
+            onChange={handleSearch}
+            clearLabel={localize("com_ui_clear")}
+          />
+        </div>
+        <div className="flex-1 flex flex-col w-full max-w-[1032px] mx-auto px-4 pb-4 pt-0">
+
+          {initialLoading ? (
+            <div className="flex-1 flex flex-col items-center justify-center gap-3 text-text-3">
+              <LoadingIcon className="size-20 text-primary" />
+              <span className="text-sm">{localize("com_list_loading")}</span>
+            </div>
+          ) : initialError ? (
+            <div className="flex-1 flex flex-col items-center justify-center text-text-3">
+              <p className="text-[14px] font-normal text-text-3">{localize("com_list_load_failed")}</p>
+            </div>
+          ) : visibleChannels.length === 0 ? (
+            <div className="flex-1 flex flex-col items-center justify-center text-text-3">
+              <EmptyStateIllustration className="size-[120px] mb-4" />
+              <p className="text-[14px] font-normal text-text-3">{tEmptyText}</p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <div
+                className="grid gap-3"
+                style={{ gridTemplateColumns: `repeat(${squareCols}, minmax(0, 1fr))` }}
+              >
+                {visibleChannels.map((channel) => (
+                    <ChannelSquareCard
+                      key={channel.id}
+                      title={channel.title}
+                      description={channel.description}
+                      creator={channel.creator}
+                      creatorAvatars={channel.creatorAvatars}
+                      articleCount={channel.articleCount}
+                      subscriberCount={channel.subscriberCount}
+                      status={channel.status}
+                      visibility={channel.visibility}
+                      isHighlighted={channel.isHighlighted}
+                      onPreview={() => onPreviewChannel?.(channel.id)}
+                      onAction={() => handleJoinChannel(channel.id)}
+                    />
+                ))}
+              </div>
+              <div ref={loadMoreRef} className="h-10 flex items-center justify-center text-[12px] text-text-4">
+                {loadingMore
+                  ? localize("com_list_loading_more")
+                  : loadMoreError
+                    ? localize("com_list_load_failed")
+                    : !hasMorePage
+                      ? localize("com_list_all_loaded")
+                      : ""}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// memo: skip re-render when parent (Subscription) re-renders due to navigate/
+// location changes. Combined with useCallback'd onPreviewChannel/onBack in the
+// parent, this stops the card list from repainting (flashing) on card click.
+export default memo(ChannelSquare);

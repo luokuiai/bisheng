@@ -1,0 +1,354 @@
+// @ts-strict-ignore
+import { Outlined } from "bisheng-icons";
+import type { FocusEvent, KeyboardEvent, MouseEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
+import { useRecoilValue } from "recoil";
+import { NotificationSeverity } from "~/common";
+import {
+  useGetEndpointsQuery,
+  useUpdateConversationMutation,
+} from "~/hooks/queries/data-provider";
+import type { TConversation } from "~/types/chat";
+import { Constants } from "~/types/chat";
+import { useLocalize, usePrefersMobileLayout, useNavigateToConvo } from "~/hooks";
+import { useToastContext } from "~/Providers";
+import store from "~/store";
+import { conversationTaskRunningState } from "~/store/linsight";
+import { cn } from "~/utils";
+import { ConvoOptions } from "./ConvoOptions";
+import { useTitleReveal } from "./useTitleReveal";
+
+type KeyEvent = KeyboardEvent<HTMLInputElement>;
+
+interface ConversationProps {
+  conversation: TConversation;
+  retainView: () => void;
+  toggleNav: () => void;
+  isLatestConvo: boolean;
+  /** Workbench sidebar rows: 8px side padding and a 22px line (Figma 13139:111616). */
+  compact?: boolean;
+  className?: string;
+}
+
+export default function Conversation({
+  conversation,
+  retainView,
+  toggleNav,
+  isLatestConvo,
+  compact = false,
+  className,
+}: ConversationProps) {
+  const params = useParams();
+
+  const currentConvoId = useMemo(
+    () => params.conversationId,
+    [params.conversationId]
+  );
+  const updateConvoMutation = useUpdateConversationMutation(
+    currentConvoId ?? ""
+  );
+  const activeConvos = useRecoilValue(store.allConversationsSelector);
+  const { data: endpointsConfig } = useGetEndpointsQuery();
+  const { navigateWithLastTools } = useNavigateToConvo();
+  const { showToast } = useToastContext();
+  const { conversationId, title } = conversation;
+  const updatedAt = new Date(conversation.updatedAt ?? '');
+  const hasDate = Number.isFinite(updatedAt.getTime());
+  // Task-mode execution indicator: true while this conversation's linsight
+  // session is still running, driving the sidebar spinner.
+  const isTaskRunning = useRecoilValue(
+    conversationTaskRunningState(conversationId ?? "")
+  );
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const renameActionsRef = useRef<HTMLDivElement | null>(null);
+  const [titleInput, setTitleInput] = useState(title);
+  const [renaming, setRenaming] = useState(false);
+  const [isPopoverActive, setIsPopoverActive] = useState(false);
+  // Keep the anchor measurable until the floating panel finishes fading out.
+  const [isPopoverPresent, setIsPopoverPresent] = useState(false);
+  const handlePopoverOpenChange = (open: boolean) => {
+    setIsPopoverActive(open);
+    if (open) setIsPopoverPresent(true);
+  };
+  const isSmallScreen = usePrefersMobileLayout();
+  const localize = useLocalize();
+  const navigate = useNavigate();
+
+  const clickHandler = async (event: MouseEvent<HTMLAnchorElement>) => {
+    if (event.button === 0 && (event.ctrlKey || event.metaKey)) {
+      toggleNav();
+      return;
+    }
+
+    event.preventDefault();
+
+    if (currentConvoId === conversationId || isPopoverActive) {
+      return;
+    }
+
+    toggleNav();
+
+    // set document title
+    if (typeof title === "string" && title.length > 0) {
+      // document.title = title;
+    }
+
+    /* Note: Latest Message should not be reset if existing convo */
+    navigateWithLastTools(
+      conversation,
+      !(conversationId ?? "") || conversationId === Constants.NEW_CONVO
+    );
+  };
+
+  const renameHandler = useCallback(() => {
+    setIsPopoverActive(false);
+    setTitleInput(title);
+    setRenaming(true);
+  }, [title]);
+
+  useEffect(() => {
+    if (renaming && inputRef.current) {
+      // Select the whole title so typing replaces it directly.
+      inputRef.current.select();
+    }
+  }, [renaming]);
+
+  const onRename = useCallback(
+    (
+      e: MouseEvent<HTMLButtonElement> | FocusEvent<HTMLInputElement> | KeyEvent
+    ) => {
+      e.preventDefault();
+      setRenaming(false);
+      // An empty (or whitespace-only) name silently restores the previous one.
+      if (!titleInput?.trim()) {
+        setTitleInput(title);
+        return;
+      }
+      if (titleInput === title) {
+        return;
+      }
+      if (typeof conversationId !== "string" || conversationId === "") {
+        return;
+      }
+
+      updateConvoMutation.mutate(
+        {
+          conversationId,
+          title: titleInput ?? "",
+          flowId: conversation.flowId,
+          flowType: conversation.flowType,
+        },
+        {
+          onError: () => {
+            setTitleInput(title);
+            showToast({
+              message: "Failed to rename conversation",
+              severity: NotificationSeverity.WARNING,
+              showIcon: true,
+            });
+          },
+        }
+      );
+    },
+    [
+      title,
+      titleInput,
+      conversationId,
+      showToast,
+      conversation,
+      updateConvoMutation,
+    ]
+  );
+
+  const handleKeyDown = useCallback(
+    (e: KeyEvent) => {
+      if (e.key === "Escape") {
+        setTitleInput(title);
+        setRenaming(false);
+      } else if (e.key === "Enter") {
+        onRename(e);
+      }
+    },
+    [title, onRename]
+  );
+
+  const handleRenameBlur = useCallback(
+    (e: FocusEvent<HTMLInputElement>) => {
+      const nextFocused = e.relatedTarget as Node | null;
+      if (nextFocused && renameActionsRef.current?.contains(nextFocused)) {
+        return;
+      }
+      onRename(e);
+    },
+    [onRename]
+  );
+
+  const isActiveConvo: boolean = useMemo(
+    () =>
+      currentConvoId === conversationId ||
+      (isLatestConvo &&
+        currentConvoId === "new" &&
+        activeConvos[0] != null &&
+        activeConvos[0] !== "new"),
+    [currentConvoId, conversationId, isLatestConvo, activeConvos]
+  );
+
+  const titleReveal = useTitleReveal(title ?? "");
+  return (
+    <div
+      data-active={isActiveConvo}
+      onPointerEnter={titleReveal.reveal} onPointerLeave={titleReveal.reset}
+      onFocus={titleReveal.reveal} onBlur={titleReveal.reset}
+      className={cn(
+        "dsh-history-row group relative w-full content-stretch flex gap-[8px] items-center mb-1 rounded-lg shrink-0 transition-colors",
+        // Mobile rows: 8px left / 6px right, 8px vertical (desktop nav uses 12px/6px).
+        isSmallScreen
+          ? "pl-[8px] pr-[6px] py-[8px]"
+          : compact
+            ? "px-[8px] py-[5px]"
+            : "px-[12px] py-[6px]",
+        isActiveConvo ? "bg-fill-2" : "hover:bg-fill-1",
+        // Pin the hover fill while the row owns a transient UI — an open
+        // options menu or the rename input — since the pointer leaves the row
+        // (into the menu) long before the interaction is over. Never promoted
+        // to the active row's fill: this row is not the open conversation.
+        !isActiveConvo && (renaming || isPopoverPresent) && "bg-fill-1",
+        // Renaming chrome matches the chat input surface (AiChatInput): 1px
+        // #ECECEC hairline + soft drop shadow, both as shadows so the row
+        // keeps its borderless box size.
+        renaming && "shadow-[0_0_0_1px_#ECECEC,0_0_8px_rgba(3,7,117,0.05)]",
+        className,
+      )}
+    >
+      {renaming ? (
+        <div className="flex h-5 grow cursor-pointer items-center gap-[8px] overflow-hidden whitespace-nowrap break-all">
+          <input
+            ref={inputRef}
+            type="text"
+            className="w-full bg-transparent text-[14px] leading-[20px] focus-visible:outline-none text-text-1"
+            value={titleInput ?? ""}
+            onChange={(e) => setTitleInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            onBlur={handleRenameBlur}
+            aria-label={`${localize("com_ui_rename")} ${localize(
+              "com_ui_chat"
+            )}`}
+          />
+          <div ref={renameActionsRef} className="flex gap-1">
+            <button
+              onClick={onRename}
+              className="flex h-4 w-4 items-center justify-center"
+              aria-label={`${localize("com_ui_submit")} ${localize(
+                "com_ui_rename"
+              )}`}
+            >
+              <Outlined.Check
+                aria-hidden={true}
+                size={12}
+                className="transition-colors duration-200 ease-in-out hover:opacity-70"
+              />
+            </button>
+          </div>
+        </div>
+      ) : (
+        <a
+          // Toggle conversation
+          href={`${__APP_ENV__.BASE_URL}/c/${conversationId}`}
+          aria-current={isActiveConvo ? "page" : undefined}
+          data-testid="convo-item"
+          onClick={clickHandler}
+          className={cn(
+            "flex grow cursor-pointer items-center gap-[8px] overflow-hidden whitespace-nowrap break-all"
+          )}
+          title={title ?? ""}
+        >
+          {/* <EndpointIcon
+            conversation={conversation}
+            endpointsConfig={endpointsConfig}
+            size={20}
+            context="menu-item"
+          /> */}
+          <div
+            className="relative flex items-center gap-[8px] flex-1 grow overflow-hidden"
+            onDoubleClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setTitleInput(title);
+              setRenaming(true);
+            }}
+            alt={conversation?.flowType}
+          >
+            {/* F035: conversation list no longer distinguishes daily vs task
+                mode — the leading icon is removed for both (unified list). */}
+            <span
+              ref={titleReveal.ref}
+              className={cn(
+                "dsh-history-label text-text-1 text-[14px] font-normal truncate",
+                compact && !isSmallScreen ? "leading-[22px]" : "leading-[20px]",
+              )}
+            >
+              {title}
+            </span>
+          </div>
+        </a>
+      )}
+      {!renaming && hasDate && (
+        <time className="dsh-history-time" dateTime={updatedAt.toISOString()}>
+          {updatedAt.toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })}
+        </time>
+      )}
+      {/* While renaming, drop the options slot entirely — an empty flex item
+          would still cost the row an extra 8px gap before the right padding. */}
+      {!renaming && (
+      <div
+        className={cn(
+          "dsh-history-options",
+          isSmallScreen
+            ? "flex w-[48px] justify-end items-center shrink-0"
+            : // While running, keep the slot visible so the spinner shows without
+              // hover; otherwise reveal the options menu on hover or keyboard focus.
+              isPopoverPresent || isTaskRunning
+              ? "flex items-center"
+              : "hidden items-center group-has-[:focus-visible]:flex group-hover:flex",
+          "coarse-pointer:flex",
+        )}
+      >
+        {isTaskRunning && (
+          // Task-mode running indicator: a body-colored spinner that yields the
+          // slot to the options menu on hover (or when its popover is open).
+          <Outlined.Loading
+            size={16}
+            className={cn(
+              "shrink-0 animate-spin",
+              isPopoverPresent
+                ? "hidden"
+                : "group-hover:hidden group-has-[:focus-visible]:hidden",
+            )}
+            style={{ color: "#1A1A1A" }}
+          />
+        )}
+        <div
+          className={cn(
+            // When running, the menu is hover-only so it swaps in for the
+            // spinner; otherwise it always fills this (already hover-gated) slot.
+            isTaskRunning && !isPopoverPresent
+              ? "hidden group-has-[:focus-visible]:flex group-hover:flex"
+              : "flex",
+          )}
+        >
+          <ConvoOptions
+            title={title}
+            retainView={retainView}
+            renameHandler={renameHandler}
+            conversationId={conversationId}
+            isPopoverActive={isPopoverActive}
+            setIsPopoverActive={handlePopoverOpenChange}
+            onMenuExit={() => setIsPopoverPresent(false)}
+          />
+        </div>
+      </div>
+      )}
+    </div>
+  );
+}

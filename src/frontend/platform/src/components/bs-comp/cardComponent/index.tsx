@@ -1,0 +1,295 @@
+// @ts-strict-ignore
+import { cname } from "@/components/bs-ui/utils";
+import { showApiError } from "@/controllers/request";
+import { AppNumType,AppType } from "@/types/app";
+import { Outlined } from "bisheng-icons";
+import { Shield } from "lucide-react";
+import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
+
+
+
+
+
+import { Dropdown, DropdownItem, DropdownSeparator, Switch, Tooltip, TooltipProvider } from "@bisheng/ui";
+import { Card,CardContent,CardDescription,CardFooter,CardHeader,CardTitle } from "../../bs-ui/card";
+
+interface IProps<T> {
+  data: T,
+  /** id为''时，表示新建 */
+  id?: number | string,
+  logo?: React.ReactNode,
+  type: AppType | AppNumType;// 技能列表｜侧边弹窗列表
+  title: string,
+  edit?: boolean,
+  description: React.ReactNode | string,
+  checked?: boolean,
+  user?: string,
+  currentUser?: any,
+  labelPannel?: React.ReactNode,
+  isAdmin?: boolean,
+  canAddTemplate?: boolean,
+  headSelecter?: React.ReactNode,
+  footer?: React.ReactNode,
+  onClick?: () => void,
+  onSwitchClick?: () => void,
+  onAddTemp?: (data: T) => void,
+  onCheckedChange?: (b: boolean, data: T) => Promise<any>
+  onDelete?: (data: T) => void,
+  onSetting?: (data: T) => void,
+  onPermission?: (data: T) => void,
+  permissionBadge?: React.ReactNode,
+  showSwitch?: boolean,
+  /** 与「编辑应用」解耦：由发布/下线权限控制开关是否可操作 */
+  canSwitch?: boolean,
+  /** 与「编辑应用」解耦：由角色「创建应用」(create_app) 等控制，见构建页 apps */
+  showCopy?: boolean,
+  onCopy?: (data: T) => void,
+  /**
+   * When set and the card is switched on, the delete entry is rendered
+   * **disabled with this hint** instead of being hidden. Default (undefined)
+   * keeps the historical behaviour — the item simply is not rendered — so
+   * workflow and assistant cards are untouched. F054 AC-42 needs the greyed
+   * form ("stop it first"), and "not there" would fail that acceptance.
+   */
+  deleteDisabledHint?: string,
+}
+
+export const gradients = [
+  'bg-amber-500',
+  'bg-orange-600',
+  'bg-teal-500',
+  'bg-purple-600',
+  'bg-blue-700'
+]
+
+// 'bg-slate-600',
+// 'bg-amber-500',
+// 'bg-red-600',
+// 'bg-orange-600',
+// 'bg-teal-500',
+// 'bg-purple-600',
+// 'bg-blue-700',
+// 'bg-yellow-600',
+// 'bg-emerald-600',
+// 'bg-green-700',
+// 'bg-cyan-600',
+// 'bg-sky-600',
+// 'bg-indigo-600',
+// 'bg-violet-600',
+// 'bg-purple-600',
+// 'bg-fuchsia-700',
+// 'bg-pink-600',
+// 'bg-rose-600'
+export function TitleIconBg({ id, className = '', children = <Outlined.Skill /> }) {
+  return <div className={cname(`rounded-md flex justify-center items-center ${gradients[parseInt(id + '', 16) % gradients.length]}`, className)}>{children}</div>
+}
+
+export default function CardComponent<T>({
+  id = '',
+  logo = '',
+  data,
+  type,
+  edit = false,
+  user,
+  labelPannel = null,
+  title,
+  checked,
+  isAdmin,
+  canAddTemplate = Boolean(edit && isAdmin && type !== AppType.ASSISTANT),
+  description,
+  footer = null,
+  headSelecter = null,
+  onClick,
+  onSwitchClick,
+  onDelete,
+  onAddTemp,
+  onCheckedChange,
+  onSetting,
+  onPermission,
+  permissionBadge = null,
+  showSwitch = true,
+  canSwitch = edit,
+  showCopy = false,
+  onCopy,
+  deleteDisabledHint,
+}: IProps<T>) {
+
+  const [_checked, setChecked] = useState(checked)
+  const [switching, setSwitching] = useState(false)
+  const [menuOpen, setMenuOpen] = useState(false)
+
+  const { t, i18n } = useTranslation()
+
+  // The row can also change from outside this card — the list reloads after a
+  // state action, another tab acts on the same app. Without this, the copy
+  // taken at mount keeps showing the pre-action state until a page refresh.
+  useEffect(() => { setChecked(checked) }, [checked])
+
+  const handleCheckedChange = async (bln) => {
+    if (!canSwitch || !onCheckedChange || switching) return false
+    // Hold the switch for the whole round trip. Taking a hosted application
+    // offline waits on `docker stop` (a 10s SIGTERM grace), long enough that
+    // the silence reads as "nothing happened" and gets clicked again — and the
+    // second call loses the state race and comes back as a conflict, leaving
+    // the card stuck on a state the server no longer has.
+    setSwitching(true)
+    try {
+      const res = await onCheckedChange(bln, data)
+      if (res === false) return
+      setChecked(bln)
+    } catch (error) {
+      showApiError(error)
+    } finally {
+      setSwitching(false)
+    }
+  }
+  const showAddTemp = Boolean(canAddTemplate && (type === AppType.FLOW || type === AppType.ASSISTANT) && onAddTemp)
+  const showCopyItem = Boolean(showCopy && onCopy)
+  const showDelete = Boolean(!checked && onDelete)
+  const hasPlainActions = Boolean(onPermission) || showAddTemp || showCopyItem
+  const showDisabledDeleteItem = Boolean(onDelete && checked && deleteDisabledHint)
+  const showActionBar = hasPlainActions || showDelete || showDisabledDeleteItem
+
+  // 新建小卡片（sheet）
+  if (!id && type === 'sheet') return <Card className="group w-[320px] cursor-pointer border-dashed border-[#BEC6D6] transition hover:border-primary hover:shadow-none bg-background-new" onClick={onClick}>
+    <CardHeader>
+      <CardTitle>
+        <div className="flex gap-2 items-center">
+          <div className="justify-between"><Outlined.Plus className="group-hover:text-primary transition-none" /></div>
+          <span>{title}</span>
+        </div>
+      </CardTitle>
+    </CardHeader>
+    <CardContent className="h-fit max-h-[44px] overflow-auto scrollbar-hide">
+      <CardDescription className="break-all">{description}</CardDescription>
+    </CardContent>
+    <CardFooter className="flex justify-end h-10">
+      <div className="rounded cursor-pointer"><Outlined.ArrowRight className="group-hover:text-primary transition-none" /></div>
+    </CardFooter>
+  </Card>
+
+
+  // 新建卡片
+  if (!id) return <Card className="group w-[320px] cursor-pointer border-dashed border-[#BEC6D6] transition hover:border-primary hover:shadow-none bg-background-new" onClick={onClick}>
+    <CardHeader>
+      <div className="flex justify-between pb-2"><Outlined.Plus className="group-hover:text-primary transition-none" /></div>
+      <CardTitle className="">{title}</CardTitle>
+    </CardHeader>
+    <CardContent className="h-[140px] overflow-auto scrollbar-hide">
+      <CardDescription>{description}</CardDescription>
+    </CardContent>
+    <CardFooter className="flex justify-end h-10">
+      <div className="rounded cursor-pointer"><Outlined.ArrowRight className="group-hover:text-primary transition-none dark:text-slate-50" /></div>
+    </CardFooter>
+  </Card>
+
+
+  // 侧边弹窗列表（sheet）
+  if (type === 'sheet') return <Card className="group max-h-[146px] w-[316px] cursor-pointer bg-[#F7F9FC] dark:bg-background-main dark:hover:bg-background-login hover:bg-[#EDEFF6] hover:shadow-none relative" onClick={onClick}>
+    <CardHeader className="pb-2">
+      <CardTitle className="truncate-doubleline">
+        <div className="flex gap-2 pb-2 items-center">
+          {logo}
+          <p className="leading-5 align-middle">{title}</p>
+        </div>
+        {/* <span></span> */}
+      </CardTitle>
+    </CardHeader>
+    <CardContent className="h-fit max-h-[60px] overflow-auto scrollbar-hide mb-2">
+      <CardDescription className="break-all">{description}</CardDescription>
+    </CardContent>
+    <CardFooter className=" block">
+      {footer}
+    </CardFooter>
+  </Card>
+
+  // 助手&技能&工作流列表卡片组件
+  return <Card className="group w-[320px] hover:bg-card/80 cursor-pointer grid" onClick={() => onClick()}>
+    <CardHeader>
+      <div className="flex justify-between pb-2">
+        {logo}
+        <div className="flex gap-1 items-center">
+          {headSelecter}
+          {showSwitch && <Switch
+            checked={_checked}
+            disabled={switching}
+            checkedChildren={t('skills.online')}
+            unCheckedChildren={t('skills.offline')}
+            onCheckedChange={handleCheckedChange}
+            onClick={e => { e.stopPropagation(); onSwitchClick?.() }}
+          ></Switch>}
+        </div>
+      </div>
+      <CardTitle className="truncate-doubleline leading-5 break-all flex items-center gap-1">{title}{permissionBadge}</CardTitle>
+    </CardHeader>
+    <CardContent className="h-[140px] overflow-auto scrollbar-hide">
+      <CardDescription className="break-all">{description}</CardDescription>
+    </CardContent>
+    <CardFooter className="h-20 grid grid-rows-2 self-end">
+      {labelPannel}
+      <div className="flex justify-between items-center h-10">
+        <div className="flex gap-1 items-center">
+          <Outlined.PeopleRound className="size-4 shrink-0" />
+          <span className="text-sm text-muted-foreground">{t('skills.createdBy')}</span>
+          <span className="text-sm font-medium overflow-hidden text-ellipsis max-w-32 ">{user}</span>
+        </div>
+        {showActionBar && (
+          // Menu clicks bubble through the portal; keep them off the card's onClick.
+          <div className={`${menuOpen ? 'flex' : 'hidden group-hover:flex'} gap-1 items-center`} onClick={(e) => e.stopPropagation()}>
+            <Dropdown
+              open={menuOpen}
+              onOpenChange={setMenuOpen}
+              align="end"
+              menu={<>
+                {onPermission && (
+                  <DropdownItem icon={<Shield />} onSelect={() => onPermission(data)}>
+                    {t('system.managePermission')}
+                  </DropdownItem>
+                )}
+                {showAddTemp && (
+                  <DropdownItem icon={<Outlined.FileAddition />} onSelect={() => onAddTemp(data)}>
+                    {t('skills.createTemplate')}
+                  </DropdownItem>
+                )}
+                {showCopyItem && (
+                  <DropdownItem icon={<Outlined.Copy />} onSelect={() => onCopy(data)}>
+                    {i18n.t('copy', { ns: 'flow' })}
+                  </DropdownItem>
+                )}
+                {showDelete && (
+                  <>
+                    {hasPlainActions && <DropdownSeparator />}
+                    <DropdownItem danger icon={<Outlined.Delete />} onSelect={() => onDelete(data)}>
+                      {i18n.t('delete', { ns: 'flow' })}
+                    </DropdownItem>
+                  </>
+                )}
+                {showDisabledDeleteItem && (
+                  <TooltipProvider>
+                    <Tooltip content={deleteDisabledHint}>
+                      <span>
+                        <DropdownItem disabled danger icon={<Outlined.Delete />}>
+                          {i18n.t('delete', { ns: 'flow' })}
+                        </DropdownItem>
+                      </span>
+                    </Tooltip>
+                  </TooltipProvider>
+                )}
+              </>}
+            >
+              <button
+                type="button"
+                className="hover:bg-[#EAEDF3] dark:hover:bg-[#34353A] rounded cursor-pointer p-1 inline-flex items-center justify-center"
+                aria-label={t('more')}
+              >
+                <Outlined.Setting className="w-4 h-4" />
+              </button>
+            </Dropdown>
+          </div>
+        )}
+      </div>
+      {footer}
+    </CardFooter>
+  </Card>
+};

@@ -1,0 +1,306 @@
+/**
+ * FilePreview — pure, reusable file preview component.
+ * Renders TopBar + optional Sidebar + format-specific Viewer.
+ * Width: 100% — the parent controls sizing.
+ * AI assistant and split-pane logic live in the parent (FilePreviewPage).
+ */
+import { usePdfDocument } from "@bisheng/file-viewers/pdf";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import { Sidebar } from "./Sidebar";
+import { TopBar } from "./TopBar";
+import { getViewerType, supportsPagination, supportsSidebar, supportsZoom } from "./viewers";
+import { MediaPlayer } from "./MediaPlayer";
+import { MediaTranscriptTabs } from "./RichKnowledgePreview";
+import { cn } from "~/utils";
+import { HtmlViewer } from "./viewers/HtmlViewer";
+import { ImageViewer } from "./viewers/ImageViewer";
+import { MarkdownViewer } from "./viewers/MarkdownViewer";
+import { PdfViewer } from "./viewers/PdfViewer";
+import { TextViewer } from "./viewers/TextViewer";
+import { useLocalize } from "~/hooks";
+import type { CitationPdfBBox } from "~/components/Chat/Messages/Content/citationUtils";
+
+// pdfjs / mammoth / xlsx weigh ~2 MB together. FilePreview is reachable from the chat
+// page (Linsight workspace panel), so load them only when a file of that type is opened.
+const DocxViewer = lazy(() => import("./viewers/DocxViewer").then((m) => ({ default: m.DocxViewer })));
+const XlsxViewer = lazy(() => import("./viewers/XlsxViewer").then((m) => ({ default: m.XlsxViewer })));
+
+export interface FilePreviewProps {
+    /** Standalone viewers own the browser title; embedded viewers use their host title. */
+    manageDocumentTitle?: boolean;
+    /** File display name (with extension) */
+    fileName: string;
+    /** File extension, e.g. "pdf", "docx" */
+    fileType: string;
+    /** Full URL to the file */
+    fileUrl: string;
+    /** Extra actions rendered in TopBar right area (before download button) */
+    actions?: React.ReactNode;
+    /** True when pptx-to-pdf conversion failed on the backend */
+    conversionFailed?: boolean;
+    /** Optional PDF highlight boxes in original PDF coordinates. */
+    highlightBboxes?: CitationPdfBBox[];
+    /** Optional PDF box to scroll into view. */
+    targetBBox?: CitationPdfBBox | null;
+    /** Render viewer-only layout (hide top toolbar and sidebar controls). */
+    compactMode?: boolean;
+    /** Hide the TopBar header entirely while keeping the full preview controls
+     *  (sidebar/zoom/pagination). Used by the mobile bare-preview layout where the
+     *  header is replaced by floating controls. */
+    hideHeader?: boolean;
+    /** Hide the left thumbnail sidebar entirely (e.g. the mobile bare-preview
+     *  layout, where the page-thumbnail panel has no room and isn't wanted). */
+    hideSidebar?: boolean;
+    /** Whether to expose download actions. */
+    allowDownload?: boolean;
+    /** Suppress the TopBar's built-in download button (the caller renders its own,
+     *  e.g. inside a More dropdown). The unsupported-format CTA stays gated by
+     *  `allowDownload`. */
+    hideHeaderDownload?: boolean;
+    /** Optional business-level download handler. Defaults to downloading fileUrl. */
+    onDownloadFile?: () => void;
+    /** Parsed-transcript URL for an audio/video file. When set, the media viewer
+     *  shows the 识别文本 / 入库文本 pane next to the player, like the knowledge
+     *  space does — the cited text lives in the transcript, not in the clip. */
+    transcriptUrl?: string;
+}
+
+export default function FilePreview({
+    manageDocumentTitle = true,
+    fileName,
+    fileType,
+    fileUrl,
+    actions,
+    conversionFailed = false,
+    highlightBboxes = [],
+    targetBBox = null,
+    compactMode = false,
+    hideHeader = false,
+    hideSidebar = false,
+    allowDownload = true,
+    hideHeaderDownload = false,
+    onDownloadFile,
+    transcriptUrl = "",
+}: FilePreviewProps) {
+    const localize = useLocalize();
+    const viewerType = getViewerType(fileType);
+    const hasSidebar = !compactMode && !hideSidebar && supportsSidebar(viewerType);
+    const hasPagination = !compactMode && supportsPagination(viewerType);
+    const hasZoom = !compactMode && supportsZoom(viewerType);
+    // Suppress the TopBar header without dropping into compactMode (which also
+    // strips sidebar/zoom/pagination). `showHeader` gates every header render below.
+    const showHeader = !compactMode && !hideHeader;
+
+    // --- PDF-specific state ---
+    const pdfState = usePdfDocument(viewerType === 'pdf' ? fileUrl : '', {
+        workerUrl: __APP_ENV__.BASE_URL + '/pdf.worker.min.js',
+        cMapUrl: __APP_ENV__.BASE_URL + '/cmaps/',
+    });
+    const pdfDoc = pdfState.document;
+    const [currentPage, setCurrentPage] = useState(1);
+    const totalPages = pdfDoc?.numPages ?? 0;
+    const [targetPage, setTargetPage] = useState<number | null>(null);
+
+    // --- Shared state ---
+    const [zoomLevel, setZoomLevel] = useState(100);
+    const [sidebarOpen, setSidebarOpen] = useState(true);
+    const error = pdfState.status === 'error' ? localize('com_knowledge.load_pdf_failed') : null;
+
+    useEffect(() => {
+        if (manageDocumentTitle) {
+            const previousTitle = document.title;
+            document.title = fileName;
+            return () => { document.title = previousTitle; };
+        }
+    }, [fileName, manageDocumentTitle]);
+
+    const handleZoomIn = useCallback(() => {
+        setZoomLevel((prev) => Math.min(500, prev + 25));
+    }, []);
+
+    const handleZoomOut = useCallback(() => {
+        setZoomLevel((prev) => Math.max(25, prev - 25));
+    }, []);
+
+    const handlePageChange = useCallback((page: number) => {
+        setCurrentPage(page);
+        setTargetPage(page);
+    }, []);
+
+    const handleCurrentPageChange = useCallback((page: number) => {
+        setCurrentPage(page);
+    }, []);
+
+    const handleSidebarPageClick = useCallback((page: number) => {
+        setCurrentPage(page);
+        setTargetPage(page);
+    }, []);
+
+    const handleDownload = useCallback(() => {
+        if (onDownloadFile) {
+            onDownloadFile();
+            return;
+        }
+        const link = document.createElement("a");
+        link.href = fileUrl;
+        link.download = fileName;
+        link.target = "_blank";
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    }, [fileName, fileUrl, onDownloadFile]);
+
+    const topBarDownload = allowDownload && !hideHeaderDownload ? handleDownload : undefined;
+
+    // Unsupported format
+    if (viewerType === "unsupported") {
+        return (
+            <div className="w-full h-full flex flex-col">
+                {showHeader && <TopBar fileName={fileName} onDownload={topBarDownload} actions={actions} showZoom={false} />}
+                <div className="flex-1 flex items-center justify-center bg-fill-1">
+                    <div className="flex flex-col items-center gap-4 text-text-3">
+                        <div className="text-5xl">📄</div>
+                        <p className="text-lg">{localize("com_knowledge.unsupported_format_prefix")}{fileType}{localize("com_knowledge.unsupported_format_suffix")}</p>
+                        {allowDownload && (
+                            <button
+                                onClick={handleDownload}
+                                className="btn-brand-primary px-4 py-2 bg-primary text-white rounded-md text-sm hover:bg-primary/90 transition-colors"
+                            >
+                                {localize("com_knowledge.download_file")}</button>
+                        )}
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    // PPTX conversion failed — show zoom controls but display error in content area
+    if (conversionFailed) {
+        return (
+            <div className="w-full h-full flex flex-col">
+                {showHeader && (
+                    <TopBar
+                        fileName={fileName}
+                        showZoom={true}
+                        zoomLevel={zoomLevel}
+                        onZoomIn={handleZoomIn}
+                        onZoomOut={handleZoomOut}
+                        onDownload={fileUrl ? topBarDownload : undefined}
+                        actions={actions}
+                    />
+                )}
+                <div className="flex-1 flex items-center justify-center bg-fill-1">
+                    <div className="flex flex-col items-center gap-3 text-text-3">
+                        <div className="text-5xl">📄</div>
+                        <p className="text-base">{localize("com_knowledge.load_doc_failed")}</p>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    // Error state
+    if (error) {
+        return (
+            <div className="w-full h-full flex flex-col">
+                {showHeader && <TopBar fileName={fileName} onDownload={topBarDownload} actions={actions} showZoom={false} />}
+                <div className="flex-1 flex items-center justify-center bg-fill-1">
+                    <div className="flex flex-col items-center gap-3 text-text-3">
+                        <div className="text-4xl">📄</div>
+                        <p>{error}</p>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    // Render the appropriate viewer
+    const renderViewer = () => {
+        switch (viewerType) {
+            case "pdf":
+                return (
+                    <PdfViewer
+                        pdfDoc={pdfDoc}
+                        zoomLevel={zoomLevel}
+                        targetPage={targetPage}
+                        highlightBboxes={highlightBboxes}
+                        targetBBox={targetBBox}
+                        onCurrentPageChange={handleCurrentPageChange}
+                    />
+                );
+            case "docx":
+                return <DocxViewer fileUrl={fileUrl} zoomLevel={zoomLevel} />;
+            case "xlsx":
+                return <XlsxViewer fileUrl={fileUrl} fileExt={fileType} zoomLevel={zoomLevel} />;
+            case "markdown":
+                return <MarkdownViewer fileUrl={fileUrl} zoomLevel={zoomLevel} />;
+            case "html":
+                return <HtmlViewer fileUrl={fileUrl} zoomLevel={zoomLevel} />;
+            case "image":
+                return <ImageViewer fileUrl={fileUrl} zoomLevel={zoomLevel} />;
+            case "text":
+                return <TextViewer fileUrl={fileUrl} zoomLevel={zoomLevel} />;
+            case "audio":
+            case "video":
+                // Player on top, the transcript the answer actually quoted below
+                // it. Stacked rather than split: this preview lives in a narrow
+                // citation panel, where two columns leave both halves cramped.
+                return (
+                    <div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-fill-1">
+                        <div className={cn("shrink-0 p-4", transcriptUrl ? "" : "flex-1")}>
+                            <MediaPlayer
+                                kind={viewerType}
+                                src={fileUrl}
+                                allowDownload={allowDownload}
+                                onDownload={handleDownload}
+                            />
+                        </div>
+                        {transcriptUrl ? (
+                            <>
+                                <div className="h-px shrink-0 bg-border-base" />
+                                <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+                                    <MediaTranscriptTabs fileUrl={transcriptUrl} />
+                                </div>
+                            </>
+                        ) : null}
+                    </div>
+                );
+            default:
+                return null;
+        }
+    };
+
+    return (
+        <div className="w-full h-full flex flex-col overflow-hidden">
+            {showHeader && (
+                <TopBar
+                    fileName={fileName}
+                    showSidebar={hasSidebar}
+                    sidebarOpen={sidebarOpen}
+                    onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
+                    showZoom={hasZoom}
+                    zoomLevel={zoomLevel}
+                    onZoomIn={handleZoomIn}
+                    onZoomOut={handleZoomOut}
+                    showPagination={hasPagination}
+                    currentPage={currentPage}
+                    totalPages={totalPages}
+                    onPageChange={handlePageChange}
+                    onDownload={topBarDownload}
+                    actions={actions}
+                />
+            )}
+            <div className="flex flex-1 min-h-0">
+                {hasSidebar && (
+                    <Sidebar
+                        open={sidebarOpen}
+                        pdfDoc={pdfDoc}
+                        currentPage={currentPage}
+                        onPageClick={handleSidebarPageClick}
+                    />
+                )}
+                <Suspense fallback={null}>{renderViewer()}</Suspense>
+            </div>
+        </div>
+    );
+}

@@ -1,0 +1,120 @@
+// @ts-strict-ignore
+import { Button, Textarea } from '@bisheng/ui';
+
+
+import { Checkbox } from "@bisheng/ui";
+
+import { Label } from "@/components/bs-ui/label";
+import { RadioGroup, Radio as RadioGroupItem } from "@bisheng/ui";
+import { t } from "i18next";
+import { Outlined } from "bisheng-icons";
+import { useEffect, useState } from "react";
+import { showApiError } from "@/controllers/request";
+
+export default function FormSet({ data, onChange, onSave, onCancel }) {
+    const showReviewType = false;
+
+    const [form, setForm] = useState(data)
+    const [saving, setSaving] = useState(false)
+    useEffect(() => {
+        setForm(data)
+    }, [data])
+
+    const handleCheckboxChange = (val, name) => {
+        const temp = form.wordsType
+        // setForm({ ...form, wordsType: [1] })
+        val ? setForm({
+            ...form, wordsType: [...temp, name]
+        }) : setForm({
+            ...form, wordsType: temp.filter(v => v !== name)
+        })
+    }
+
+    const handleUploadFile = (e) => {
+        const file = e.target.files[0]
+        if (file) {
+            const reader = new FileReader()
+            reader.onload = (evt) => {
+                const text = evt.target.result
+                //@ts-ignore
+                const formatContent = text.replace(/[\s,，\r\n]+/g, '\n') // 将所有符号替换成换行符
+                setForm({ ...form, words: formatContent })
+            }
+            reader.readAsText(file)
+        }
+    }
+    const handleSave = async () => {
+        if (saving || String(form.autoReply ?? '').length > 500) return;
+        setSaving(true)
+        try {
+            const blocked = await onChange(form)
+            if (!blocked) onSave()
+        } catch (error) {
+            showApiError(error)
+        } finally {
+            setSaving(false)
+        }
+    }
+    return <fieldset disabled={saving} className="m-0 min-w-0 border-0 p-0">
+        <div className="px-4 mt-6">
+            {showReviewType && (
+                <>
+                    <span className="bisheng-label">{t('build.reviewType')}</span>
+                    <RadioGroup value="1"
+                        className="flex space-x-2 h-[20px] mt-4 mb-6">
+                        <div>
+                            <Label className="flex justify-center">
+                                <RadioGroupItem className="mr-2" value="1" />{t('build.sensitiveWordListMatch')}
+                            </Label>
+                        </div>
+                        <div>
+                            <Label className="flex justify-center">
+                                <RadioGroupItem disabled className="mr-2" value="模型审查" />{t('build.modelReview')}
+                            </Label>
+                        </div>
+                    </RadioGroup>
+                </>
+            )}
+            <div className="mb-6">
+                <span className="bisheng-label">{t('build.wordListType')}</span>
+                <div className="mt-4 mb-6 space-y-3">
+                    <div className="space-x-2 flex items-center">
+                        <Checkbox
+                            id="c1"
+                            value="1"
+                            checked={form.wordsType?.includes(1)}
+                            onCheckedChange={(val) => handleCheckboxChange(val, 1)}
+                        />
+                        <Label htmlFor="c1" className="cursor-pointer">{t('build.builtinWordList')}</Label>
+                    </div>
+                    <div className="space-x-2 flex items-center">
+                        <Checkbox
+                            id="c2"
+                            value="2"
+                            checked={form.wordsType?.includes(2)}
+                            onCheckedChange={(val) => handleCheckboxChange(val, 2)}
+                        />
+                        <Label htmlFor="c2" className="cursor-pointer">{t('build.customWordList')}</Label>
+                    </div>
+                </div>
+                <div className="flex justify-center relative">
+                    <Textarea value={form.words} onChange={(e) => setForm({ ...form, words: e.target.value })} placeholder={t('build.useNewlineToSeparate')} textareaClassName={"h-[100px] resize-none"}></Textarea>
+                    <input type="file" accept=".txt" id="fileUpload" className="hidden" onChange={handleUploadFile} />
+                    {/* @ts-ignore */}
+                    <div className="flex items-center absolute right-1 top-1 cursor-pointer" onClick={() => document.querySelector('#fileUpload').click()}>
+                        <Outlined.Upload id="ul" color="blue" className="w-3 h-3" />
+                        <Label htmlFor="ul"><span className="text-xs text-primary cursor-pointer">{t('build.txtFile')}</span></Label>
+                    </div>
+                </div>
+            </div>
+            <span className="bisheng-label">{t('build.autoReplyContent')}</span>
+            <div className="flex justify-center mt-4">
+                <Textarea value={form.autoReply} onChange={(e) => setForm({ ...form, autoReply: e.target.value })} maxLength={500} placeholder={t('build.defaultAutoReply')} textareaClassName={"h-[100px] resize-none"} showCount></Textarea>
+            </div>
+        </div>
+        <div className="absolute bottom-10 right-4 sapce-x-10 flex space-x-8">
+            <Button onClick={onCancel} disabled={saving} variant="outlined" color="default">{t('cancel')}</Button>
+            <Button onClick={handleSave} disabled={saving || (String((form.autoReply) ?? '').length > 500)}>{t('save')}</Button>
+        </div>
+    </fieldset>
+};

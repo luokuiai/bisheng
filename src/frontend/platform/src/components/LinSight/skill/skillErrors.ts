@@ -1,0 +1,55 @@
+// F035: map skill business error codes (110xx) to localized copy.
+// skillApi mutation calls run in `silent` mode so the structured error reaches the
+// caller and validation copy can go through i18n instead of backend English.
+import type { SkillUploadLimit } from "@/controllers/API/linsight";
+import { isApiError } from '@bisheng/api-client';
+import { notification } from '@bisheng/ui';
+
+const SKILL_ERROR_KEYS: Record<number, string> = {
+    11051: 'skillManage.errors.validation',
+    11052: 'skillManage.errors.tooLarge',
+    11053: 'skillManage.errors.notFound',
+    11054: 'skillManage.errors.noPermission',
+    11055: 'skillManage.errors.duplicate',
+    11056: 'skillManage.errors.githubUrlInvalid',
+    11057: 'skillManage.errors.githubFetch',
+    11058: 'skillManage.errors.githubRateLimit',
+    // 11052 = the uploaded payload is too big; 11059 = its unpacked contents are.
+    // A well-compressing 7MB archive can trip 11059 alone, so they must not share copy.
+    11059: 'skillManage.errors.bundleTooLarge',
+};
+
+/** ``limit`` fills the size placeholders of the 11052 / 11059 copy; callers that
+ *  cannot receive those codes (no upload involved) may omit it. */
+export function getSkillErrorMessage(
+    err: unknown,
+    t: (key: string, options?: Record<string, unknown>) => string,
+    limit?: SkillUploadLimit,
+): string {
+    if (err && typeof err === 'object' && 'status_code' in err) {
+        const envelope = err as { status_code: number; status_message?: string };
+        // 11051 covers a dozen distinct causes (missing frontmatter, bad description,
+        // illegal name, ...) — the backend msg names the actual one, so surface it
+        // instead of a canned catch-all that misleads (e.g. "archive must contain
+        // SKILL.md" shown for an uppercase frontmatter name).
+        if (envelope.status_code === 11051 && envelope.status_message) {
+            return t('skillManage.errors.validationDetail', { detail: envelope.status_message });
+        }
+        const key = SKILL_ERROR_KEYS[envelope.status_code];
+        if (key) return t(key, limit ? { size: limit.max_size_mb, unpacked: limit.max_unpacked_mb } : undefined);
+        if (envelope.status_message) return envelope.status_message;
+    }
+    if (typeof err === 'string') return err;
+    return t('skillManage.errors.unknown');
+}
+
+/** Silent skill mutations own localized validation, while respecting global/canceled failures. */
+export function showSkillError(
+    error: unknown,
+    t: (key: string, options?: Record<string, unknown>) => string,
+    limit?: SkillUploadLimit,
+): void {
+    if (isApiError(error) && (error.kind === 'canceled' || error.presentation !== 'none')) return;
+    notification.open({ type: 'error', description: getSkillErrorMessage(error, t, limit) });
+    if (isApiError(error)) error.presentation = 'toast';
+}

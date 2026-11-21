@@ -1,0 +1,553 @@
+import os
+import re
+import shutil
+import uuid
+from abc import ABC, abstractmethod
+from datetime import timedelta
+from os import DirEntry
+from typing import Any
+
+from loguru import logger
+from minio import Minio
+
+# Deliverables must be written to the RELATIVE ``output/`` (or intermediate
+# ``scratch/``) directory under the executor's working dir — that dir is the only
+# location harvested back into the linsight workspace. A leading-slash
+# ``/output/...`` lands at the container filesystem root, OUTSIDE the harvested
+# working dir (and, for the shared LocalExecutor, cannot be safely rescued from
+# there without leaking one task's files into another). Such a write therefore
+# vanishes silently from the result panel. This regex flags the pattern in
+# submitted code (string literal starting with ``/output`` or ``/scratch``) so the
+# executor can append a corrective notice and the model self-corrects next step.
+_ABSOLUTE_DELIVERABLE_RE = re.compile(r"""['"]/(?:output|scratch)(?:/|['"])""")
+
+# The read-side twin. ``/skills`` and ``/uploads`` are zones the model READS: the
+# workspace tools hand it ``/skills/<name>/SKILL.md`` and ``/uploads/<file>``, and
+# copying those into code prefixes the container root — ``open()`` then raises
+# FileNotFoundError. Nothing is lost, so the write-side wording ("DISCARDED") would
+# be actively misleading here; hence a separate pattern and a separate notice.
+_ABSOLUTE_PROVISIONED_RE = re.compile(r"""['"]/(?:skills|uploads|large_tool_results)(?:/|['"])""")
+
+ABSOLUTE_PATH_NOTICE = (
+    "\n\n[SYSTEM NOTICE] Your code wrote file(s) to an ABSOLUTE path "
+    "(/output/... or /scratch/...). Files written outside the current working "
+    "directory are DISCARDED and were NOT delivered to the user. Re-run and write "
+    "to the RELATIVE path with no leading slash, e.g. `output/report.pdf` for "
+    "deliverables or `scratch/temp.png` for intermediate files. The working "
+    "directory IS the workspace root, so the file tools' `/output/x` is simply "
+    "`output/x` here."
+)
+
+ABSOLUTE_PROVISIONED_PATH_NOTICE = (
+    "\n\n[SYSTEM NOTICE] Your code opened an ABSOLUTE workspace path "
+    "(/skills/... or /uploads/...). Those leading-slash paths exist only in the FILE "
+    "TOOLS' view; on this filesystem they live under the CURRENT WORKING DIRECTORY, "
+    "so a leading slash sends open() to the container root and raises "
+    "FileNotFoundError. Nothing was lost or discarded — the file simply was not "
+    "read. Re-run with the same path minus the leading slash, e.g. "
+    "`skills/<name>/SKILL.md`, `uploads/<file>`, or "
+    "`large_tool_results/<call_id>`."
+)
+
+# --- Workspace escape ------------------------------------------------------
+# The local executor is a subprocess on the SHARED backend host, not a sandbox:
+# a script can read anything the service account can. That is how a daily-chat
+# turn once answered from `/root/.cache/bisheng/bisheng/` — the global download
+# cache, where EVERY user's uploads pile up under a flat sha256 name. Reading
+# another tenant's document is not a feature we want to keep, so these patterns
+# reject the run outright (unlike the advisories above, which only annotate).
+#
+# Matching an ACCESS VERB rather than a bare string literal is deliberate: code
+# may legitimately mention such a path in prose it prints back to the user.
+_FS_ACCESS_VERBS = (
+    "open|walk|scandir|listdir|glob|iglob|rglob|Path|PosixPath|copy|copy2|copyfile|copytree|"
+    "move|rename|remove|unlink|rmtree|stat|lstat|getsize|exists|isfile|isdir|read_text|read_bytes"
+)
+# Host directories that are never part of a workspace. The workspace's own
+# absolute-looking zones (/output /scratch /skills /uploads) are handled by
+# ``absolute_path_advisory`` and are deliberately absent here.
+_HOST_ROOTS = "root|home|etc|proc|sys|boot|opt|srv|usr|var|app|data|mnt|media"
+# Group 2 captures the whole literal so the caller can tell "somewhere on the
+# host" from "my own working dir, spelled absolutely" — linsight hands the model
+# host paths of its own workspace, so those must stay legal.
+_HOST_PATH_ACCESS_RE = re.compile(
+    rf"""\b(?:{_FS_ACCESS_VERBS})\s*\([^)\n]{{0,120}}?(['"])(/(?:{_HOST_ROOTS})[^'"\n]*)\1"""
+)
+# ``expanduser("~")`` / ``Path.home()`` resolve to the SERVICE account's home.
+# A model hunting for "the file I was given" reaches for ``~`` early.
+_HOME_EXPANSION_RE = re.compile(r"""expanduser\s*\(\s*['"]~|Path\s*\.\s*home\s*\(""")
+# A scan rooted at ``/`` walks the entire container.
+_ROOT_SCAN_RE = re.compile(r"""\b(?:walk|glob|iglob|scandir|listdir)\s*\(\s*['"]/['"]""")
+
+WORKSPACE_ESCAPE_NOTICE = (
+    "[SYSTEM NOTICE] This run was REJECTED and nothing was executed: the code reaches OUTSIDE "
+    "the working directory — a system path (/root, /etc, /app, /home, ...), the expanded home "
+    "directory (`~`), or a scan rooted at `/`. Only the task workspace is available to this "
+    "run.\n"
+    "Your current working directory IS your workspace. Use RELATIVE paths only: "
+    "`uploads/<file>` for provided sources, `output/<file>` for deliverables, `scratch/<file>` "
+    "for intermediates.\n"
+    "If what you are looking for is not under the working directory, it was NOT provided to you "
+    "on this turn. Say so plainly and ask for it — do not search the filesystem for it, and do "
+    "not answer from memory of an earlier turn as if you had re-read the file."
+)
+
+# Shared by every executor's tool description (kept in lockstep with the linsight
+# system prompt's "执行环境边界" section). Users do ask the agent to print env vars
+# or "the keys in the config"; a model with no stated boundary just writes the
+# script. This lowers how often that happens — it is NOT the access control: a
+# determined prompt can still talk a model past it, so process-level isolation of
+# the executor is what actually keeps platform secrets unreadable.
+# Wording is deliberate: state the boundary and the expected reply, never WHY
+# (no "secrets live here" / "other users' data") — the model repeats this text
+# to the user, and the reason would only advertise where to look.
+EXECUTION_BOUNDARY_RULES = (
+    "ENVIRONMENT BOUNDARY: this interpreter is for working on the task's own files. It does "
+    "not provide the platform's environment variables, configuration files, keys, credentials "
+    "or internal service addresses. Do not write code that reads or prints them — no "
+    "os.environ dumps, no /proc, no platform config files or installed platform source code, "
+    "no connecting to the platform's database, cache or object storage. If the user asks for "
+    "any of these, reply that the task environment does not provide platform configuration or "
+    "credentials, do not try another way to get them, and carry on with the rest of the task. "
+    "Files the user uploaded under `uploads/` (including .env or config files) are the user's "
+    "own material and may be read and analysed normally. "
+)
+
+# Delivery zones of the executor working dir. ``output/`` is the ONLY zone the
+# linsight harvester (``get_final_result_file``) treats as deliverables;
+# ``scratch/`` is explicitly intermediate.
+OUTPUT_DIR_NAME = "output"
+SCRATCH_DIR_NAME = "scratch"
+
+
+def path_namespace_rules(include_skills: bool = True) -> str:
+    """The mapping between the two path namespaces the model is shown.
+
+    The file tools (ls / read_file / write_file / edit_file) render every workspace
+    path with a LEADING SLASH, while the interpreter's cwd IS that same workspace
+    root — so `/output/a.md` and `output/a.md` are one file, and the model has to
+    translate in both directions. Nothing said so until now, and a real run burned
+    three model round-trips discovering it, then failed four `read_file` calls at the
+    end by handing back a host path it had seen in the interpreter.
+
+    ``include_skills`` is False for E2B: the sandbox copy-in snapshots the working dir
+    BEFORE skills are materialised, so `skills/` genuinely is not there and promising
+    it would just point the model at nothing.
+    """
+    zones = (
+        "`/output/x` is `output/x`, `/scratch/x` is `scratch/x`, "
+        "`/uploads/x` is `uploads/x`, `/large_tool_results/x` is `large_tool_results/x`"
+    )
+    # Every example has to stay inside the zone set this executor actually has, or
+    # the guidance points at something that is not there.
+    read_example = "`open('/skills/...')`" if include_skills else "`open('/uploads/...')`"
+    if include_skills:
+        zones += ", `/skills/<name>/SKILL.md` is `skills/<name>/SKILL.md`"
+    return (
+        "WORKING DIRECTORY: your cwd IS the task workspace root. The file tools show "
+        f"those same files with a LEADING SLASH: {zones}. "
+        f"In code ALWAYS drop the leading slash — {read_example} or "
+        "`open('/output/...')` resolves at the CONTAINER ROOT, so reads raise "
+        "FileNotFoundError and writes are discarded and never delivered. Conversely, "
+        "never hand a host path you saw here (e.g. `/root/.cache/.../output/a.png`) "
+        "back to read_file — pass the workspace path `output/a.png`. Create the zone "
+        "dirs before writing into them: `os.makedirs('output', exist_ok=True)`. "
+    )
+
+
+# A file created at the working-directory ROOT sits in no zone at all, so it was
+# never delivered — the model just wrote ``report.xlsx`` instead of
+# ``output/report.xlsx``. The tool description asks for ``output/`` but that is a
+# soft contract the model regularly misses (and when it does, the deliverable
+# silently disappears from the result panel). The executor therefore relocates
+# such files itself and tells the model the new paths, because the old ones stop
+# resolving after the move.
+RELOCATED_PATH_NOTICE_HEADER = (
+    "\n\n[SYSTEM NOTICE] The following file(s) were written to the working-directory "
+    "ROOT, which is NOT a delivery zone — files there are never delivered to the user. "
+    "They have been MOVED into `output/`. Use the NEW paths from now on; the old paths "
+    "no longer exist. To avoid this, write deliverables to `output/` and intermediate "
+    "files to `scratch/` directly.\n"
+)
+
+# A SUCCESSFUL run's log is unbounded today, and nothing downstream bounds it either.
+# Once the serialized result crosses ~80000 chars, the deepagents FilesystemMiddleware
+# offloads it to /large_tool_results/<tool_call_id> and replaces the content with a
+# preview. That preview is computed PER LINE — but ToolNode serializes the dict result
+# with json.dumps, which turns every newline into a literal \n, so the whole result is
+# ONE line and the preview degrades to line[:1000] with no truncation marker at all.
+# The model then sees `{"exitcode": 0, "log": "…` and nothing else: no file_list, no
+# ending, and no sign that the rest exists elsewhere. Measured on 114, 2026-08-14: a
+# 112744-byte result put a kimi-k3 run into a 79-turn / 78-minute / 13.8M-token loop
+# re-sending the exact same script, because re-running was the only way it could think
+# of to get the data back.
+#
+# Capping here keeps the output INSIDE the context (head + tail, ~30x more than the
+# 1000 chars the offload path actually delivers) instead of behind a pointer the model
+# does not follow. 30000 sits far above the measured p90 (~8000; only 11.7% of calls
+# exceed 8000) so ordinary runs are untouched, and far below the eviction line even
+# after file_list URLs are added.
+MAX_SUCCESS_LOG_CHARS = 30000
+LOG_MIDDLE_TRUNCATED_NOTICE = (
+    "\n[... {omitted} characters of output omitted from the middle. Re-running this "
+    "code will NOT return more — the output itself is too long. Print less (summarize, "
+    "or print only what you need), or write the bulk to a file under `scratch/` and read "
+    "it back in chunks with read_file ...]\n"
+)
+
+
+def clip_middle(logs: str, limit: int = MAX_SUCCESS_LOG_CHARS) -> str:
+    """Cap ``logs`` keeping BOTH ends, dropping the middle.
+
+    Deliberately not ``LocalExecutor._tail``: that one keeps only the tail, which is
+    right for a FAILING run (a traceback states its cause on the last lines) and wrong
+    for a succeeding one — the head holds what the script actually printed (its
+    conclusions), and the tail holds the advisories the model must act on next turn.
+    """
+    if len(logs) <= limit:
+        return logs
+    notice = LOG_MIDDLE_TRUNCATED_NOTICE.format(omitted=len(logs) - limit)
+    head_len = limit // 2
+    return logs[:head_len] + notice + logs[-(limit - head_len) :]
+
+
+class BaseExecutor(ABC):
+    def __init__(self, minio: dict, **kwargs):
+        self.minio = minio
+        # 将代码生成的文件同步到本地的路径
+        self.local_sync_path = kwargs.get("local_sync_path", None)
+        # Object-storage prefix of the session workspace (``workspace/<svid>``).
+        # Set by the linsight tool binder; empty for every other caller, which
+        # simply disables the mirror in ``sync_to_workspace``.
+        self.workspace_prefix = kwargs.get("workspace_prefix", None)
+        # Request-scoped knowledge-image stage (workstation daily chat); None elsewhere.
+        self._kb_stage: Any = None
+
+    # Executors that run scripts through ``run_with_dir`` can write the stage's images
+    # into the working directory; others (E2B) leave this False and ignore the stage.
+    supports_kb_stage = False
+
+    def attach_stage(self, stage: Any) -> None:
+        if self.supports_kb_stage:
+            self._kb_stage = stage
+
+    def kb_stage_hint(self) -> str:
+        return self._kb_stage.tool_hint() if self._kb_stage is not None else ""
+
+    def stage_kb_images(self, dir_path: str) -> str:
+        """Write this request's retrieved knowledge images into ``dir_path``; return a notice for the model."""
+        if self._kb_stage is None:
+            return ""
+        return self._kb_stage.materialize(dir_path, self._minio_client)
+
+    def kb_stage_failure_advisory(self, code: str) -> str:
+        return self._kb_stage.failure_advisory(code) if self._kb_stage is not None else ""
+
+    @abstractmethod
+    def run(self, code: str) -> Any:
+        raise NotImplementedError()
+
+    def execute_code(
+        self,
+        code: str | None = None,
+        timeout: int | None = None,
+        filename: str | None = None,
+        work_dir: str | None = None,
+        lang: str | None = "python",
+    ) -> tuple[int, str, str]:
+        """Run ``code`` in ``work_dir``. Backends that share ``run_with_dir`` implement this.
+
+        Not ``@abstractmethod``: ``E2bCodeExecutor`` is frozen and only overrides
+        ``run``, so marking this abstract would make that class un-instantiable.
+        """
+        raise NotImplementedError()
+
+    def _execute_in_dir(self, code: str, dir_path: str, lang: str) -> tuple[int, str, str]:
+        """The ``execute_code`` call of ``run_with_dir``; executors with per-instance run state override it."""
+        return self.execute_code(code, work_dir=dir_path, lang=lang)
+
+    @staticmethod
+    def _snapshot_files(dir_path: str) -> dict[str, tuple[float, int]]:
+        """Map every non-hidden file under ``dir_path`` to ``(mtime, size)``.
+
+        Taken before and after a run so the executor can tell what THIS run
+        produced. Without the diff the working dir is indistinguishable from its
+        contents: it also holds the prefetched uploaded sources and every earlier
+        step's files, so "what did this code write" is otherwise unanswerable.
+        """
+        snapshot: dict[str, tuple[float, int]] = {}
+        for root, dirs, files in os.walk(dir_path):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
+            for name in files:
+                if name.startswith("."):
+                    continue
+                abs_path = os.path.join(root, name)
+                try:
+                    stat = os.stat(abs_path)
+                except OSError:
+                    continue
+                snapshot[os.path.relpath(abs_path, dir_path)] = (stat.st_mtime, stat.st_size)
+        return snapshot
+
+    def _relocate_root_files(self, dir_path: str, created: list[str]) -> list[tuple[str, str]]:
+        """Move run-created ROOT-level files into ``output/``; return the moves.
+
+        The working-dir root is not a delivery zone — only ``output/`` is harvested
+        into the result panel — so a model that writes ``report.xlsx`` instead of
+        ``output/report.xlsx`` loses its deliverable silently. Relocating is safe
+        because only files *this run created* are eligible: prefetched upload
+        sources and prior-step files sit in the pre-run snapshot and stay put.
+
+        An existing ``output/<name>`` is overwritten on purpose: re-running the same
+        script must refresh its deliverable, not accumulate ``report (1).xlsx``.
+        """
+        moved: list[tuple[str, str]] = []
+        for rel in created:
+            if os.sep in rel or "/" in rel:
+                continue
+            src = os.path.join(dir_path, rel)
+            if not os.path.isfile(src):
+                continue
+            target_dir = os.path.join(dir_path, OUTPUT_DIR_NAME)
+            dst = os.path.join(target_dir, rel)
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+                shutil.move(src, dst)
+            except OSError:
+                logger.exception("relocate root deliverable failed: {}", src)
+                continue
+            moved.append((rel, os.path.relpath(dst, dir_path)))
+        return moved
+
+    def run_with_dir(self, code: str, dir_path: str, lang: str) -> tuple[int, str, list]:
+        """Run ``code`` under ``dir_path`` and return logs plus this run's files."""
+        pre_snapshot = self._snapshot_files(dir_path)
+        exitcode, logs, _ = self._execute_in_dir(code, dir_path, lang)
+        file_list = []
+        if exitcode != 0:
+            return exitcode, logs, file_list
+
+        post_snapshot = self._snapshot_files(dir_path)
+        created = [rel for rel in post_snapshot if rel not in pre_snapshot]
+        modified = [rel for rel, meta in post_snapshot.items() if rel in pre_snapshot and pre_snapshot[rel] != meta]
+
+        moved = self._relocate_root_files(dir_path, created)
+        relocated_from = {old for old, _ in moved}
+        touched = [rel for rel in created if rel not in relocated_from]
+        touched.extend(new for _, new in moved)
+        touched.extend(modified)
+        logs += self.relocation_advisory(moved)
+
+        file_list = self._publish_generated_files(dir_path, touched)
+        if self.local_sync_path and os.path.exists(self.local_sync_path):
+            files_info = list(os.scandir(dir_path))
+            self.sync_files_to_local(files_info, dir_path)
+        return exitcode, logs, file_list
+
+    def _publish_generated_files(self, dir_path: str, touched: list[str]) -> list[str]:
+        """Publish a successful run's changed files to its caller's storage."""
+        file_list = []
+        for rel in touched:
+            file_name = os.path.join(dir_path, rel)
+            if not os.path.isfile(file_name):
+                continue
+            file_ext = os.path.splitext(rel)[-1]
+            file_list.append(self.upload_minio(f"{uuid.uuid4().hex}.{file_ext}", file_name))
+        self.sync_to_workspace(dir_path, touched)
+        return file_list
+
+    def sync_files_to_local(self, files_info: list[DirEntry], root_path: str):
+        if not files_info:
+            return
+        for file in files_info:
+            if file.name.startswith("."):
+                continue
+            if file.is_file():
+                self.download_file(file, root_path)
+            else:
+                new_files_info = os.scandir(file.path)
+                self.sync_files_to_local(list(new_files_info), root_path)
+
+    def download_file(self, file_info: DirEntry, root_path: str):
+        relative_path = file_info.path.replace(root_path, "").lstrip(os.sep)
+        local_path = os.path.join(self.local_sync_path, relative_path)
+        local_dir = os.path.dirname(local_path)
+        os.makedirs(local_dir, exist_ok=True)
+        shutil.move(file_info.path, local_path)
+
+    @staticmethod
+    def absolute_path_advisory(code: str) -> str:
+        """Corrective notice for absolute workspace paths in ``code``; "" if clean.
+
+        Two independent failure modes, two notices, because the consequences differ:
+
+        - WRITE side (``/output`` / ``/scratch``): the file lands outside the
+          harvested working dir and silently vanishes from the result panel.
+        - READ side (``/skills`` / ``/uploads``): ``open()`` raises FileNotFoundError
+          and nothing is lost — telling the model its file was "DISCARDED" there
+          would send it chasing a data-loss problem that never happened.
+
+        Both hit at once → both notices, write side first. String-literal match only,
+        which is specific enough that false positives are negligible, and the notice
+        is non-blocking (appended to the tool result, never rejects the run).
+        """
+        if not code:
+            return ""
+        notices = ""
+        if _ABSOLUTE_DELIVERABLE_RE.search(code):
+            notices += ABSOLUTE_PATH_NOTICE
+        if _ABSOLUTE_PROVISIONED_RE.search(code):
+            notices += ABSOLUTE_PROVISIONED_PATH_NOTICE
+        return notices
+
+    def workspace_escape_guard(self, code: str) -> str:
+        """Rejection notice when ``code`` reaches outside the working dir; "" if clean.
+
+        Unlike ``absolute_path_advisory`` (annotates a completed run), a hit here
+        means the run must NOT happen: the local executor shares a filesystem with
+        the backend service, so a read of ``/root/.cache/...`` returns other users'
+        uploaded documents. Blocking after the fact would be pointless — the data
+        would already be in the model's context.
+
+        Two deliberate exemptions keep legitimate code running:
+
+        - Matching is VERB-anchored, so prose stays legal: a script may print
+          "nothing under /root/.cache" without being rejected; only an actual
+          ``open`` / ``os.walk`` / ``glob`` against a host root trips it.
+        - A literal under ``local_sync_path`` is this run's OWN workspace written
+          absolutely. ``path_namespace_rules`` shows the model exactly such host
+          paths, so rejecting them would break the thing we told it to expect.
+        """
+        if not code:
+            return ""
+        work_dir = (self.local_sync_path or "").rstrip("/")
+        for match in _HOST_PATH_ACCESS_RE.finditer(code):
+            path = match.group(2)
+            if work_dir and (path == work_dir or path.startswith(f"{work_dir}/")):
+                continue
+            return WORKSPACE_ESCAPE_NOTICE
+        # `~` and `/` are never the workspace, so no exemption applies.
+        if _HOME_EXPANSION_RE.search(code) or _ROOT_SCAN_RE.search(code):
+            return WORKSPACE_ESCAPE_NOTICE
+        return ""
+
+    @staticmethod
+    def relocation_advisory(moved: list[tuple[str, str]]) -> str:
+        """Corrective notice listing ``(old_rel, new_rel)`` relocations into
+        ``output/``; empty string when nothing was moved.
+
+        Paired with the relocation itself (not a substitute for it): the move is
+        what makes the file deliverable, the notice is what keeps the model's
+        follow-up reads from hitting a path that no longer exists.
+        """
+        if not moved:
+            return ""
+        lines = "\n".join(f"- {old} -> {new}" for old, new in moved)
+        return RELOCATED_PATH_NOTICE_HEADER + lines
+
+    def sync_to_workspace(self, dir_path: str, rel_paths: list[str]) -> int:
+        """Mirror this run's files into the session workspace prefix. Returns the count.
+
+        The executor writes to a LOCAL working dir that is deleted when the task
+        ends (``_cleanup_resources``), while ``workspace/<svid>/`` in object storage
+        is what the file tools (``ls`` / ``read_file``) actually see and what the
+        next turn inherits via ``seed_workspace_from_previous``. Without this
+        mirror a code-generated deliverable exists ONLY on that local disk, which
+        produced two long-standing defects:
+
+          * the model cannot ``ls`` the file it just wrote (the prompt had to carry
+            an explicit "trust exitcode 0, do not go looking for it" caveat);
+          * a follow-up turn runs under a fresh svid whose workspace seeds from the
+            previous one's ``output/`` — empty, because nothing was ever written
+            there — so "把封面加个副标题" finds no deck and can only regenerate.
+
+        Deletions are deliberately NOT mirrored: this runs off a created/modified
+        diff, and reconciling removals would mean trusting a partially-failed run
+        to delete objects the harvester may still need.
+
+        Best-effort by design — a mirror failure must never fail the run. The local
+        copy is still what ``get_final_result_file`` harvests, so the user gets the
+        deliverable either way.
+        """
+        if not self.minio or not self.workspace_prefix or not rel_paths:
+            return 0
+
+        bucket = self.minio.get("public_bucket") or "bisheng"
+        prefix = self.workspace_prefix.strip("/")
+        try:
+            minio_client = self._minio_client()
+        except Exception:
+            logger.exception("workspace mirror: minio client init failed; local copy is unaffected")
+            return 0
+
+        synced = 0
+        for rel in rel_paths:
+            # Normalise once: a leading slash would make os.path.join return the
+            # absolute path and silently skip the file.
+            rel_key = rel.replace(os.sep, "/").lstrip("/")
+            local_path = os.path.join(dir_path, rel_key)
+            if not os.path.isfile(local_path):
+                continue
+            object_name = f"{prefix}/{rel_key}"
+            try:
+                minio_client.fput_object(bucket_name=bucket, object_name=object_name, file_path=local_path)
+                synced += 1
+            except Exception:
+                # One unmirrored file degrades ls/continuity for that file only.
+                logger.exception("workspace mirror failed for {}", object_name)
+        if synced:
+            logger.debug("workspace mirror: {} file(s) -> {}/{}", synced, bucket, prefix)
+        return synced
+
+    def _minio_client(self) -> Minio:
+        return Minio(
+            endpoint=self.minio.get("endpoint"),
+            access_key=self.minio.get("access_key"),
+            secret_key=self.minio.get("secret_key"),
+            secure=self.minio.get("schema") or self.minio.get("secure"),
+            cert_check=self.minio.get("cert_check"),
+        )
+
+    def upload_minio(
+        self,
+        object_name: str,
+        file_path,
+    ) -> str:
+        # 初始化minio
+        if not self.minio:
+            return ""
+
+        minio_client = Minio(
+            endpoint=self.minio.get("endpoint"),
+            access_key=self.minio.get("access_key"),
+            secret_key=self.minio.get("secret_key"),
+            secure=self.minio.get("schema") or self.minio.get("secure"),
+            cert_check=self.minio.get("cert_check"),
+        )
+        minio_share = Minio(
+            endpoint=self.minio.get("sharepoint"),
+            access_key=self.minio.get("access_key"),
+            secret_key=self.minio.get("secret_key"),
+            secure=self.minio.get("share_schema", False),
+            cert_check=self.minio.get("share_cert_check", False),
+        )
+        bucket = self.minio.get("tmp_bucket", "tmp-dir")
+        logger.debug(
+            "upload_file obj={} bucket={} file_path={}",
+            object_name,
+            bucket,
+            file_path,
+        )
+        minio_client.fput_object(
+            bucket_name=bucket,
+            object_name=object_name,
+            file_path=file_path,
+        )
+        return minio_share.presigned_get_object(
+            bucket_name=bucket,
+            object_name=object_name,
+            expires=timedelta(days=7),
+        )
+
+    def close(self) -> None:
+        pass

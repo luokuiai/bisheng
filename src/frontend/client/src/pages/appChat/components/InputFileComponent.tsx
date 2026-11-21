@@ -1,0 +1,268 @@
+// @ts-strict-ignore
+import type { WorkflowFileFieldProps } from '@bisheng/chat';
+import type { ReactNode } from 'react';
+
+import { FileSearch2, Loader2 } from "lucide-react";
+import { useContext, useEffect, useRef, useState } from "react";
+import { bishengConfState } from "../store/atoms";
+import { useRecoilState } from "recoil";
+import { useToastContext } from "~/Providers";
+import { Button } from "~/components";
+import { uploadFile, uploadFileWithProgress } from "~/api/apps";
+import useLocalize from "~/hooks/useLocalize";
+import { normalizeSuffixList } from "../fileAcceptUtils";
+
+interface InputFileComponentProps {
+    renderControl?: (props: WorkflowFileFieldProps) => ReactNode;
+    value?: string;
+    onChange: (name: string) => void;
+    disabled?: boolean;
+    suffixes?: string | readonly string[];
+    fileTypes?: unknown;
+    placeholder?: string;
+    onFileChange: (value: unknown) => void;
+    editNode?: boolean;
+    isSSO?: boolean;
+    multiple?: boolean;
+    flow?: unknown;
+}
+export default function InputFileComponent({
+    value,
+    onChange,
+    disabled,
+    suffixes = [],
+    fileTypes,
+    placeholder = 'The current file is empty',
+    onFileChange,
+    editNode = false,
+    isSSO = false,
+    multiple = false,
+    flow,
+    renderControl,
+}: InputFileComponentProps) {
+    const t = useLocalize()
+    const [myValue, setMyValue] = useState(value);
+    const [loading, setLoading] = useState(false);
+    useEffect(() => {
+        if (disabled) {
+            setMyValue("");
+            onChange("");
+            onFileChange("");
+        }
+    }, [disabled, onChange]);
+
+    // Two callers, two shapes. The skill form passes an array of extensions off
+    // the node template; the workflow form passes the already-joined accept
+    // string from fileAcceptToInputAccept(). The component used to call
+    // suffixes.join(",") unconditionally, which threw `join is not a function`
+    // on the workflow form — that, not the picker mechanics, is why its upload
+    // field did nothing. Normalize once so neither consumer has to care.
+    const suffixList = normalizeSuffixList(suffixes);
+    const acceptAttr = suffixList.join(",");
+
+    function checkFileType(fileName: string): boolean {
+        return suffixList.length === 0 || suffixList.some((suffix) => fileName.toLowerCase().endsWith(suffix.trim().toLowerCase()));
+    }
+
+    useEffect(() => {
+        setMyValue(value);
+    }, [value]);
+
+    const [bishengConfig] = useRecoilState(bishengConfState)
+
+    const { showToast } = useToastContext();
+
+    const checkFileSize = (file) => {
+        const maxSize = (bishengConfig?.uploaded_files_maximum_size || 50) * 1024 * 1024;
+        if (file.size > maxSize) {
+            return t('com_inputfile_exceed_limit', { 0: file.name, 1: (bishengConfig?.uploaded_files_maximum_size || 50) })
+        }
+        return ''
+    }
+
+    // A real input rendered into the tree, opened through this ref. The previous
+    // version built a detached `display:none` input and called .click() on it —
+    // a node that is in no document and explicitly not displayed, which browsers
+    // are free to ignore, and did: the workflow form's upload field opened
+    // nothing at all. Every other file field in this app renders its input in
+    // JSX; this one now matches.
+    const inputRef = useRef<HTMLInputElement>(null);
+
+    const handleButtonClick = () => {
+        if (disabled) return;
+        inputRef.current?.click();
+    };
+
+    const singleUpload = (file: File | undefined) => {
+        if (!file) return;
+        setLoading(true);
+
+        {
+            const errorMsg = checkFileSize(file)
+            if (errorMsg) {
+                showToast({ message: errorMsg, status: 'warning' });
+
+                return setLoading(false);
+            }
+            // Types are validated by the picker handler before an upload starts.
+            isSSO ? uploadFileWithProgress(file, (progress) => { }).then(res => {
+                setLoading(false);
+                
+                if (typeof res === 'string') return showToast({ message: res, status: 'warning' });
+                const { file_path } = res;
+                setMyValue(file.name);
+                onChange(file.name);
+                // sets the value that goes to the backend
+                onFileChange(file_path);
+            }) : uploadFile(file, flow.id)
+                .then((data) => {
+                    console.log("File uploaded successfully");
+                    // Get the file name from the response
+                    const { file_path } = data.data;
+
+                    // Update the state and callback with the name of the file
+                    // sets the value to the user
+                    setMyValue(file.name);
+                    onChange(file.name);
+                    // sets the value that goes to the backend
+                    onFileChange(file_path);
+                    setLoading(false);
+                })
+                .catch(() => {
+                    console.error("Error occurred while uploading file");
+                    setLoading(false);
+                });
+        }
+    };
+
+    const batchUpload = (_files: readonly File[] | null) => {
+        {
+            setLoading(true);
+
+            if (_files && _files.length > 0) {
+                const filePaths = []; // This will hold the file paths after successful upload
+
+                const errorMsgs = []
+                const files = []
+                for (let i = 0; i < _files.length; i++) {
+                    const errorMsg = checkFileSize(_files[i])
+                    errorMsg ? errorMsgs.push(errorMsg) : files.push(_files[i])
+                }
+
+                if (errorMsgs.length) {
+                    showToast({ message: errorMsgs.join('\n'), status: 'warning' });
+
+
+                    // Stop when every selected file exceeds the size limit.
+                    if (errorMsgs.length === _files.length) {
+                        return setLoading(false);
+                    }
+                }
+
+                const fileNames = Array.from(files).map(file => file.name); // Extract file names
+
+                // Perform the upload for each file
+                const uploadPromises = Array.from(files).map(file => {
+                    return isSSO
+                        ? uploadFileWithProgress(file, (progress) => { }) // Adjust upload method if needed
+                            .then(res => {
+                                if (typeof res === 'string') {
+                                    // setErrorData({ title: "Error", list: [res] });
+                                    showToast({ message: res, status: 'warning' });
+
+                                    setLoading(false);
+                                    throw new Error(res); // Exit the upload if error occurs
+                                }
+                                return res.file_path
+                            })
+                        : uploadFile(file, flow.id).then((data) => {
+                            console.log("File uploaded successfully");
+                            return data.data.file_path
+                        });
+                });
+
+                // Wait for all file uploads to finish
+                Promise.all(uploadPromises)
+                    .then((filePaths) => {
+                        // After all files are uploaded successfully, update the state
+                        setMyValue(fileNames.join(",")); // Join file names with commas
+                        onChange(fileNames); // Pass an array of file names
+                        onFileChange(filePaths); // Pass an array of file paths
+
+                        setLoading(false); // Hide loading state
+                    })
+                    .catch((error) => {
+                        console.error("Error occurred while uploading files", error);
+                        setLoading(false); // Hide loading state if an error occurs
+                    });
+            } else {
+                showToast({ message: t('com_inputfile_no_file_selected'), status: 'warning' });
+
+                setLoading(false); // Hide loading state if no files were selected
+            }
+        }
+    };
+
+    const handleFilesPicked = (event: React.ChangeEvent<HTMLInputElement>) => {
+        const picked = Array.from(event.target.files ?? []);
+        // Snapshot the files before resetting the picker, including rejected selections.
+        event.target.value = "";
+        if (disabled || loading || !picked.length) return;
+        const allowed = picked.filter(file => checkFileType(file.name));
+        if (allowed.length !== picked.length) {
+            showToast({ message: t('com_ui_upload_file_type_error'), status: 'warning' });
+        }
+        if (!allowed.length) return;
+        if (multiple) {
+            batchUpload(allowed);
+        } else {
+            singleUpload(allowed[0]);
+        }
+    };
+
+    if (renderControl) return <>
+        <input ref={inputRef} type="file" className="hidden" accept={acceptAttr} multiple={multiple}
+            disabled={disabled || loading} onChange={handleFilesPicked} />
+        {renderControl({ value: myValue, placeholder, disabled, loading, onClick: handleButtonClick })}
+    </>;
+
+    return (
+        <div className={disabled ? "input-component-div" : "w-full"}>
+            <input
+                ref={inputRef}
+                type="file"
+                className="hidden"
+                accept={acceptAttr}
+                multiple={multiple}
+                disabled={disabled}
+                onChange={handleFilesPicked}
+            />
+            <div className="input-file-component flex items-center gap-2 border bg-search-input rounded-md px-2 justify-between">
+                <span
+                    onClick={handleButtonClick}
+                    className={
+                        editNode
+                            ? "input-edit-node input-dialog text-muted-foreground"
+                            : disabled
+                                ? "input-disable input-dialog input-primary"
+                                : "w-full input-dialog input-primary text-muted-foreground cursor-pointer"
+                    }
+                >
+                    {myValue !== "" ? myValue : placeholder}
+                </span>
+                <Button size="icon" variant="ghost" onClick={handleButtonClick}>
+                    {!editNode && !loading && (
+                        <FileSearch2
+                            strokeWidth={1.5}
+                            size={18}
+                            className={
+                                (disabled ? " text-ring " : " hover:text-accent-foreground")
+                            }
+                        />
+                    )}
+                    {!editNode && loading && (<Loader2 className="text-primary animate-spin duration-300 pointer-events-none" />)}
+                </Button>
+            </div>
+        </div>
+    );
+}

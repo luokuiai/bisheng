@@ -1,0 +1,525 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { type InformationSource, type SourceType } from "~/api/channels";
+import {
+    ChannelBusinessType,
+    getChannelsApi,
+    listManagerSourcesApi,
+    searchManagerSourcesApi,
+    SortType,
+    type ManagerSource,
+    addWechatSourceApi
+} from "~/api/channels";
+import { useLocalize } from "~/hooks";
+import { useEffectiveQuota } from "~/hooks/useEffectiveQuota";
+import { useConfirm } from "~/Providers";
+import { isApiError } from "@bisheng/api-client";
+import { normalizeUrlForSearch } from "../urlNormalize";
+
+const PAGE_SIZE = 20;
+
+function looksLikeUrl(s: string): boolean {
+    const t = s.trim();
+    // 支持：
+    // - 带协议的完整 URL：https://example.com/xxx
+    // - 不带协议的域名/路径：home.cofco.com 或 home.cofco.com/path
+    return (
+        /^https?:\/\//i.test(t) ||
+        /^([a-z0-9-]+\.)+[a-z]{2,}(\/[^\s]*)?$/i.test(t)
+    );
+}
+
+function looksLikeWechatArticleUrl(s: string): boolean {
+    return s.trim().toLowerCase().includes("mp.weixin.qq.com/");
+}
+
+export type ViewMode = "list" | "noResultNonUrl" | "noResultUrl" | "wechatProcessing";
+
+export function useSourceManager(
+    sources: InformationSource[],
+    onSourcesChange: (sources: InformationSource[]) => void,
+    expanded: boolean,
+    onExpandChange: (v: boolean) => void
+) {
+    const [activeTab, setActiveTab] = useState<SourceType>("official_account");
+    const [searchKeyword, setSearchKeyword] = useState("");
+    // Bumped on every submit. Re-pressing Enter on an unchanged link leaves
+    // searchKeyword identical, so without this the effect below never re-runs
+    // and the retry silently does nothing.
+    const [submitSeq, setSubmitSeq] = useState(0);
+    const [pendingSources, setPendingSources] = useState<InformationSource[]>([]);
+    const [wechatSources, setWechatSources] = useState<InformationSource[]>([]);
+    const [websiteSources, setWebsiteSources] = useState<InformationSource[]>([]);
+    const [loadingSources, setLoadingSources] = useState(false);
+    const [sourceListError, setSourceListError] = useState<unknown>(null);
+    const [failedMore, setFailedMore] = useState(false);
+    const [retrySeq, setRetrySeq] = useState(0);
+    const requestKey = `${expanded}:${activeTab}:${searchKeyword}`;
+    const requestKeyRef = useRef(requestKey);
+    requestKeyRef.current = requestKey;
+    const recordListError = (error: unknown, more = false) => {
+        if (isApiError(error) && error.kind === 'canceled') return;
+        setSourceListError(error);
+        setFailedMore(more);
+    };
+    const [listPageMap, setListPageMap] = useState<Record<ChannelBusinessType, number>>({
+        wechat: 1,
+        website: 1,
+    });
+    const [listHasMoreMap, setListHasMoreMap] = useState<Record<ChannelBusinessType, boolean>>({
+        wechat: true,
+        website: true,
+    });
+    const [searchPage, setSearchPage] = useState(1);
+    const [searchHasMore, setSearchHasMore] = useState(true);
+    const prevExpanded = useRef(false);
+    const processingWechatRef = useRef("");
+    const wechatRequestTokenRef = useRef(0);
+    const wechatAbortRef = useRef<AbortController | null>(null);
+    // Sticky until the next attempt: after the user dismisses the error dialog,
+    // the processing panel stays up but swaps its copy for "fix the link, then
+    // press Enter" guidance instead of the "adding…" spinner state.
+    const [wechatLinkFailed, setWechatLinkFailed] = useState(false);
+    const localize = useLocalize();
+    const confirm = useConfirm();
+
+    // Dead-end notice when a pasted WeChat article URL cannot be read: single
+    // "back to edit" action, no cancel — the user's only move is to fix the link.
+    const showWechatLinkError = () => {
+        setWechatLinkFailed(true);
+        void confirm({
+            title: localize("com_subscription.wechat_link_unrecognized_title"),
+            description: localize("com_subscription.wechat_link_unrecognized_desc"),
+            confirmText: localize("com_subscription.back_to_edit"),
+            hideCancel: true,
+        });
+    };
+
+    const invalidateWechatRequest = useCallback((token: number) => {
+        if (wechatRequestTokenRef.current === token) wechatRequestTokenRef.current++;
+    }, []);
+
+    const abortWechatRequest = () => {
+        wechatAbortRef.current?.abort();
+        wechatAbortRef.current = null;
+    };
+
+    // Sync pending sources when panel opens
+    useEffect(() => {
+        if (expanded && !prevExpanded.current) setPendingSources([...sources]);
+        prevExpanded.current = expanded;
+    }, [expanded, sources]);
+
+    // 爬取/新增的信源会先进入父级 sources → pendingSources，可能尚未出现在管理端搜索接口结果里；
+    // 合并进展示列表，否则 URL 搜索仍会判定「无结果」而卡在「网站尚未入库」页。
+    const mergedWechat = useMemo(() => {
+        const ids = new Set(wechatSources.map((s) => s.id));
+        const extra = pendingSources.filter(
+            (s) => s.type === "official_account" && !ids.has(s.id)
+        );
+        return extra.length ? [...wechatSources, ...extra] : wechatSources;
+    }, [wechatSources, pendingSources]);
+
+    const mergedWebsite = useMemo(() => {
+        const ids = new Set(websiteSources.map((s) => s.id));
+        const extra = pendingSources.filter((s) => s.type === "website" && !ids.has(s.id));
+        return extra.length ? [...websiteSources, ...extra] : websiteSources;
+    }, [websiteSources, pendingSources]);
+
+    const filteredSources = useMemo(() => {
+        const kw = searchKeyword.trim().toLowerCase();
+        const kwNorm = normalizeUrlForSearch(searchKeyword);
+        if (!kw) {
+            return activeTab === "official_account" ? mergedWechat : mergedWebsite;
+        }
+        const combined = [...mergedWechat, ...mergedWebsite];
+        return combined.filter(
+            (s) =>
+                s.name.toLowerCase().includes(kw) ||
+                (s.url && (
+                    s.url.toLowerCase().includes(kw) ||
+                    normalizeUrlForSearch(s.url).includes(kwNorm)
+                ))
+        );
+    }, [activeTab, searchKeyword, mergedWechat, mergedWebsite]);
+
+    const isSearchMode = searchKeyword.trim().length > 0;
+    const workingSources = expanded ? pendingSources : sources;
+    const selectedIds = new Set(workingSources.map((s) => s.id));
+    // Source count is no longer hard-capped on the front end. The real ceiling is
+    // the backend / external API-key quota, which rejects over-quota subscriptions
+    // (errcode 19007) on save; the number shown in the UI is just a default reference.
+    const canSelectMore = true;
+    const isAtLimit = false;
+
+    // `info_source_subscribe` role quota preview: mirrors the backend's own dedup
+    // check (QuotaService.check_info_source_subscribe_limit) — usage is the union
+    // of source ids across every channel the user has created, so a source already
+    // used by another of the user's channels never consumes an extra slot here.
+    // Legacy roles without this key saved yet must still read as the product
+    // default (200), not "unlimited" — only an explicit backend value (including
+    // an explicit -1 for admin exemption) overrides it.
+    const INFO_SOURCE_SUBSCRIBE_DEFAULT_LIMIT = 200;
+    const { quotas } = useEffectiveQuota();
+    const sourceQuotaLimit = quotas["info_source_subscribe"]?.effective ?? INFO_SOURCE_SUBSCRIBE_DEFAULT_LIMIT;
+    const { data: ownedChannels = [] } = useQuery({
+        queryKey: ["channels", "created", SortType.RECENT_UPDATE],
+        queryFn: () => getChannelsApi({ type: "created", sortBy: SortType.RECENT_UPDATE }),
+        staleTime: 30_000,
+    });
+    const otherUsedSourceIds = useMemo(() => {
+        const ids = new Set<string>();
+        ownedChannels.forEach((c) => (c.source_list || []).forEach((id) => ids.add(id)));
+        return ids;
+    }, [ownedChannels]);
+    const sourceQuotaUsedIds = useMemo(() => {
+        const ids = new Set(otherUsedSourceIds);
+        pendingSources.forEach((s) => ids.add(s.id));
+        return ids;
+    }, [otherUsedSourceIds, pendingSources]);
+    const sourceQuotaUsed = sourceQuotaUsedIds.size;
+    // A source not already counted (neither used elsewhere nor already pending)
+    // is blocked only once adding it would push the deduped total past the limit.
+    const isSourceQuotaBlocked = (sourceId: string) => {
+        if (sourceQuotaLimit === -1) return false;
+        if (sourceQuotaUsedIds.has(sourceId)) return false;
+        return sourceQuotaUsed >= sourceQuotaLimit;
+    };
+
+    // 当外部 sources 在面板展开期间新增时（例如通过爬取新网址信源），
+    // 自动将新增的信源合并进 pendingSources，并保持选中态。
+    useEffect(() => {
+        if (!expanded) return;
+        if (!sources || sources.length === 0) return;
+        setPendingSources((prev) => {
+            const map = new Map(prev.map((s) => [s.id, s]));
+            let changed = false;
+            for (const s of sources) {
+                if (!map.has(s.id)) {
+                    map.set(s.id, s);
+                    changed = true;
+                }
+            }
+            return changed ? Array.from(map.values()) : prev;
+        });
+    }, [expanded, sources]);
+
+    const viewMode: ViewMode = useMemo(() => {
+        if (loadingSources || sourceListError || !searchKeyword.trim()) return "list";
+        if (filteredSources.length > 0) return "list";
+        if (looksLikeWechatArticleUrl(searchKeyword)) return "wechatProcessing";
+        return looksLikeUrl(searchKeyword) ? "noResultUrl" : "noResultNonUrl";
+    }, [searchKeyword, filteredSources.length, loadingSources, sourceListError]);
+
+    // Load source list from API
+    useEffect(() => {
+        if (!expanded) return;
+        if (searchKeyword.trim()) return;
+        let active = true;
+        setSourceListError(null);
+        const load = async (business_type: ChannelBusinessType) => {
+            setLoadingSources(true);
+            try {
+                const res = await listManagerSourcesApi({ business_type, page: 1, page_size: PAGE_SIZE });
+                if (!active) return;
+                const mapped: InformationSource[] = (res.sources || []).map((s: ManagerSource) => ({
+                    id: s.id,
+                    name: s.name,
+                    avatar: s.icon,
+                    url: s.original_url,
+                    type: s.business_type === "wechat" ? "official_account" : "website"
+                }));
+                if (business_type === "wechat") setWechatSources(mapped);
+                else setWebsiteSources(mapped);
+                setListPageMap((prev) => ({ ...prev, [business_type]: 1 }));
+                setListHasMoreMap((prev) => ({
+                    ...prev,
+                    [business_type]: res.total > mapped.length,
+                }));
+            } catch (error) {
+                if (active) recordListError(error);
+            } finally {
+                if (active) setLoadingSources(false);
+            }
+        };
+        const currentType: ChannelBusinessType =
+            activeTab === "official_account" ? "wechat" : "website";
+        void load(currentType);
+        return () => { active = false; };
+    }, [expanded, activeTab, searchKeyword, retrySeq]);
+
+    useEffect(() => {
+        if (!expanded) return;
+        const kw = searchKeyword.trim();
+        if (!kw) return;
+
+        let active = true;
+        setSourceListError(null);
+        const load = async () => {
+            setLoadingSources(true);
+            try {
+                const res = await searchManagerSourcesApi({
+                    keyword: kw,
+                    page: 1,
+                    page_size: PAGE_SIZE,
+                });
+                if (!active) return;
+                const mapped: InformationSource[] = (res.sources || []).map((s: ManagerSource) => ({
+                    id: s.id,
+                    name: s.name,
+                    avatar: s.icon,
+                    url: s.original_url,
+                    type: s.business_type === "wechat" ? "official_account" : "website"
+                }));
+                const wechat = mapped.filter((s) => s.type === "official_account");
+                const website = mapped.filter((s) => s.type === "website");
+                setWechatSources(wechat);
+                setWebsiteSources(website);
+                setSearchPage(1);
+                setSearchHasMore(res.total > mapped.length);
+            } catch (error) {
+                if (active) recordListError(error);
+            } finally {
+                if (active) setLoadingSources(false);
+            }
+        };
+
+        void load();
+        return () => { active = false; };
+    }, [expanded, searchKeyword, retrySeq]);
+
+    const loadMoreSources = async () => {
+        if (!expanded || loadingSources) return;
+        const key = requestKey;
+        setSourceListError(null);
+        const kw = searchKeyword.trim();
+
+        if (kw) {
+            if (!searchHasMore) return;
+            const nextPage = searchPage + 1;
+            setLoadingSources(true);
+            try {
+                const res = await searchManagerSourcesApi({
+                    keyword: kw,
+                    page: nextPage,
+                    page_size: PAGE_SIZE,
+                });
+                if (requestKeyRef.current !== key) return;
+                const mapped: InformationSource[] = (res.sources || []).map((s: ManagerSource) => ({
+                    id: s.id,
+                    name: s.name,
+                    avatar: s.icon,
+                    url: s.original_url,
+                    type: s.business_type === "wechat" ? "official_account" : "website",
+                }));
+                const wechat = mapped.filter((s) => s.type === "official_account");
+                const website = mapped.filter((s) => s.type === "website");
+                setWechatSources((prev) => {
+                    const idSet = new Set(prev.map((s) => s.id));
+                    return [...prev, ...wechat.filter((s) => !idSet.has(s.id))];
+                });
+                setWebsiteSources((prev) => {
+                    const idSet = new Set(prev.map((s) => s.id));
+                    return [...prev, ...website.filter((s) => !idSet.has(s.id))];
+                });
+                setSearchPage(nextPage);
+                setSearchHasMore(nextPage * PAGE_SIZE < res.total);
+            } catch (error) {
+                if (requestKeyRef.current === key) recordListError(error, true);
+            } finally {
+                if (requestKeyRef.current === key) setLoadingSources(false);
+            }
+            return;
+        }
+
+        const business_type: ChannelBusinessType = activeTab === "official_account" ? "wechat" : "website";
+        if (!listHasMoreMap[business_type]) return;
+
+        const nextPage = (listPageMap[business_type] || 1) + 1;
+        setLoadingSources(true);
+        try {
+            const res = await listManagerSourcesApi({
+                business_type,
+                page: nextPage,
+                page_size: PAGE_SIZE,
+            });
+            if (requestKeyRef.current !== key) return;
+            const mapped: InformationSource[] = (res.sources || []).map((s: ManagerSource) => ({
+                id: s.id,
+                name: s.name,
+                avatar: s.icon,
+                url: s.original_url,
+                type: s.business_type === "wechat" ? "official_account" : "website",
+            }));
+            if (business_type === "wechat") {
+                setWechatSources((prev) => {
+                    const idSet = new Set(prev.map((s) => s.id));
+                    return [...prev, ...mapped.filter((s) => !idSet.has(s.id))];
+                });
+            } else {
+                setWebsiteSources((prev) => {
+                    const idSet = new Set(prev.map((s) => s.id));
+                    return [...prev, ...mapped.filter((s) => !idSet.has(s.id))];
+                });
+            }
+            setListPageMap((prev) => ({ ...prev, [business_type]: nextPage }));
+            setListHasMoreMap((prev) => ({
+                ...prev,
+                [business_type]: nextPage * PAGE_SIZE < res.total,
+            }));
+        } catch (error) {
+            if (requestKeyRef.current === key) recordListError(error, true);
+        } finally {
+            if (requestKeyRef.current === key) setLoadingSources(false);
+        }
+    };
+
+    const retrySources = () => {
+        if (loadingSources) return;
+        if (failedMore) return loadMoreSources();
+        setRetrySeq(n => n + 1);
+    };
+
+    // Auto-detect and process WeChat article URLs
+    useEffect(() => {
+        if (!expanded) return;
+        if (viewMode !== "wechatProcessing") {
+            processingWechatRef.current = "";
+            return;
+        }
+        const target = searchKeyword.trim();
+        // Keyed by submit, not by the link: the same link submitted again is a
+        // deliberate retry, while a re-render mid-flight is not.
+        const attempt = `${submitSeq}:${target}`;
+        if (!target || processingWechatRef.current === attempt) return;
+        processingWechatRef.current = attempt;
+        const token = ++wechatRequestTokenRef.current;
+
+        const timer = setTimeout(() => {
+            (async () => {
+                try {
+                    setWechatLinkFailed(false);
+                    // Abort previous in-flight request (if any) and create a new controller for this run
+                    abortWechatRequest();
+                    const controller = new AbortController();
+                    wechatAbortRef.current = controller;
+
+                    const res = await addWechatSourceApi({ url: target }, { signal: controller.signal });
+                    if (wechatRequestTokenRef.current !== token) return;
+                    const root: any = res as any;
+                    const statusCode = root?.status_code ?? root?.code;
+                    if (statusCode && statusCode !== 200) {
+                        showWechatLinkError();
+                        return;
+                    }
+                    const raw: any = root?.data ?? root ?? {};
+                    const created: InformationSource = {
+                        id: String(raw.id ?? raw.source_id ?? `wx-${Date.now()}`),
+                        // 后端返回 name/title，否则退回为固定文案“公众号内容源”
+                        name: String(raw.name ?? raw.title ?? localize("com_subscription.official_account_content_source")),
+                        // 兼容后端不同字段命名，避免首次添加时头像丢失
+                        avatar: raw.avatar ?? raw.icon ?? raw.source_icon,
+                        url: raw.url ?? target,
+                        type: "official_account"
+                    };
+                    setWechatSources((prev) => {
+                        if (prev.some((s) => s.id === created.id)) return prev;
+                        return [...prev, created];
+                    });
+                    setPendingSources((prev) => {
+                        if (prev.some((s) => s.id === created.id || s.url === created.url)) return prev;
+                        return [...prev, created];
+                    });
+                } catch (error) {
+                    if (wechatRequestTokenRef.current !== token) return;
+                    if (isApiError(error) && (error.kind === 'canceled' || error.presentation === 'global')) return;
+                    showWechatLinkError();
+                    if (isApiError(error)) error.presentation = 'inline';
+                } finally {
+                    if (wechatRequestTokenRef.current !== token) return;
+                    // Clear controller for this run
+                    wechatAbortRef.current = null;
+                    processingWechatRef.current = "";
+                }
+            })();
+        }, 1800);
+
+        return () => {
+            clearTimeout(timer);
+            invalidateWechatRequest(token);
+            // If effect is cleaned up (keyword changes/unmount), abort request
+            abortWechatRequest();
+        };
+    }, [expanded, viewMode, searchKeyword, submitSeq, invalidateWechatRequest]);
+
+    const toggleSource = (source: InformationSource) => {
+        if (selectedIds.has(source.id)) {
+            const next = workingSources.filter((s) => s.id !== source.id);
+            if (expanded) setPendingSources(next);
+            else onSourcesChange(next);
+        } else if (canSelectMore && !isSourceQuotaBlocked(source.id)) {
+            const next = [...workingSources, source];
+            if (expanded) setPendingSources(next);
+            else onSourcesChange(next);
+        }
+    };
+
+    const handleClearSearch = () => {
+        // 用户点击「暂不添加」/清空搜索：让当前公众号添加流程失效，避免异步返回后仍被加入
+        wechatRequestTokenRef.current++;
+        processingWechatRef.current = "";
+        abortWechatRequest();
+        setWechatLinkFailed(false);
+        setSearchKeyword("");
+    };
+
+    const handleConfirm = () => {
+        onSourcesChange([...pendingSources]);
+        onExpandChange(false);
+        setSearchKeyword("");
+    };
+
+    const handleCancel = () => {
+        // 用户点击「取消」关闭面板时，也要让当前公众号添加流程失效
+        // 否则异步返回后仍可能把公众号加进 pendingSources
+        wechatRequestTokenRef.current++;
+        processingWechatRef.current = "";
+        abortWechatRequest();
+        onExpandChange(false);
+        setSearchKeyword("");
+    };
+
+    /** Submit the box's contents. Re-submitting the same link counts as a
+     *  fresh attempt, which is what makes "fix nothing and press Enter" retry. */
+    const submitSearch = (value: string) => {
+        // Clear the failure copy here rather than waiting for the debounced
+        // request to start, so the panel reacts on the keypress.
+        setWechatLinkFailed(false);
+        setSearchKeyword(value);
+        setSubmitSeq((n) => n + 1);
+    };
+
+    return {
+        activeTab, setActiveTab,
+        searchKeyword, setSearchKeyword,
+        submitSearch,
+        pendingSources,
+        loadingSources,
+        sourceListError,
+        retrySources,
+        filteredSources,
+        isSearchMode,
+        selectedIds,
+        isAtLimit,
+        sourceQuotaUsed,
+        sourceQuotaLimit,
+        isSourceQuotaBlocked,
+        viewMode,
+        toggleSource,
+        loadMoreSources,
+        handleClearSearch,
+        handleConfirm,
+        handleCancel,
+        wechatLinkFailed,
+    };
+}

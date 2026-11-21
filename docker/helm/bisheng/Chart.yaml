@@ -1,0 +1,9 @@
+apiVersion: v2
+name: bisheng
+description: BiSheng platform — frontend, API, and Celery worker.
+type: application
+version: 0.1.2
+appVersion: v3.0.2
+keywords:
+  - bisheng
+  - llm

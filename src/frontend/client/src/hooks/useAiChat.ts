@@ -1,0 +1,1345 @@
+/**
+ * Core chat state hook — manages messages, submission, and SSE lifecycle.
+ * Uses useState/useRef for local state, Recoil only for shared atoms (chatModel, searchType).
+ */
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useRecoilState } from "recoil";
+import { v4 } from "uuid";
+import type { ConversationData, TConversation } from "~/types/chat";
+import { QueryKeys, dataService } from "~/types/chat";
+import { addConversation, updateConvoFields } from "~/utils";
+import store from "~/store";
+import type { SelectedOrgKb } from "~/store/modeltype";
+import { useAuthContext } from "~/hooks/AuthContext";
+import { knowledgeSpaceTagFilters } from "~/utils/knowledgeTagSelection";
+import { canProcessChatImage } from "~/common/chatAccept";
+import { useKnowledgeSpaceAccess } from "~/hooks/useKnowledgeSpaceAccess";
+import { useConversationKnowledge } from "~/hooks/useConversationKnowledge";
+import { useLocalize } from "~/hooks";
+import { useToastContext } from "~/Providers";
+import type { ChatMessage } from "~/api/chatApi";
+import { getAgentMessages, getSessionName } from "~/api/chatApi";
+import { openChatStream, type SSESubmission } from "~/hooks/useAiChatSSE";
+import { useGetBsConfig } from "~/hooks/queries/data-provider";
+import { useLinsightManager } from "~/hooks/useLinsightManager";
+import { startLinsight, getLinsightSessionVersionList } from "~/api/linsight";
+import { SopStatus, taskModeSkillsState } from "~/store/linsight";
+import { isMediaAttachmentFile, type MediaParsingState } from "~/utils/mediaAttachmentUtils";
+
+/**
+ * Turns that are still generating, across every mounted chat surface.
+ *
+ * A turn belongs to its conversation, not to whatever is on screen. Keeping the
+ * handles module-level is what lets the user read another chat — or leave this
+ * one — without the answer being cancelled behind them: nothing here is torn
+ * down by a component effect.
+ *
+ * The key carries an owner id as well as the conversation, so the workstation
+ * view and the subscription AI dock cannot collide on "new" or close each
+ * other's turns when one of them unmounts.
+ */
+type LiveStream = { convoId: string; close: () => void };
+const liveStreams = new Map<string, LiveStream>();
+const streamKey = (ownerId: string, conversationId: string) => `${ownerId}::${conversationId}`;
+const EMPTY_MESSAGES: ChatMessage[] = [];
+
+/**
+ * Close every live turn for a conversation, whoever opened it.
+ *
+ * Switching conversations no longer closes anything, so deleting one has to say
+ * so explicitly — otherwise the backend goes on generating an answer that has
+ * nowhere left to be stored.
+ */
+export function closeChatStream(conversationId: string): void {
+    for (const [key, stream] of [...liveStreams]) {
+        if (stream.convoId !== conversationId) continue;
+        liveStreams.delete(key);
+        stream.close();
+    }
+}
+
+const NO_PARENT = "00000000-0000-0000-0000-000000000000";
+
+/** Poll cadence for the post-handoff attachment fetch (see the handoff handler).
+ *
+ * Two-speed on purpose. A small batch lands in seconds and deserves a snappy
+ * first paint; a big one is the reason this poll exists at all — 12 bid PDFs
+ * measured 19 minutes of ETL — and a fixed fast cadence would have to run for
+ * hundreds of round-trips to cover it. So: fast while the common case plays out,
+ * then back off and simply outlast the slow case.
+ *
+ * The deadline is a real bound, not a guess at the worst case: the per-file ETL
+ * ceiling is 600s (settings.etl4lm.timeout) and the batch size is capped by the
+ * folder-upload limits, so a pathological batch CAN outlive 30 minutes. Past the
+ * deadline the drawer degrades to "visible after a refresh", which is where it
+ * was before this poll existed — never to a timer that runs for the session's
+ * lifetime. */
+const INGEST_POLL_FAST_MS = 3000;
+const INGEST_POLL_SLOW_MS = 15000;
+/** Round-trips kept at the fast cadence before backing off (~1 minute). */
+const INGEST_POLL_FAST_ATTEMPTS = 20;
+const INGEST_POLL_DEADLINE_MS = 30 * 60 * 1000;
+/** Backend SessionVersionStatusEnum values after which nothing will be ingested. */
+const TERMINAL_SV_STATUSES = new Set([
+    "completed",
+    "failed",
+    "terminated",
+    "sop_generation_failed",
+]);
+
+/** The fields of an input-box attachment that decide whether it can be sent.
+    Backends disagree on the path key (filepath / file_path / file_url), so all
+    three count as "the upload landed somewhere we can point at". */
+interface OutgoingAttachment {
+    filepath?: string;
+    file_path?: string;
+    file_url?: string;
+    valid?: boolean;
+    name?: string;
+    filename?: string;
+    file_name?: string;
+}
+
+export default function useAiChat(initialConversationId: string = "new", isLingsi: boolean = false, shareToken: string = "", draftScope = "chat") {
+    const [historyError, setHistoryError] = useState<unknown>(null);
+    const [historyReload, setHistoryReload] = useState(0);
+    const retryHistory = () => setHistoryReload(value => value + 1);
+    const localize = useLocalize();
+    const { showToast } = useToastContext();
+    // --- Local state ---
+    // Bucketed by conversation: switching only changes which bucket renders, so
+    // a turn the user walked away from keeps writing into its own.
+    const [messagesByConvo, setMessagesByConvo] = useState<Record<string, ChatMessage[]>>({});
+    const [titleByConvo, setTitleByConvo] = useState<Record<string, string>>({});
+    const [streamingByConvo, setStreamingByConvo] = useState<Record<string, boolean>>({});
+    const [loadingByConvo, setLoadingByConvo] = useState<Record<string, boolean>>({});
+    const [parsingMediaByConvo, setParsingMediaByConvo] = useState<Record<string, boolean>>({});
+    const [conversationId, setConversationId] = useState(initialConversationId);
+
+    // What the caller sees: the active conversation's slice of the above.
+    const messages = messagesByConvo[conversationId] ?? EMPTY_MESSAGES;
+    const title = titleByConvo[conversationId] ?? "";
+    const isStreaming = !!streamingByConvo[conversationId];
+    const isLoading = !!loadingByConvo[conversationId];
+    const isParsingMedia = !!parsingMediaByConvo[conversationId];
+
+    // Identifies this hook instance inside the shared registry.
+    const ownerIdRef = useRef<string>("");
+    if (!ownerIdRef.current) ownerIdRef.current = v4();
+
+    // Every write names the conversation it targets, because a turn's callbacks
+    // may well fire while the user is reading a different chat.
+    const setMessagesFor = useCallback(
+        (cid: string, updater: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[])) => {
+            setMessagesByConvo((prev) => {
+                const cur = prev[cid] ?? EMPTY_MESSAGES;
+                const next = typeof updater === "function" ? updater(cur) : updater;
+                return next === cur ? prev : { ...prev, [cid]: next };
+            });
+        },
+        [],
+    );
+    const setTitleFor = useCallback(
+        (cid: string, updater: string | ((prev: string) => string)) => {
+            setTitleByConvo((prev) => {
+                const cur = prev[cid] ?? "";
+                const next = typeof updater === "function" ? updater(cur) : updater;
+                return next === cur ? prev : { ...prev, [cid]: next };
+            });
+        },
+        [],
+    );
+    const setStreamingFor = useCallback((cid: string, value: boolean) => {
+        setStreamingByConvo((prev) => (!!prev[cid] === value ? prev : { ...prev, [cid]: value }));
+    }, []);
+    const setLoadingFor = useCallback((cid: string, value: boolean) => {
+        setLoadingByConvo((prev) => (!!prev[cid] === value ? prev : { ...prev, [cid]: value }));
+    }, []);
+    const setParsingMediaFor = useCallback((cid: string, value: boolean) => {
+        setParsingMediaByConvo((prev) => (!!prev[cid] === value ? prev : { ...prev, [cid]: value }));
+    }, []);
+
+    /** Move a turn's buckets when it learns its real conversation id, so the
+     *  answer the user is watching is still there once the URL catches up. */
+    const promoteBucket = useCallback((from: string, to: string) => {
+        if (!to || to === from) return;
+        const move = <T,>(prev: Record<string, T>): Record<string, T> => {
+            if (!(from in prev)) return prev;
+            const { [from]: carried, ...rest } = prev;
+            return { ...rest, [to]: carried };
+        };
+        setMessagesByConvo(move);
+        setTitleByConvo(move);
+        setStreamingByConvo(move);
+        setLoadingByConvo(move);
+        setParsingMediaByConvo(move);
+    }, []);
+
+    // The viewed conversation's writers, for everything outside a turn (loading
+    // history, clearing, the switch effect).
+    const setMessages = useCallback(
+        (updater: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[])) =>
+            setMessagesFor(conversationId, updater),
+        [conversationId, setMessagesFor],
+    );
+    const setTitle = useCallback(
+        (updater: string | ((prev: string) => string)) => setTitleFor(conversationId, updater),
+        [conversationId, setTitleFor],
+    );
+    const setIsStreaming = useCallback(
+        (value: boolean) => setStreamingFor(conversationId, value),
+        [conversationId, setStreamingFor],
+    );
+    const setIsLoading = useCallback(
+        (value: boolean) => setLoadingFor(conversationId, value),
+        [conversationId, setLoadingFor],
+    );
+    const setIsParsingMedia = useCallback(
+        (value: boolean) => setParsingMediaFor(conversationId, value),
+        [conversationId, setParsingMediaFor],
+    );
+
+    // Refs for accessing latest state in callbacks
+    const messagesRef = useRef<ChatMessage[]>([]);
+    messagesRef.current = messages;
+
+    // Shared Recoil atoms
+    const [chatModel] = useRecoilState(store.chatModel);
+    const [searchType] = useRecoilState(store.searchType);
+    // v2.5 Agent-mode: tools toggled on in the chat input bar. Non-empty
+    // means the backend dispatcher routes to the LangGraph Agent flow (which
+    // emits the new ChatResponse SSE format). Empty array keeps us on the
+    // legacy flow so existing tests / old clients aren't disrupted.
+    const [selectedAgentTools] = useRecoilState(store.selectedAgentTools);
+    // Task-mode requests carry the explicit skill selection.
+    const [dailyTaskSkills] = useRecoilState(taskModeSkillsState('new'));
+    // Admin-level org-KB toggle. Knowledge spaces remain available even when
+    // the org knowledge base feature is disabled, so we only strip org ids.
+    const { data: bsConfig } = useGetBsConfig();
+    const { user } = useAuthContext();
+    const knowledgeDefaults = useMemo<SelectedOrgKb[]>(() => bsConfig?.knowledgeBase?.enabled === false
+        ? [] : (bsConfig?.orgKbs ?? []).filter((kb) => kb.default_checked)
+            .map((kb) => ({ id: String(kb.id), name: kb.name, type: 'org' })), [bsConfig]);
+    const { selectedOrgKbs: savedKnowledge, setSelectedOrgKbs, promoteSelection } = useConversationKnowledge(
+        user?.id == null ? undefined : String(user.id), conversationId, knowledgeDefaults,
+        bsConfig?.knowledgeBase?.enabled !== false, draftScope,
+    );
+
+    const { available: selectedOrgKbs, message: knowledgeAccessMessage, blocked: knowledgeAccessBlocked } =
+        useKnowledgeSpaceAccess(savedKnowledge, `${draftScope}:${conversationId}`, !shareToken);
+
+    const queryClient = useQueryClient();
+
+    // F035 Track J (TJ-6): task-mode turns reuse the linsight execution machinery
+    // (createLinsight seeds the per-SV store, startLinsight kicks off the run, the
+    // inline task bubble hosts the WS). The turn stays in THIS daily conversation.
+    const { createLinsight, updateLinsight } = useLinsightManager();
+
+    // --- SSE hook ---
+    /**
+     * Open a turn and register it under the conversation it belongs to.
+     *
+     * The returned closer is what `stopGenerating`, deleting a conversation and
+     * a real unmount reach for. Nothing else closes a turn — in particular,
+     * switching conversations does not.
+     */
+    const beginStream = useCallback(
+        (cid: string, submission: SSESubmission) => {
+            const ownerId = ownerIdRef.current;
+            const previous = liveStreams.get(streamKey(ownerId, cid));
+            previous?.close();
+            const handle = openChatStream(submission, localize);
+            liveStreams.set(streamKey(ownerId, cid), { convoId: cid, close: handle.close });
+        },
+        [localize],
+    );
+
+    /** Close a turn if one is live for this conversation, and forget it. */
+    const endStream = useCallback((cid: string) => {
+        const key = streamKey(ownerIdRef.current, cid);
+        const stream = liveStreams.get(key);
+        if (!stream) return;
+        stream.close();
+        liveStreams.delete(key);
+    }, []);
+
+    /** A turn opened on "new" gets its real id mid-stream; move its registration
+     *  across so the closer still reaches it. */
+    const promoteStream = useCallback((from: string, to: string) => {
+        if (!to || to === from) return;
+        const ownerId = ownerIdRef.current;
+        const stream = liveStreams.get(streamKey(ownerId, from));
+        if (!stream) return;
+        stream.convoId = to;
+        liveStreams.delete(streamKey(ownerId, from));
+        liveStreams.set(streamKey(ownerId, to), stream);
+    }, []);
+
+    /** Move a turn, and the view, onto the id the server just gave it.
+     *
+     *  Everything a turn owns is keyed by the conversation it started in, and
+     *  what the caller renders is the bucket of whichever id is current. So the
+     *  id can never move on its own: point the view at a fresh id without
+     *  carrying the bucket and the pane goes blank on content that is still
+     *  there, while the bucket left behind resurfaces the next time someone
+     *  opens a new chat. Both happened — this is one call so neither half can
+     *  be forgotten again.
+     */
+    const adoptConversationId = useCallback(
+        (turn: { cid: string; knowledge: SelectedOrgKb[] }, next: string) => {
+            if (!next || next === turn.cid) return;
+            const previousId = turn.cid;
+            promoteSelection(previousId, next, turn.knowledge);
+            promoteBucket(turn.cid, next);
+            promoteStream(turn.cid, next);
+            turn.cid = next;
+            setConversationId((current) => current === previousId ? next : current);
+        },
+        [promoteBucket, promoteStream, promoteSelection],
+    );
+
+    // Every live turn belongs to the page, not to this component's lifetime —
+    // but when the page really does go away, they go with it.
+    useEffect(
+        () => () => {
+            const prefix = `${ownerIdRef.current}::`;
+            for (const [key, stream] of [...liveStreams]) {
+                if (!key.startsWith(prefix)) continue;
+                stream.close();
+                liveStreams.delete(key);
+            }
+        },
+        [],
+    );
+
+    // F035 Track J (TJ-6): after a task handoff we bind the conversation to the
+    // freshly-minted chat_id, which would normally trigger a history refetch.
+    // But the bot task row isn't persisted yet (the worker writes it at execution
+    // start), so a refetch here returns ONLY the user question and CLOBBERS the
+    // optimistic task turn — the panel vanishes ("jumps back to empty daily").
+    // This ref tells the load effect to skip exactly that one refetch; the live
+    // optimistic message + linsightMapState are authoritative for this turn.
+    const skipLoadConvoRef = useRef<string | null>(null);
+
+    // Track previous external ID to distinguish sidebar navigation from self-navigate
+    const [previousExternalId, setPreviousExternalId] = useState(initialConversationId);
+    const internalConvoIdRef = useRef(conversationId);
+    internalConvoIdRef.current = conversationId;
+
+    // Timer for the post-handoff attachment poll. `generation` fences a request
+    // that is already in flight: clearing the timeout alone would still let its
+    // `.then` re-arm a new one after we unmounted or switched conversations.
+    // One poll per conversation, not one for "the" conversation. It used to be a
+    // single timer cancelled on every switch, which was correct only while one
+    // chat could be live at a time. With buckets, a poll started in A must keep
+    // running while the user reads B and must write back into A — cancelling it
+    // on switch would strand A's attachments mid-parse, and letting it write to
+    // whatever is on screen would put A's files in B's messages.
+    const ingestPollsRef = useRef<
+        Map<string, { timer: ReturnType<typeof setTimeout> | null; generation: number }>
+    >(new Map());
+    const ingestPollFor = useCallback((cid: string) => {
+        let entry = ingestPollsRef.current.get(cid);
+        if (!entry) {
+            entry = { timer: null, generation: 0 };
+            ingestPollsRef.current.set(cid, entry);
+        }
+        return entry;
+    }, []);
+    const cancelIngestPoll = useCallback(
+        (cid: string) => {
+            const entry = ingestPollFor(cid);
+            if (entry.timer) {
+                clearTimeout(entry.timer);
+                entry.timer = null;
+            }
+            // Fences a request already in flight: clearing the timeout alone
+            // would still let its `.then` re-arm a new one.
+            entry.generation += 1;
+        },
+        [ingestPollFor],
+    );
+    // Only a real unmount stops every poll. Switching conversations does not.
+    useEffect(
+        () => () => {
+            for (const entry of ingestPollsRef.current.values()) {
+                if (entry.timer) clearTimeout(entry.timer);
+                entry.generation += 1;
+            }
+            ingestPollsRef.current.clear();
+        },
+        [],
+    );
+
+    // Resolve sidebar navigation during render so the composer, its callbacks,
+    // and the message bucket commit with the same conversation identity.
+    if (previousExternalId !== initialConversationId) {
+        setPreviousExternalId(initialConversationId);
+        if (initialConversationId !== conversationId) {
+            const arrivingIsLive = !!streamingByConvo[initialConversationId]
+                || !!liveStreams.get(streamKey(ownerIdRef.current, initialConversationId));
+            setLoadingFor(initialConversationId, initialConversationId !== "new" && !arrivingIsLive);
+            skipLoadConvoRef.current = null;
+            setConversationId(initialConversationId);
+        }
+    }
+
+    // --- Load existing messages when conversationId changes ---
+    // Only re-runs when conversationId itself changes — NOT when streaming ends.
+    // (isStreaming intentionally excluded from deps: when SSE creates a new convo
+    // mid-stream we set the conversationId during streaming; if we re-ran on
+    // streaming end we'd refetch and overwrite the just-streamed messages,
+    // causing a visible flash on the first reply of a new chat.)
+    useEffect(() => {
+        setHistoryError(null);
+        if (isStreaming) return;
+        if (!conversationId || conversationId === "new") {
+            return;
+        }
+        // F035 Track J: skip the one post-handoff refetch that would clobber the
+        // optimistic task turn (see skipLoadConvoRef). Consume the guard so a
+        // genuine later navigation back to this convo still reloads normally.
+        if (conversationId === skipLoadConvoRef.current) {
+            skipLoadConvoRef.current = null;
+            setIsLoading(false);
+            return;
+        }
+        setIsLoading(true);
+        // v2.5: use the native Agent-mode history endpoint.
+        // Returns ChatMessage[] with category + structured fields (reasoning,
+        // tool_calls, steps, thinking_segments) already expanded; legacy
+        // regenerate siblings are pre-collapsed server-side.
+        let active = true;
+        getAgentMessages(conversationId, shareToken || undefined)
+            .then((msgs) => {
+                if (!active) return;
+                setMessages(msgs);
+                setIsLoading(false);
+            })
+            .catch((err) => {
+                if (!active) return;
+                setHistoryError(err);
+                setIsLoading(false);
+            });
+        return () => { active = false; };
+        // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally exclude isStreaming
+    }, [conversationId, shareToken, historyReload]);
+
+    // Load the conversation's stored name. The history endpoints return messages
+    // only, so opening an existing conversation by URL (deep link or share link)
+    // left `title` empty and HeaderTitle fell back to "New Chat" — even though
+    // the sidebar list showed the real name.
+    //
+    // Guarded against clobbering a freshly generated title: skip while streaming
+    // (a brand-new conversation's row still says "New Chat" until gen_title
+    // lands) and never overwrite a title we already hold.
+    useEffect(() => {
+        if (isStreaming) return;
+        if (!conversationId || conversationId === "new") return;
+        let cancelled = false;
+        getSessionName(conversationId, shareToken || undefined)
+            .then((name) => {
+                if (cancelled || !name) return;
+                setTitle((prev) => (prev ? prev : name));
+            })
+            .catch(() => {
+                // Non-critical: the header keeps the "New Chat" fallback.
+            });
+        return () => {
+            cancelled = true;
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally exclude isStreaming
+    }, [conversationId, shareToken]);
+
+    // v2.5 Module B: agent flow renders a flat list keyed by category;
+    // messagesTree + buildMessageTree were only needed by the legacy
+    // SiblingSwitch UI which is no longer shown (ChatView passes flatMode).
+    // The (still-used) legacy Messages/* component chain imports
+    // buildMessageTree directly from chatApi, so only this local indirection
+    // is removed.
+
+    // --- Send a message ---
+    const finishMediaParsing = useCallback((userMsgId: string) => {
+        setIsParsingMedia(false);
+        setMessages((prev) => {
+            let matched = false;
+            const next = prev.map((m) => {
+                if (!m.isCreatedByUser || !m.files?.length) return m;
+                const hasParsingMedia = m.files.some(
+                    (f) => isMediaAttachmentFile(f) && f.parsingState === 'parsing',
+                );
+                if (!hasParsingMedia) return m;
+                const matchesTarget =
+                    m.messageId === userMsgId || String(m.messageId) === String(userMsgId);
+                if (!matchesTarget) return m;
+                matched = true;
+                return {
+                    ...m,
+                    files: m.files.map((f) =>
+                        isMediaAttachmentFile(f)
+                            ? { ...f, parsingState: 'done' as MediaParsingState }
+                            : f,
+                    ),
+                };
+            });
+            if (matched) return next;
+
+            for (let i = next.length - 1; i >= 0; i -= 1) {
+                const m = next[i];
+                if (
+                    !m.isCreatedByUser
+                    || !m.files?.some((f) => isMediaAttachmentFile(f) && f.parsingState === 'parsing')
+                ) {
+                    continue;
+                }
+                next[i] = {
+                    ...m,
+                    files: m.files!.map((f) =>
+                        isMediaAttachmentFile(f)
+                            ? { ...f, parsingState: 'done' as MediaParsingState }
+                            : f,
+                    ),
+                };
+                break;
+            }
+            return next;
+        });
+    }, [setIsParsingMedia, setMessages]);
+
+    const sendMessage = useCallback(
+        (text: string, files?: any[] | null, opts?: { taskMode?: boolean }) => {
+            if ((!text.trim() && !(files?.length)) || isStreaming) return false;
+            if (knowledgeAccessBlocked) {
+                showToast({ message: knowledgeAccessMessage, status: "warning" });
+                return false;
+            }
+            if (opts?.taskMode && selectedOrgKbs.some(item => item.type === 'space' && item.tag)) {
+                showToast({ message: localize("com_knowledge.tag_filter_daily_only"), status: "warning" });
+                return false;
+            }
+            const vision = bsConfig?.models?.some(model => String(model.id) === String(chatModel.id) && model.visual) ?? false;
+            if (!opts?.taskMode && !isLingsi && files?.some(file => !canProcessChatImage(
+                file.name || file.filename || file.file_name || '', vision, !!bsConfig?.enable_etl4lm,
+            ))) {
+                showToast({ message: localize("chatImage.processingRequired"), status: "warning" });
+                return false;
+            }
+            // This turn belongs to the conversation it started in, and every
+            // write below must land there even if the user walks away mid-answer.
+            // Shadowing the viewed-conversation writers with turn-scoped ones is
+            // what makes that true for all of the callbacks at once: `turn.cid`
+            // is the single place the id lives, so a mid-stream promotion from
+            // "new" to a real id carries the whole turn with it.
+            const turn = { cid: conversationId, knowledge: selectedOrgKbs };
+            setSelectedOrgKbs(turn.knowledge);
+            const setMessages = (updater: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[])) =>
+                setMessagesFor(turn.cid, updater);
+            const setTitle = (updater: string | ((prev: string) => string)) =>
+                setTitleFor(turn.cid, updater);
+            const setIsStreaming = (value: boolean) => setStreamingFor(turn.cid, value);
+            const setIsParsingMedia = (value: boolean) => setParsingMediaFor(turn.cid, value);
+
+
+            const taskMode = !!opts?.taskMode;
+
+            // An attachment whose upload never landed carries no storage path. It
+            // used to be sent anyway: the backend stored it as an attachment with
+            // no object name, the model never saw it, and on render the bubble
+            // showed "图片已失效" — so the user got an answer that quietly ignored
+            // one of their files. Block the send and name the offender instead.
+            const stranded = ((files ?? []) as OutgoingAttachment[]).filter(
+                (f) => f && (f.valid === false || !(f.filepath || f.file_path || f.file_url)),
+            );
+            if (stranded.length) {
+                showToast({
+                    message: localize("com_error_file_upload_incomplete", {
+                        0: stranded.map((f) => f.name || f.filename || f.file_name || "").join("、"),
+                    }),
+                    status: "warning",
+                });
+                return false;
+            }
+
+            const filesForDisplay = (files ?? []).map((f) =>
+                isMediaAttachmentFile(f) ? { ...f, parsingState: 'parsing' as MediaParsingState } : f,
+            );
+            const hasMediaAttachments = filesForDisplay.some(isMediaAttachmentFile);
+            if (hasMediaAttachments) {
+                setIsParsingMedia(true);
+            }
+
+            // Strip blob preview URLs and UI-only parsing flags before SSE payload.
+            const cleanFiles = filesForDisplay.map(
+                ({ previewUrl, mediaPreviewUrl, mediaCoverUrl, parsingState, ...rest }) => rest,
+            );
+
+            const parentMsg = messagesRef.current[messagesRef.current.length - 1];
+            const parentMessageId = parentMsg?.messageId ?? NO_PARENT;
+            const currentConvoId =
+                conversationId === "new" ? null : conversationId;
+            // Track whether this send started a new conversation (for genTitle)
+            const wasNewConvo = conversationId === "new";
+
+            // Create user message
+            const userMessageId = v4();
+            const userMessage: ChatMessage = {
+                text: text.trim(),
+                sender: "User",
+                clientTimestamp: new Date().toLocaleString("sv").replace(" ", "T"),
+                isCreatedByUser: true,
+                parentMessageId,
+                conversationId: currentConvoId ?? "",
+                messageId: userMessageId,
+                error: false,
+                files: filesForDisplay,
+            };
+
+            // Create placeholder response
+            const responseMessageId = `${userMessageId}_`;
+            const initialResponse: ChatMessage = {
+                text: "",
+                sender: chatModel.name || "AI",
+                isCreatedByUser: false,
+                parentMessageId: userMessageId,
+                conversationId: currentConvoId ?? "",
+                messageId: responseMessageId,
+                error: false,
+            };
+
+            // Add both messages immediately
+            const updatedMessages = [...messagesRef.current, userMessage, initialResponse];
+            setMessages(updatedMessages);
+
+            // Build SSE payload (same structure as useChatFunctions.ask).
+            // Backend expects List[int] for both id fields; selections hold strings
+            // so we coerce via Number here.
+            const orgKbDisabled = (bsConfig as any)?.knowledgeBase?.enabled === false;
+            const orgKbs = orgKbDisabled
+                ? []
+                : selectedOrgKbs.filter((kb) => kb.type === 'org').map((kb) => Number(kb.id));
+            const spaceKbs = selectedOrgKbs
+                .filter((kb) => kb.type === 'space')
+                .map((kb) => Number(kb.id));
+            const payload = {
+                text: text.trim(),
+                clientTimestamp: new Date().toLocaleString("sv").replace(" ", "T"),
+                parentMessageId,
+                conversationId: currentConvoId,
+                messageId: userMessageId,
+                endpoint: "",
+                endpointType: "custom",
+                model: chatModel.id + "",
+                use_knowledge_base: {
+                    personal_knowledge_enabled: false,
+                    organization_knowledge_ids: orgKbs,
+                    knowledge_space_ids: spaceKbs,
+                    knowledge_space_tag_filters: knowledgeSpaceTagFilters(selectedOrgKbs),
+                },
+                isContinued: false,
+                isTemporary: false,
+                files: cleanFiles,
+                // v2.5: present `tools` array → backend agent flow.
+                // Absent (null/undefined) → legacy flow. We always send the
+                // field when the user has toggled any tool on.
+                tools: selectedAgentTools.flatMap((g) =>
+                    (g.children || []).map((c) => ({
+                        id: c.id,
+                        tool_key: c.tool_key,
+                        type: "tool",
+                    })),
+                ),
+                linsight: isLingsi,
+                // F035 Track J (TJ-6): route this turn to the linsight task kernel
+                // via the SAME unified entry. Backend replies with a handoff event.
+                task_mode: taskMode,
+                // Ordinary turns carry an empty skill selection.
+                skills: taskMode ? dailyTaskSkills.map((s) => s.name) : [],
+                skill_ids: taskMode ? dailyTaskSkills.flatMap((s) => (typeof s.id === 'number' ? [s.id] : [])) : [],
+            };
+
+            // Correlation key for the user (question) message. Starts as the
+            // client-side temp UUID, then gets promoted to the real persisted
+            // DB id once the backend's `created` event delivers it (see
+            // onCreated). Kept in sync so later callbacks (onFinal) and the
+            // F028 export selection address the question by its real id rather
+            // than a temp value the backend never persisted.
+            let realUserMessageId = userMessageId;
+
+            // Create SSE submission
+            const submission: SSESubmission = {
+                payload,
+                userMessage,
+                onStart: () => {
+                    console.log('[AiChat] SSE stream started');
+                    setIsStreaming(true);
+                },
+                onCreated: (newConvoId, mergedUser) => {
+                    console.log('[AiChat] created:', newConvoId, mergedUser);
+                    // Only update conversationId if we got a valid value
+                    if (newConvoId && newConvoId !== "") {
+                        // A content-safety block (and any other turn that finishes
+                        // in the same tick the id is minted) lands here with
+                        // isStreaming already false. The history effect would then
+                        // treat it as a cold open and replace the live turn with
+                        // the blank loader. Skip that one refetch.
+                        if (newConvoId !== turn.cid) {
+                            skipLoadConvoRef.current = newConvoId;
+                        }
+                        adoptConversationId(turn, newConvoId);
+
+                        // Only add placeholder for brand-new conversations to avoid
+                        // overwriting an existing conversation's generated title.
+                        if (wasNewConvo) {
+                            const placeholderConvo = {
+                                conversationId: newConvoId,
+                                title: localize('com_ui_new_chat'),
+                                createdAt: new Date().toISOString(),
+                                updatedAt: new Date().toISOString(),
+                                model: chatModel.name || '',
+                                endpoint: '',
+                                endpointType: 'custom',
+                                isArchived: false,
+                                tags: [],
+                            } as unknown as TConversation;
+
+                            queryClient.setQueryData<ConversationData>(
+                                [QueryKeys.allConversations],
+                                (convoData) => {
+                                    if (!convoData) return convoData;
+                                    return addConversation(convoData, placeholderConvo);
+                                }
+                            );
+                        }
+                    }
+                    // Promote the question message to its real persisted DB id.
+                    // The `created` event carries the backend message_id in
+                    // mergedUser.messageId; older code pinned it back to the
+                    // temp UUID here, which left the question unexportable
+                    // (F028 parses messageId as an int — a UUID becomes NaN and
+                    // the whole question turn is silently dropped from exports).
+                    const serverMessageId =
+                        mergedUser.messageId != null && mergedUser.messageId !== ""
+                            ? String(mergedUser.messageId)
+                            : userMessageId;
+                    realUserMessageId = serverMessageId;
+                    setMessages((prev) =>
+                        prev.map((m) =>
+                            m.messageId === userMessageId
+                                ? { ...m, ...mergedUser, messageId: serverMessageId }
+                                : m
+                        )
+                    );
+                },
+                // F035 Track J (TJ-6): task-mode handoff. Promote the placeholder
+                // assistant turn into a `task` row pointing at the linsight SV,
+                // seed the per-SV store, and kick off execution. The inline task
+                // bubble (TJ-7) hosts the WS and renders the live run from there.
+                onTaskHandoff: ({ session_version_id: svid, chat_id }) => {
+                    if (!svid) return;
+
+                    // The handoff is the daily SSE's last act: the task now runs via
+                    // the linsight worker/WS, so the daily stream is done. Clear
+                    // isStreaming NOW instead of waiting for the stream to drop on
+                    // its own (which can lag) — otherwise the input's stop button,
+                    // gated on `isStreaming || taskRunning`, stays lit after a task
+                    // is terminated (incl. from the QueueCard) until the stale stream
+                    // finally closes. With this, taskRunning alone drives the button,
+                    // so every terminate path syncs the input immediately. (QA: stop
+                    // /cancel while queued.)
+                    setIsStreaming(false);
+
+                    // Bind this conversation (new convo: chat_id was just minted
+                    // server-side as a flow_type=15 daily session). Guard the load
+                    // effect from refetching (and clobbering) the optimistic task
+                    // turn before the worker has persisted the bot task row.
+                    if (chat_id) {
+                        skipLoadConvoRef.current = chat_id;
+                        adoptConversationId(turn, chat_id);
+                        if (wasNewConvo) {
+                            const placeholderConvo = {
+                                conversationId: chat_id,
+                                title: localize('com_ui_new_chat'),
+                                createdAt: new Date().toISOString(),
+                                updatedAt: new Date().toISOString(),
+                                model: chatModel.name || '',
+                                endpoint: '',
+                                endpointType: 'custom',
+                                isArchived: false,
+                                tags: [],
+                            } as unknown as TConversation;
+                            queryClient.setQueryData<ConversationData>(
+                                [QueryKeys.allConversations],
+                                (convoData) =>
+                                    convoData ? addConversation(convoData, placeholderConvo) : convoData,
+                            );
+                        }
+                    }
+
+                    // Seed the linsight execution store for this SV, then start it.
+                    createLinsight(svid, {
+                        status: SopStatus.SopGenerating,
+                        question: text.trim(),
+                        tasks: [],
+                        sessionSteps: [],
+                        history: [],
+                        output_result: null,
+                        file_list: [],
+                        files: [],
+                        tools: [],
+                        session_id: chat_id,
+                        version: svid,
+                        queueCount: 0,
+                        taskError: '',
+                        sopError: '',
+                        inputSop: false,
+                    } as any);
+
+                    startLinsight(svid)
+                        .then(() => updateLinsight(svid, { status: SopStatus.Running }))
+                        .catch((err) => {
+                            console.error('[AiChat] task start-execute failed:', err);
+                            updateLinsight(svid, { taskError: String(err), status: SopStatus.Stoped });
+                        });
+
+                    // The handoff event carries no files. Attachment ingest no longer
+                    // runs inside the submit request — the linsight worker materializes
+                    // uploads/* just before the run — so at handoff time this SV's row
+                    // still has files=[] and the single shot this used to be always
+                    // missed, leaving the workspace drawer (uploaded-files group +
+                    // header button) empty until a manual refresh. Poll instead: stop
+                    // as soon as the files land, stop when the run can no longer
+                    // produce any, and give up at INGEST_POLL_DEADLINE_MS so a
+                    // pathological batch degrades to "visible after refresh" rather
+                    // than to an unbounded timer.
+                    if (chat_id) {
+                        // Keyed by the turn's conversation, so it survives the
+                        // user switching away and writes back where it started.
+                        const pollCid = turn.cid;
+                        cancelIngestPoll(pollCid);
+                        const pollEntry = ingestPollFor(pollCid);
+                        const pollGeneration = pollEntry.generation;
+                        const pollDeadline = Date.now() + INGEST_POLL_DEADLINE_MS;
+                        let attempts = 0;
+                        const scheduleNextIngestPoll = () => {
+                            if (pollEntry.generation !== pollGeneration) return;
+                            if (Date.now() >= pollDeadline) return;
+                            const delay =
+                                attempts < INGEST_POLL_FAST_ATTEMPTS
+                                    ? INGEST_POLL_FAST_MS
+                                    : INGEST_POLL_SLOW_MS;
+                            pollEntry.timer = setTimeout(pollIngestedFiles, delay);
+                        };
+                        const pollIngestedFiles = () => {
+                            attempts += 1;
+                            getLinsightSessionVersionList(chat_id, '')
+                                .then((versions: any[]) => {
+                                    if (pollEntry.generation !== pollGeneration) return;
+                                    const item = (versions || []).find((v: any) => v.id === svid);
+                                    if (item?.files?.length) {
+                                        updateLinsight(svid, {
+                                            files: item.files.map((f: any) => ({
+                                                ...f,
+                                                file_name: decodeURIComponent(f.original_filename),
+                                            })),
+                                        } as any);
+
+                                        // Stamp the user question's attachment chips with each
+                                        // file's parse result so a failed attachment shows its
+                                        // failed state live (not only after a refresh).
+                                        const statusById = new Map<string, any>(
+                                            item.files
+                                                .filter((f: any) => f?.file_id != null)
+                                                .map((f: any) => [String(f.file_id), f]),
+                                        );
+                                        setMessages((prev) =>
+                                            prev.map((m) =>
+                                                m.messageId === realUserMessageId && m.files?.length
+                                                    ? {
+                                                          ...m,
+                                                          files: m.files.map((mf: any) => {
+                                                              const p = statusById.get(String(mf.file_id));
+                                                              return p
+                                                                  ? {
+                                                                        ...mf,
+                                                                        valid: p.valid,
+                                                                        parsing_status: p.parsing_status,
+                                                                        error_message: p.error_message,
+                                                                        ...(p.cover_filepath
+                                                                            ? { cover_filepath: p.cover_filepath }
+                                                                            : {}),
+                                                                    }
+                                                                  : mf;
+                                                          }),
+                                                      }
+                                                    : m,
+                                            ),
+                                        );
+                                        return;
+                                    }
+                                    // A terminated / failed / completed run will never
+                                    // ingest anything more; keeping the timer alive would
+                                    // just poll a settled row for two minutes.
+                                    if (item && TERMINAL_SV_STATUSES.has(item.status)) return;
+                                    scheduleNextIngestPoll();
+                                })
+                                .catch(() => {
+                                    // best-effort: drawer still works after refresh
+                                    scheduleNextIngestPoll();
+                                });
+                        };
+                        pollIngestedFiles();
+                    }
+
+                    // Promote the placeholder assistant row to a task turn so the
+                    // bubble renders the embedded execution panel by SV.
+                    setMessages((prev) => {
+                        return prev.map((m) =>
+                            m.messageId === responseMessageId
+                                ? {
+                                      ...m,
+                                      category: 'task',
+                                      linsightSessionVersionId: svid,
+                                      conversationId: chat_id || m.conversationId,
+                                      unfinished: true,
+                                  }
+                                : m,
+                        );
+                    });
+
+                    // New task conversations have no daily `final` event to drive
+                    // title generation — request it explicitly. The gen_title
+                    // endpoint waits until the backend has persisted a real name,
+                    // so this no longer races slow models.
+                    if (wasNewConvo && chat_id) {
+                        dataService.genTitle({ conversationId: chat_id })
+                            .then((res: { title?: string }) => {
+                                if (!res?.title) return;
+                                setTitle(res.title);
+                                queryClient.setQueryData<ConversationData>(
+                                    [QueryKeys.allConversations],
+                                    (convoData) =>
+                                        convoData
+                                            ? updateConvoFields(convoData, {
+                                                  conversationId: chat_id,
+                                                  title: res.title,
+                                              } as TConversation)
+                                            : convoData,
+                                );
+                            })
+                            .catch(() => { /* non-critical */ });
+                    }
+                },
+                onQuestionFilesUpdate: ({ messageId, files: updatedFiles }) => {
+                    if (!updatedFiles?.length) return;
+                    setMessages((prev) =>
+                        prev.map((m) => {
+                            if (!m.isCreatedByUser || !m.files?.length) return m;
+                            const matchesTarget =
+                                (messageId && (m.messageId === messageId || String(m.messageId) === messageId))
+                                || m.messageId === realUserMessageId
+                                || m.messageId === userMessageId;
+                            if (!matchesTarget) return m;
+                            const byKey = new Map(
+                                updatedFiles.map((f: any) => [
+                                    String(f.file_id || f.filepath || f.id || ''),
+                                    f,
+                                ]),
+                            );
+                            return {
+                                ...m,
+                                files: m.files.map((mf: any) => {
+                                    const key = String(mf.file_id || mf.filepath || mf.id || '');
+                                    const next = byKey.get(key);
+                                    if (!next?.cover_filepath) return mf;
+                                    return {
+                                        ...mf,
+                                        cover_filepath: next.cover_filepath,
+                                        parsingState: 'done' as MediaParsingState,
+                                    };
+                                }),
+                            };
+                        }),
+                    );
+                },
+                onMessage: (text, messageId) => {
+                    finishMediaParsing(realUserMessageId);
+                    console.log('[AiChat] message:', { text: text?.slice(0, 50), messageId });
+                    setMessages((prev) => {
+                        const msgs = [...prev];
+                        const lastMsg = msgs[msgs.length - 1];
+                        if (lastMsg && !lastMsg.isCreatedByUser) {
+                            msgs[msgs.length - 1] = {
+                                ...lastMsg,
+                                text,
+                                messageId: messageId || lastMsg.messageId,
+                            };
+                        }
+                        return msgs;
+                    });
+                },
+                // v2.5 Agent native update — merges structured fields so the
+                // AgentMessageBubble can render thinking / tool-calls / answer
+                // as separate sections instead of regex-parsing a `:::thinking:::`
+                // envelope.
+                onAgentUpdate: (patch) => {
+                    finishMediaParsing(realUserMessageId);
+                    setMessages((prev) => {
+                        const msgs = [...prev];
+                        const lastMsg = msgs[msgs.length - 1];
+                        if (!lastMsg || lastMsg.isCreatedByUser) return prev;
+                        msgs[msgs.length - 1] = {
+                            ...lastMsg,
+                            // Tag with agent category so the bubble switches to
+                            // native rendering. First SSE event upgrades the row;
+                            // subsequent ones just refresh fields.
+                            category: patch.category ?? lastMsg.category ?? "agent_answer",
+                            ...(patch.messageId ? { messageId: patch.messageId } : {}),
+                            ...(patch.text != null ? { text: patch.text } : {}),
+                            ...(patch.events ? { events: patch.events } : {}),
+                            ...(patch.finalised ? { unfinished: false } : {}),
+                        };
+                        return msgs;
+                    });
+                },
+
+                onFinal: (data) => {
+                    setMessages((prev) => {
+                        const msgs = [...prev];
+                        // Update with final response data if available
+                        if (data.responseMessage) {
+                            const lastMsg = msgs[msgs.length - 1];
+                            if (lastMsg && !lastMsg.isCreatedByUser) {
+                                msgs[msgs.length - 1] = {
+                                    ...lastMsg,
+                                    ...data.responseMessage,
+                                };
+                            }
+                        }
+                        if (data.requestMessage) {
+                            // Match by the (possibly promoted) real id first,
+                            // falling back to the temp UUID for the window
+                            // before `created` landed. onCreated may already
+                            // have swapped the question's messageId to the real
+                            // DB id, so a plain userMessageId lookup would miss.
+                            const userIdx = msgs.findIndex(
+                                (m) =>
+                                    m.messageId === realUserMessageId ||
+                                    m.messageId === userMessageId
+                            );
+                            if (userIdx >= 0 && data.requestMessage) {
+                                msgs[userIdx] = { ...msgs[userIdx], ...data.requestMessage };
+                            }
+                        }
+                        return msgs;
+                    });
+                    if (data.conversation?.conversationId) {
+                        if (data.conversation.conversationId !== turn.cid) {
+                            skipLoadConvoRef.current = data.conversation.conversationId;
+                        }
+                        adoptConversationId(turn, data.conversation.conversationId);
+                    }
+                    // New conversation: fetch the AI-generated title. The gen_title
+                    // endpoint waits until the backend's background task persists a
+                    // real name, so this no longer races slow models (>5s).
+                    const finalConvoId = data.conversation?.conversationId || internalConvoIdRef.current;
+                    if (wasNewConvo && finalConvoId && finalConvoId !== 'new') {
+                        dataService.genTitle({ conversationId: finalConvoId })
+                            .then((res: { title?: string }) => {
+                                if (!res?.title) return;
+                                setTitle(res.title);
+                                queryClient.setQueryData<ConversationData>(
+                                    [QueryKeys.allConversations],
+                                    (convoData) => {
+                                        if (!convoData) return convoData;
+                                        return updateConvoFields(convoData, {
+                                            conversationId: finalConvoId,
+                                            title: res.title,
+                                        } as TConversation);
+                                    }
+                                );
+                            })
+                            .catch(() => {
+                                // genTitle failure is non-critical — keep 'New Chat' title
+                            });
+                    } else {
+                        // For existing conversations, hot-update title if returned in SSE final
+                        const sseTitle = data.conversation?.title || data.conversation?.flow_name;
+                        if (sseTitle && finalConvoId && finalConvoId !== 'new') {
+                            setTitle(sseTitle);
+                            queryClient.setQueryData<ConversationData>(
+                                [QueryKeys.allConversations],
+                                (convoData) => {
+                                    if (!convoData) return convoData;
+                                    return updateConvoFields(convoData, {
+                                        conversationId: finalConvoId,
+                                        title: sseTitle,
+                                    } as TConversation);
+                                }
+                            );
+                        }
+                    }
+                },
+                // The failure copy lands in `errorText`, never in `text`: the backend
+                // emits the SSE error event *before* it finishes the turn, so a stream
+                // that already produced an answer would lose it if we overwrote `text`
+                // (and the bubble would then render that answer as raw error text).
+                onError: (error, errorCode, meta) => {
+                    finishMediaParsing(realUserMessageId);
+                    setMessages((prev) => {
+                        const msgs = [...prev];
+                        const lastMsg = msgs[msgs.length - 1];
+                        if (lastMsg && !lastMsg.isCreatedByUser) {
+                            msgs[msgs.length - 1] = {
+                                ...lastMsg,
+                                errorText: error || localize("workstation.chat.answer_failed"),
+                                error: true,
+                                errorCode,
+                                errorType: meta?.errorType,
+                                errorDetail: meta?.errorDetail,
+                            };
+                        }
+                        return msgs;
+                    });
+                },
+                onEnd: () => {
+                    finishMediaParsing(realUserMessageId);
+                    setIsStreaming(false);
+                },
+            };
+
+            // Lock input immediately — don't wait for SSE open event
+            setIsStreaming(true);
+            beginStream(turn.cid, submission);
+            return true;
+        },
+        [knowledgeAccessBlocked, knowledgeAccessMessage, conversationId, isStreaming, chatModel, selectedOrgKbs, setSelectedOrgKbs, bsConfig, adoptConversationId, searchType, selectedAgentTools, dailyTaskSkills, isLingsi, createLinsight, updateLinsight, localize, showToast, queryClient, finishMediaParsing]
+    );
+
+    // --- Stop generating ---
+    const stopGenerating = useCallback(() => {
+        // Only the conversation being read. A turn generating in another one is
+        // none of this button's business.
+        endStream(conversationId);
+        cancelIngestPoll(conversationId);
+        setIsStreaming(false);
+        setIsParsingMedia(false);
+    }, [cancelIngestPoll, conversationId, endStream, setIsParsingMedia, setIsStreaming]);
+
+    // --- Clear conversation ---
+    const clearConversation = useCallback(() => {
+        stopGenerating();
+        setMessages([]);
+        setConversationId("new");
+        setTitle("");
+    }, [setMessages, setTitle, stopGenerating]);
+
+    // --- Regenerate: add a new sibling response under the same parent ---
+    const regenerate = useCallback(
+        (parentMessageId: string) => {
+            if (isStreaming) return;
+            if (knowledgeAccessBlocked) {
+                showToast({ message: knowledgeAccessMessage, status: "warning" });
+                return;
+            }
+            // This turn belongs to the conversation it started in, and every
+            // write below must land there even if the user walks away mid-answer.
+            // Shadowing the viewed-conversation writers with turn-scoped ones is
+            // what makes that true for all of the callbacks at once: `turn.cid`
+            // is the single place the id lives, so a mid-stream promotion from
+            // "new" to a real id carries the whole turn with it.
+            const turn = { cid: conversationId, knowledge: selectedOrgKbs };
+            setSelectedOrgKbs(turn.knowledge);
+            const setMessages = (updater: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[])) =>
+                setMessagesFor(turn.cid, updater);
+            const setIsStreaming = (value: boolean) => setStreamingFor(turn.cid, value);
+
+
+
+            // Find the parent (user) message
+            const parentMsg = messagesRef.current.find(
+                (m) => m.messageId === parentMessageId
+            );
+            if (!parentMsg) return;
+            const vision = bsConfig?.models?.some(model => String(model.id) === String(chatModel.id) && model.visual) ?? false;
+            if (parentMsg.files?.some(file => !canProcessChatImage(
+                file.name || file.filename || file.file_name || '', vision, !!bsConfig?.enable_etl4lm,
+            ))) {
+                showToast({ message: localize("chatImage.processingRequired"), status: "warning" });
+                return;
+            }
+
+            // Create a new placeholder response as sibling
+            const newResponseId = v4();
+            const newResponse: ChatMessage = {
+                text: "",
+                sender: chatModel.name || "AI",
+                isCreatedByUser: false,
+                parentMessageId,
+                conversationId: conversationId === "new" ? "" : conversationId,
+                messageId: newResponseId,
+                error: false,
+            };
+
+            // Add the new response to messages (as a sibling of existing responses)
+            setMessages((prev) => [...prev, newResponse]);
+
+            // Build SSE payload
+            const payload = {
+                text: parentMsg.text?.trim() || "",
+                clientTimestamp: new Date()
+                    .toLocaleString("sv")
+                    .replace(" ", "T"),
+                parentMessageId:
+                    parentMsg.parentMessageId || NO_PARENT,
+                conversationId:
+                    conversationId === "new" ? null : conversationId,
+                messageId: parentMsg.messageId,
+                endpoint: "",
+                endpointType: "custom",
+                model: chatModel.id + "",
+                use_knowledge_base: {
+                    organization_knowledge_ids: (bsConfig as any)?.knowledgeBase?.enabled === false
+                        ? []
+                        : selectedOrgKbs.filter((kb) => kb.type === 'org').map((kb) => Number(kb.id)),
+                    knowledge_space_ids: selectedOrgKbs
+                        .filter((kb) => kb.type === 'space')
+                        .map((kb) => Number(kb.id)),
+                    knowledge_space_tag_filters: knowledgeSpaceTagFilters(selectedOrgKbs),
+                },
+                isContinued: false,
+                isRegenerate: true,
+                isTemporary: false,
+                files: parentMsg.files ?? [],
+                tools: selectedAgentTools.flatMap((g) =>
+                    (g.children || []).map((c) => ({
+                        id: c.id,
+                        tool_key: c.tool_key,
+                        type: "tool",
+                    })),
+                ),
+                linsight: isLingsi,
+            };
+
+            const submission: SSESubmission = {
+                payload,
+                userMessage: parentMsg,
+                onStart: () => {
+                    console.log("[AiChat] Regenerate SSE started");
+                    setIsStreaming(true);
+                },
+                onCreated: (newConvoId) => {
+                    if (newConvoId && newConvoId !== "") {
+                        adoptConversationId(turn, newConvoId);
+                    }
+                },
+                onMessage: (text, messageId) => {
+                    setMessages((prev) => {
+                        const msgs = [...prev];
+                        const idx = msgs.findIndex(
+                            (m) => m.messageId === newResponseId
+                        );
+                        if (idx >= 0) {
+                            msgs[idx] = {
+                                ...msgs[idx],
+                                text,
+                                messageId: messageId || msgs[idx].messageId,
+                            };
+                        }
+                        return msgs;
+                    });
+                },
+                onAgentUpdate: (patch) => {
+                    setMessages((prev) => {
+                        const msgs = [...prev];
+                        const idx = msgs.findIndex(
+                            (m) => m.messageId === newResponseId,
+                        );
+                        if (idx < 0) return prev;
+                        msgs[idx] = {
+                            ...msgs[idx],
+                            category:
+                                patch.category ?? msgs[idx].category ?? "agent_answer",
+                            ...(patch.messageId ? { messageId: patch.messageId } : {}),
+                            ...(patch.text != null ? { text: patch.text } : {}),
+                            ...(patch.events ? { events: patch.events } : {}),
+                            ...(patch.finalised ? { unfinished: false } : {}),
+                        };
+                        return msgs;
+                    });
+                },
+
+                onFinal: (data) => {
+                    setMessages((prev) => {
+                        const msgs = [...prev];
+                        const idx = msgs.findIndex(
+                            (m) => m.messageId === newResponseId
+                        );
+                        if (idx >= 0 && data.responseMessage) {
+                            msgs[idx] = { ...msgs[idx], ...data.responseMessage };
+                        }
+                        return msgs;
+                    });
+                    if (data.conversation?.conversationId) {
+                        adoptConversationId(turn, data.conversation.conversationId);
+                    }
+                },
+                // Same as the send path: failure copy goes to `errorText` so a
+                // partially-streamed answer survives the error.
+                onError: (error, errorCode, meta) => {
+                    setMessages((prev) => {
+                        const msgs = [...prev];
+                        const idx = msgs.findIndex(
+                            (m) => m.messageId === newResponseId
+                        );
+                        if (idx >= 0) {
+                            msgs[idx] = {
+                                ...msgs[idx],
+                                errorText: error || localize("workstation.chat.answer_failed"),
+                                error: true,
+                                errorCode,
+                                errorType: meta?.errorType,
+                                errorDetail: meta?.errorDetail,
+                            };
+                        }
+                        return msgs;
+                    });
+                },
+                onEnd: () => {
+                    setIsStreaming(false);
+                },
+            };
+
+            setIsStreaming(true);
+            beginStream(turn.cid, submission);
+        },
+        [knowledgeAccessBlocked, knowledgeAccessMessage, conversationId, isStreaming, chatModel, selectedOrgKbs, setSelectedOrgKbs, bsConfig, adoptConversationId, searchType, selectedAgentTools, localize, showToast]
+    );
+
+    return {
+        historyError,
+        isClearing: false,
+        retryHistory,
+        // State
+        messages,
+        // Legacy alias — kept null to maintain the old destructuring shape
+        // without shipping tree-building on the hot path.
+        messagesTree: null as unknown,
+        conversationId,
+        title,
+        isLoading,
+        isStreaming,
+        isParsingMedia,
+
+        selectedOrgKbs,
+        knowledgeAccessMessage,
+        setSelectedOrgKbs,
+
+        // Actions
+        sendMessage,
+        stopGenerating,
+        clearConversation,
+        regenerate,
+        setConversationId,
+    };
+}

@@ -1,0 +1,656 @@
+from datetime import datetime
+from enum import Enum
+from typing import Any
+
+from sqlalchemy import Integer, String
+from sqlmodel import Column, DateTime, Field, Text, and_, col, func, or_, select, text
+
+from bisheng.common.models.base import SQLModelSerializable
+from bisheng.core.context.tenant import bypass_tenant_filter
+from bisheng.core.database import get_async_db_session, get_sync_db_session
+from bisheng.core.database.dialect_helpers import (
+    UPDATE_TIME_SERVER_DEFAULT,
+    JsonType,
+    json_array_contains,
+    json_object_field_equals,
+)
+from bisheng.utils import generate_uuid
+
+
+def _db_dialect() -> str:
+    try:
+        from bisheng.core.database.manager import sync_get_database_connection
+
+        return sync_get_database_connection().engine.dialect.name
+    except Exception:
+        return "mysql"
+
+
+# System Module Enumeration
+class SystemId(Enum):
+    CHAT = "chat"  # Sessions
+    BUILD = "build"  # Build.
+    KNOWLEDGE = "knowledge"  # The knowledge base upon
+    SYSTEM = "system"  # System
+    DASHBOARD = "dashboard"  # KANBAN
+    SUBSCRIPTION = "subscription"  # Subscription Management
+    KNOWLEDGE_SPACE = "knowledge_space"  # Knowledge Space
+
+
+# Action Behavior Enumeration
+class EventType(Enum):
+    CREATE_CHAT = "create_chat"  # New Session
+    DELETE_CHAT = "delete_chat"  # Delete Thread
+
+    CREATE_BUILD = "create_build"  # New App
+    UPDATE_BUILD = "update_build"  # Edit App Page
+    DELETE_BUILD = "delete_build"  # Delete App?
+
+    CREATE_KNOWLEDGE = "create_knowledge"  # New Knowledge Base
+    DELETE_KNOWLEDGE = "delete_knowledge"  # Delete Knowledge Base
+    UPLOAD_FILE = "upload_file"  # Knowledge Base Upload Files
+    DELETE_FILE = "delete_file"  # Knowledge Base Delete File
+
+    UPDATE_USER = "update_user"  # Edit account
+    FORBID_USER = "forbid_user"  # Deactivate user
+    RECOVER_USER = "recover_user"  # Enable User
+    CREATE_USER_GROUP = "create_user_group"  # Add Usergroup
+    DELETE_USER_GROUP = "delete_user_group"  # Can delete existing usergroups
+    UPDATE_USER_GROUP = "update_user_group"  # Can edit existing usergroups
+    CREATE_ROLE = "create_role"  # Create a Role
+    DELETE_ROLE = "delete_role"  # Delete a Role
+    UPDATE_ROLE = "update_role"  # Edit a Role
+
+    ADD_TOOL = "add_tool"  # Add Widget
+    UPDATE_TOOL = "update_tool"
+    UPDATE_SANDBOX_CONF = "update_sandbox_conf"
+    DELETE_TOOL = "delete_tool"
+
+    USER_LOGIN = "user_login"  # Login Pengguna
+
+    CREATE_DASHBOARD = "create_dashboard"
+    UPDATE_DASHBOARD = "update_dashboard"
+    DELETE_DASHBOARD = "delete_dashboard"
+
+    CREATE_CHANNEL = "create_channel"  # Create Subscription Channel
+    DELETE_CHANNEL = "delete_channel"
+
+    CREATE_KNOWLEDGE_SPACE = "create_knowledge_space"  # Create Knowledge Space
+    DELETE_KNOWLEDGE_SPACE = "delete_knowledge_space"  # Delete Knowledge Space
+
+    LINK_FILE_VERSION = "link_file_version"
+    SET_PRIMARY_VERSION = "set_primary_version"
+    DELETE_FILE_VERSION = "delete_file_version"
+    DISMISS_SIMILAR_FILE = "dismiss_similar_file"
+
+
+# Action object type enumeration
+class ObjectType(Enum):
+    NONE = "none"  # W/O
+    WORK_FLOW = "work_flow"  # The Workflow
+    ASSISTANT = "assistant"  # assistant
+    WORKSTATION = "workstation"  # Workstation
+    KNOWLEDGE = "knowledge"  # The knowledge base upon
+    FILE = "file"  # Doc.
+    USER_CONF = "user_conf"  # User Configuration
+    USER_GROUP_CONF = "user_group_conf"  # User Group Configuration
+    ROLE_CONF = "role_conf"  # Configuration of user roles
+    TOOL = "tool"
+    DASHBOARD = "dashboard"  # KANBAN
+    CHANNEL = "channel"  # Subscription Channel
+    KNOWLEDGE_SPACE = "knowledge_space"  # Knowledge Space
+
+
+class AuditLogBase(SQLModelSerializable):
+    """
+    Audit Log Table
+    """
+
+    operator_id: int = Field(index=True, description="Operating User'sID")
+    operator_name: str | None = Field(description="Username")
+    group_ids: list[int | str] | None = Field(
+        sa_column=Column(JsonType), description="Belongs to a user groupIDVertical"
+    )
+    system_id: str | None = Field(index=True, description="Module Item")
+    event_type: str | None = Field(index=True, description="Operation behaviors")
+    object_type: str | None = Field(index=True, description="Action object type")
+    object_id: str | None = Field(index=True, description="Operation ObjectID")
+    object_name: str | None = Field(sa_column=Column(Text), description="Action object name")
+    note: str | None = Field(sa_column=Column(Text), description="Action notes")
+    ip_address: str | None = Field(index=True, description="Client's at time of operationIP<g id='Bold'>Address:</g>")
+    # v2.5.1 F011: structured audit fields.
+    # Coexist with legacy system_id/event_type/object_* columns — old callers
+    # keep writing legacy fields (new columns NULL); new callers use the
+    # structured fields below. See spec §5.4 "字段填值规则".
+    tenant_id: int | None = Field(
+        default=None,
+        sa_column=Column(
+            Integer,
+            nullable=True,
+            index=True,
+            comment="v2.5.1: leaf tenant of the resource being acted on",
+        ),
+    )
+    operator_tenant_id: int | None = Field(
+        default=None,
+        sa_column=Column(
+            Integer,
+            nullable=True,
+            comment="v2.5.1: operator leaf (may differ from tenant_id for super-admin cross-child ops)",
+        ),
+    )
+    action: str | None = Field(
+        default=None,
+        sa_column=Column(
+            String(64),
+            nullable=True,
+            index=True,
+            comment="v2.5.1: structured action name; see spec §5.4.2 allowlist",
+        ),
+    )
+    target_type: str | None = Field(
+        default=None,
+        sa_column=Column(
+            String(32),
+            nullable=True,
+            comment="v2.5.1: tenant/department/resource/user/llm_server/llm_model/...",
+        ),
+    )
+    target_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+    reason: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+    # SQL column name stays `metadata`; Python attribute is `audit_metadata`
+    # to avoid clashing with SQLModel's declarative `metadata` attribute.
+    audit_metadata: dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(
+            "metadata",
+            JsonType,
+            nullable=True,
+            comment="v2.5.1: extended fields (from/to values, affected ids, etc.)",
+        ),
+    )
+    create_time: datetime | None = Field(
+        sa_column=Column(DateTime, nullable=False, index=True, server_default=text("CURRENT_TIMESTAMP")),
+        description="operate time",
+    )
+    update_time: datetime | None = Field(
+        default=None, sa_column=Column(DateTime, nullable=False, server_default=UPDATE_TIME_SERVER_DEFAULT)
+    )
+
+
+class AuditLog(AuditLogBase, table=True):
+    id: str = Field(default_factory=generate_uuid, primary_key=True, index=True, description="primary keyuuidFormat")
+
+
+# v2.5.1 product decision (2026-05-06): the legacy "系统操作" page surfaces
+# only a curated subset of structured actions to operators. Other v2 actions
+# (admin.scope_switch, resource.*, user.*, dept.*, llm.server.toggle_share,
+# llm.model.*) keep writing for compliance/forensics but stay hidden from
+# the UI list and filter dropdowns.
+#
+# LOCKSTEP: this tuple must equal `V2_ACTIONS` in
+# src/frontend/platform/src/controllers/API/log.ts, and every entry needs copy
+# under `log.eventTypeEnum` in all three bs.json. **Both are enforced by
+# `pnpm check-i18n`, which CI runs** — an action added here alone fails the
+# gate rather than silently becoming an event nobody can find on the audit
+# page. The frontend label key is derived from the value, never hand-written,
+# so it cannot drift from what the table looks up.
+_UI_VISIBLE_V2_ACTIONS: tuple[str, ...] = (
+    "tenant.mount",
+    "tenant.unmount",
+    "tenant.disable",
+    "llm.server.create",
+    "llm.server.update",
+    "llm.server.delete",
+    "approval.request.submit",
+    "approval.task.approve",
+    "approval.task.reject",
+    "approval.request.withdraw",
+    "approval.route.pass",
+    "approval.handler.success",
+    "approval.handler.failed",
+    "approval.exception.retry",
+    "approval.exception.assign_approver",
+    "approval.exception.cancel",
+    "approval.flow.update",
+    "approval.scenario.toggle",
+    # Extras kept for compliance/forensics (not in PRD §9.1 surface list but
+    # already in use by admin flows).
+    "approval.scenario.create",
+    "approval.exception.skip_node",
+    "approval.menu_access.revoke_grant",
+    # F049 open API auth (design D11). Registered once for all five families;
+    # grant / share_link / ws events start being written in later waves.
+    "open_api.service_account.create",
+    "open_api.service_account.update",
+    "open_api.service_account.enable",
+    "open_api.service_account.disable",
+    "open_api.service_account.delete",
+    "open_api.api_key.issue",
+    "open_api.api_key.update",
+    "open_api.api_key.revoke",
+    "open_api.api_key.revoke_all",
+    "open_api.api_key.expire",
+    "open_api.api_key.invalidate_by_subject",
+    "open_api.grant.add",
+    "open_api.grant.update",
+    "open_api.grant.remove",
+    "open_api.grant.remove_all",
+    "open_api.share_link.revoke",
+    "open_api.share_link.expire",
+    "open_api.ws.connect",
+    # F052 MCP face: one row per tools/call, plus the refusals that never
+    # reached a tool. The generic ``open_api.call`` middleware is short-circuited
+    # for that path, so this is the only writer and there is no double row.
+    "open_api.mcp.tool_call",
+    # F054 app factory (design D14 / pit 24). The hosted-application state
+    # machine, meta updates and the data-tab row edit / export (AC-56, written
+    # by AppDataService).
+    # Also lockstep with bisheng/app_runtime/domain/constants.py AppAuditAction
+    # (backend-side twin, not covered by the frontend gate).
+    "app.publish",
+    "app.publish_pending",
+    "app.manual_publish",
+    "app.stop",
+    "app.resume",
+    "app.delete",
+    "app.delete_hook_failed",
+    "app.meta_update",
+    "app.data_row_edit",
+    "app.data_export",
+    "app.data_restore",
+    # F056 governance (design D6 / K3). Written by the visibility-change audit
+    # hook that `app_runtime` registers on the F048 grant mutation path — the
+    # permission module itself never learns the `app.` namespace.
+    "app.visibility_change",
+    # F055 resource-tier admin surface (AC-45): a super admin retuned /
+    # disabled / re-enabled a tier. Under the `app.` namespace like the rest of
+    # the app factory; `target_type='resource_tier'`, `target_id=<tier code>`.
+    "app.tier_update",
+    # F055 publish pipeline (design §4.2 ⑥ / pit 21). Own action family
+    # `app.release.*`, deliberately NOT nested under F054's `app.publish` —
+    # that name is already the *state action* "the app went online", and
+    # reusing the prefix would make both the audit filter and the namespace
+    # mapping ambiguous (design D12). The namespace entry `"app": "app."`
+    # below already covers this family; do not add a second namespace.
+    # Registered in one go — `capability_declared` / `rollback` get their first
+    # writers in a later wave, and touching this whitelist twice for one
+    # feature is how a written event ends up invisible on the audit page.
+    "app.release.submit",
+    "app.release.precheck_failed",
+    "app.release.scan_blocked",
+    "app.release.version_created",
+    "app.release.approval_created",
+    "app.release.approval_exception",
+    "app.release.self_approval",
+    "app.release.approved",
+    "app.release.rejected",
+    "app.release.withdrawn",
+    "app.release.cancelled",
+    "app.release.online",
+    "app.release.pending_online",
+    "app.release.iteration_failed",
+    "app.release.schema_migration_failed",
+    "app.release.manual_publish",
+    "app.release.capability_declared",
+    "app.release.preview_started",
+    "app.release.preview_reclaimed",
+    "app.release.rollback",
+    "app.secret.set",
+    "app.secret.delete",
+    "app.secret.rebuild",
+)
+
+# Synthetic system_id namespace → action prefix. The frontend `getModulesApi`
+# emits these synthetic module values for v2 namespaces (legacy modules like
+# `chat`, `build`, ... still match the literal `system_id` column).
+_V2_NAMESPACE_TO_ACTION_PREFIX: dict[str, str] = {
+    "tenant": "tenant.",
+    "llm": "llm.server.",
+    "approval": "approval.",
+    "open_api": "open_api.",
+    "app": "app.",
+}
+
+
+class AuditLogDao(AuditLogBase):
+    @classmethod
+    def _ui_visible_predicate(cls):
+        """Whitelist for the legacy audit page: keep all legacy rows
+        (``system_id`` filled by ``insert_audit_logs`` paths) plus the six
+        v2 actions explicitly surfaced to operators.
+        """
+        return or_(
+            AuditLog.system_id.is_not(None),
+            col(AuditLog.action).in_(_UI_VISIBLE_V2_ACTIONS),
+        )
+
+    @classmethod
+    def _visible_for_tenant(cls, tenant_id: int):
+        """Audit visibility predicate (spec §5.4): rows attributable to a
+        tenant, either as the resource side (``tenant_id``) or the operator
+        side (``operator_tenant_id`` — catches super-admin cross-child ops).
+        """
+        return or_(
+            AuditLog.tenant_id == tenant_id,
+            AuditLog.operator_tenant_id == tenant_id,
+        )
+
+    @classmethod
+    def _object_app_predicate(cls, app_id: str):
+        """Rows that are *about* one hosted application (F056 AC-21 / AC-28).
+
+        Two shapes exist and both must match, otherwise "filter by app" shows
+        the state machine but not the release pipeline (or vice versa):
+
+        - ``target_type='app'`` + ``target_id=<app id>`` — F054 state actions
+          and the F056 visibility-change hook write this;
+        - ``metadata.app_id=<app id>`` — F055 ``app.release.*`` rows target
+          the *version* (``target_type='app_version'``) and carry the app in
+          metadata; the approval terminal states are expected to adopt the
+          same key (spec 决议-1), so the predicate is keyed on the metadata
+          field rather than on ``target_type='app_version'``.
+
+        A deleted application still has its rows: deletion is a state
+        transition, never a row purge, and every row keeps ``object_name`` as
+        the name snapshot — nothing here needs the ``app`` table.
+        """
+        return or_(
+            and_(AuditLog.target_type == "app", AuditLog.target_id == app_id),
+            json_object_field_equals(AuditLog.audit_metadata, "app_id", app_id, _db_dialect()),
+        )
+
+    @classmethod
+    async def get_audit_logs(
+        cls,
+        group_ids: list[int],
+        operator_ids: list[int] = 0,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        system_id: str | None = None,
+        event_type: str | None = None,
+        page: int = 0,
+        limit: int = 0,
+        tenant_scope: int | None = None,
+        target_app_id: str | None = None,
+        group_member_ids: list[int] | None = None,
+    ) -> (list[AuditLog], int):
+        """
+        Filter logs by user group.
+
+        ``tenant_scope`` (v2.5.0 audit isolation):
+        - ``None``  → cross-tenant view (global super admin without F019
+          admin-scope) — must see every tenant's rows.
+        - ``X``     → tenant-scoped view (Child Admin / dept admin / log-menu
+          role / super with admin-scope=X) — only rows visible to X per
+          ``_visible_for_tenant``.
+
+        ``target_app_id`` (F056 AC-28): only rows about that hosted
+        application, see ``_object_app_predicate``. Tenant boundary checks
+        for the app itself are the service's job (AC-31); this layer only
+        ANDs the predicate onto whatever scope it was given.
+
+        ``group_member_ids`` (F056 design pit 15): legacy rows snapshot the
+        operator's groups into ``group_ids``; structured v2 rows
+        (``ainsert_v2``) never fill that column, so a plain
+        ``json_array_contains`` filter hides every v2 event from group
+        admins. When the caller passes the current members of the selected
+        groups, v2 rows whose operator is one of them match too — the same
+        rule ("what members of this group did"), read from membership
+        instead of the snapshot.
+
+        Always wraps the session in ``bypass_tenant_filter()``: the DAO is
+        the sole source of tenant scoping here. Without bypass, the F013
+        auto-listener would inject ``WHERE tenant_id = current_tenant_id``
+        which (a) hides every child tenant's row from a global super whose
+        leaf is Root (the original screenshot bug), and (b) double-filters
+        on top of the explicit ``_visible_for_tenant`` OR predicate when a
+        scope is set.
+        """
+        statement = select(AuditLog)
+        count_statement = select(func.count(AuditLog.id))
+
+        # UI whitelist — legacy rows + 6 surfaced v2 actions. Applied first
+        # so pagination math reflects what the operator can actually see.
+        ui_predicate = cls._ui_visible_predicate()
+        statement = statement.where(ui_predicate)
+        count_statement = count_statement.where(ui_predicate)
+
+        if group_ids:
+            group_filters = []
+            for one in group_ids:
+                group_filters.append(json_array_contains(AuditLog.group_ids, str(one), _db_dialect()))
+            if group_member_ids:
+                group_filters.append(
+                    and_(AuditLog.action.is_not(None), col(AuditLog.operator_id).in_(group_member_ids))
+                )
+
+            statement = statement.where(or_(*group_filters))
+            count_statement = count_statement.where(or_(*group_filters))
+        if target_app_id:
+            app_predicate = cls._object_app_predicate(target_app_id)
+            statement = statement.where(app_predicate)
+            count_statement = count_statement.where(app_predicate)
+        if operator_ids:
+            statement = statement.where(AuditLog.operator_id.in_(operator_ids))
+            count_statement = count_statement.where(AuditLog.operator_id.in_(operator_ids))
+        if start_time:
+            statement = statement.where(AuditLog.create_time >= start_time)
+            count_statement = count_statement.where(AuditLog.create_time >= start_time)
+        if end_time:
+            statement = statement.where(AuditLog.create_time <= end_time)
+            count_statement = count_statement.where(AuditLog.create_time <= end_time)
+        if system_id:
+            # Synthetic v2 namespace from the frontend dropdown maps to an
+            # ``action`` prefix; legacy module values match ``system_id``.
+            prefix = _V2_NAMESPACE_TO_ACTION_PREFIX.get(system_id)
+            if prefix:
+                module_predicate = col(AuditLog.action).like(f"{prefix}%")
+            else:
+                module_predicate = AuditLog.system_id == system_id
+            statement = statement.where(module_predicate)
+            count_statement = count_statement.where(module_predicate)
+        if event_type:
+            # v2 action strings always contain a dot (``tenant.mount`` etc.);
+            # legacy event_type values are plain snake_case (``create_chat``).
+            if "." in event_type:
+                action_predicate = AuditLog.action == event_type
+            else:
+                action_predicate = AuditLog.event_type == event_type
+            statement = statement.where(action_predicate)
+            count_statement = count_statement.where(action_predicate)
+        if tenant_scope is not None:
+            tenant_predicate = cls._visible_for_tenant(tenant_scope)
+            statement = statement.where(tenant_predicate)
+            count_statement = count_statement.where(tenant_predicate)
+        # ``create_time`` is second-precision; the id tiebreaker keeps OFFSET
+        # pages disjoint and the export deterministic (backend AGENTS.md).
+        statement = statement.order_by(AuditLog.create_time.desc(), AuditLog.id.desc())
+        if page and limit:
+            statement = statement.offset((page - 1) * limit).limit(limit)
+        with bypass_tenant_filter(), get_sync_db_session() as session:
+            return session.exec(statement).all(), session.scalar(count_statement)
+
+    @classmethod
+    def insert_audit_logs(cls, audit_logs: list[AuditLog]):
+        with get_sync_db_session() as session:
+            session.add_all(audit_logs)
+            session.commit()
+
+    @classmethod
+    async def ainsert_audit_logs(cls, audit_logs: list[AuditLog]):
+        async with get_async_db_session() as session:
+            session.add_all(audit_logs)
+            await session.commit()
+
+    @classmethod
+    def get_all_operators(cls, group_ids: list[int], tenant_scope: int | None = None):
+        """List distinct operators across audit log rows.
+
+        ``tenant_scope`` (v2.5.0 audit isolation):
+        - ``None``  → global super admin (no F019 scope) — return operators
+          from every tenant.
+        - ``X``     → only operators from rows visible to tenant X per
+          ``_visible_for_tenant``. Without this the dropdown leaks Root
+          operator names into Child Admin views.
+
+        Always wraps in ``bypass_tenant_filter()`` for the same reason as
+        ``get_audit_logs``: the DAO owns tenant scoping; the auto-listener
+        would otherwise pin results to ``current_tenant_id`` and hide
+        cross-tenant operators from a global super.
+        """
+        statement = select(AuditLog.operator_id, AuditLog.operator_name).distinct()
+        # Mirror the list endpoint's UI whitelist so the operator dropdown
+        # does not advertise users who only ever produced hidden v2 rows.
+        statement = statement.where(cls._ui_visible_predicate())
+        if group_ids:
+            group_filters = []
+            for one in group_ids:
+                group_filters.append(json_array_contains(AuditLog.group_ids, str(one), _db_dialect()))
+            statement = statement.where(or_(*group_filters))
+        if tenant_scope is not None:
+            statement = statement.where(cls._visible_for_tenant(tenant_scope))
+
+        with bypass_tenant_filter(), get_sync_db_session() as session:
+            return session.exec(statement).all()
+
+    # -----------------------------------------------------------------------
+    # v2.5.1 F011: structured audit_log API.
+    # Callers: F011 mount/unmount/migrate, F012 relocate, F016 quota,
+    # F017 share, F018 transfer, F019 scope_switch, F020 llm.* — all
+    # structured actions listed in spec §5.4.2.
+    # -----------------------------------------------------------------------
+
+    @classmethod
+    async def ainsert_v2(
+        cls,
+        tenant_id: int | None,
+        operator_id: int,
+        operator_tenant_id: int | None,
+        action: str,
+        target_type: str | None = None,
+        target_id: str | None = None,
+        reason: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        ip_address: str | None = None,
+        operator_name: str | None = None,
+        object_name: str | None = None,
+    ) -> AuditLog:
+        """Structured audit_log insert (v2.5.1 schema).
+
+        Callers must supply ``operator_tenant_id`` per spec §5.4 rules:
+          - ordinary user / Child Admin → operator.leaf_tenant_id
+          - global super (no F019 scope)   → ROOT_TENANT_ID (=1)
+          - global super (F019 scope=X)    → X (current management view)
+          - system trigger (operator_id=0) → ROOT_TENANT_ID
+
+        ``operator_name`` is auto-resolved when not supplied: ``'system'``
+        for ``operator_id == 0`` (system trigger), otherwise looked up via
+        ``UserDao.aget_user``. Without this fallback every v2 row's
+        ``operator_name`` would be NULL — the legacy "系统操作" page reads
+        that column for the user-name cell, so callers used to leave it
+        blank in the UI. The lookup is best-effort: a miss leaves the
+        column NULL and logs a warning rather than failing the insert.
+        """
+        if operator_name is None:
+            if operator_id == 0:
+                operator_name = "system"
+            else:
+                # Lazy import: UserDao lives in a higher-level package and a
+                # top-level import would cycle through user → role → audit.
+                from bisheng.user.domain.models.user import UserDao
+
+                try:
+                    user = await UserDao.aget_user(operator_id)
+                    if user is not None:
+                        operator_name = user.user_name
+                except Exception as e:
+                    from loguru import logger
+
+                    logger.warning(
+                        "audit_log operator_name lookup failed for operator_id=%s action=%s: %s",
+                        operator_id,
+                        action,
+                        e,
+                    )
+
+        entry = AuditLog(
+            tenant_id=tenant_id,
+            operator_id=operator_id,
+            operator_name=operator_name,
+            operator_tenant_id=operator_tenant_id,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            reason=reason,
+            audit_metadata=metadata,
+            ip_address=ip_address,
+            object_name=object_name,
+        )
+        with bypass_tenant_filter():
+            async with get_async_db_session() as session:
+                session.add(entry)
+                await session.commit()
+                await session.refresh(entry)
+                return entry
+
+    @classmethod
+    async def aget_by_action(
+        cls,
+        action: str,
+        tenant_id: int | None = None,
+        page: int = 1,
+        limit: int = 20,
+    ) -> tuple[list[AuditLog], int]:
+        """Paginated lookup by structured ``action`` (v2.5.1 schema).
+
+        Uses ``bypass_tenant_filter()`` to prevent the auto-injected
+        ``auditlog.tenant_id = <ctx>`` WHERE clause from clashing with
+        the explicit tenant_id filter here. See spec §5.4.
+        """
+        offset = max(0, (page - 1) * limit)
+        with bypass_tenant_filter():
+            async with get_async_db_session() as session:
+                stmt = select(AuditLog).where(AuditLog.action == action)
+                count_stmt = select(func.count()).select_from(AuditLog).where(AuditLog.action == action)
+                if tenant_id is not None:
+                    stmt = stmt.where(AuditLog.tenant_id == tenant_id)
+                    count_stmt = count_stmt.where(AuditLog.tenant_id == tenant_id)
+                total = (await session.exec(count_stmt)).one()
+                stmt = stmt.order_by(AuditLog.create_time.desc()).offset(offset).limit(limit)
+                rows = (await session.exec(stmt)).all()
+                return list(rows), total
+
+    @classmethod
+    async def aget_visible_for_child_admin(
+        cls,
+        tenant_id: int,
+        page: int = 1,
+        limit: int = 20,
+    ) -> tuple[list[AuditLog], int]:
+        """Child Admin visibility (spec §5.4 "可见性规则").
+
+        A Child Admin sees rows where:
+          - ``tenant_id`` equals their tenant (operations ON their resources), OR
+          - ``operator_tenant_id`` equals their tenant (operations BY ops inside
+            their tenant — catches global super ops that targeted this child).
+        """
+        offset = max(0, (page - 1) * limit)
+        with bypass_tenant_filter():
+            # Build predicate inside the bypass block so the static guard
+            # (test_tenant_bypass_filter_guard) can see the tenant_id token —
+            # the predicate already filters by tenant_id / operator_tenant_id.
+            predicate = cls._visible_for_tenant(tenant_id)
+            async with get_async_db_session() as session:
+                stmt = select(AuditLog).where(predicate)
+                count_stmt = select(func.count()).select_from(AuditLog).where(predicate)
+                total = (await session.exec(count_stmt)).one()
+                stmt = stmt.order_by(AuditLog.create_time.desc()).offset(offset).limit(limit)
+                rows = (await session.exec(stmt)).all()
+                return list(rows), total

@@ -1,0 +1,90 @@
+from __future__ import annotations
+
+from typing import Any
+
+from bisheng.approval.domain.schemas.approval_center_schema import ApprovalScenarioPreset
+
+
+class ApprovalRegistry:
+    def __init__(self) -> None:
+        self._presets: dict[str, ApprovalScenarioPreset] = {}
+        self._handlers: dict[str, Any] = {}
+
+    @classmethod
+    def with_default_presets(cls) -> ApprovalRegistry:
+        registry = cls()
+        registry.register_preset(
+            ApprovalScenarioPreset(
+                scenario_code="menu_access_request",
+                scenario_name="菜单权限申请",
+                handler_key="menu_access_request",
+                # applicant_role: admin / dept_admin / regular_user
+                # menu_key: specific menu key from payload_snapshot
+                condition_fields=["applicant_role", "menu_key"],
+                approver_source_types=["direct_user", "department_admin"],
+            )
+        )
+        registry.register_preset(
+            ApprovalScenarioPreset(
+                scenario_code="channel_subscribe_request",
+                scenario_name="频道订阅审批",
+                handler_key="channel_subscribe_request",
+                condition_fields=["applicant_role"],
+                approver_source_types=["direct_user", "department_admin", "channel_owner", "channel_manager"],
+            )
+        )
+        registry.register_preset(
+            ApprovalScenarioPreset(
+                scenario_code="knowledge_space_subscribe_request",
+                scenario_name="知识空间加入审批",
+                handler_key="knowledge_space_subscribe_request",
+                condition_fields=["applicant_role"],
+                approver_source_types=[
+                    "direct_user",
+                    "department_admin",
+                    "knowledge_space_owner",
+                    "knowledge_space_manager",
+                ],
+            )
+        )
+        registry.register_preset(
+            ApprovalScenarioPreset(
+                scenario_code="app_publish_request",
+                scenario_name="应用发布",
+                handler_key="app_publish_request",
+                # No condition fields: every release is approved the same way,
+                # there is no免审 branch to select (F055 INV-34).
+                condition_fields=[],
+                # ``condition_fields=[]`` alone does not deliver INV-34. It only
+                # removes the *conditions* a branch could match on; a catch-all
+                # branch set to ``pass`` needs none, so a tenant administrator
+                # could still turn every release into an auto-approval. PRD-1
+                # RT-03 / GOV-02 promise the opposite in three places ("不提供
+                # 免审配置项"), so the refusal has to be stated, not implied.
+                mandatory_approval=True,
+                # ``direct_user`` is what makes AC-19 reachable — without it a
+                # tenant administrator who reconfigures the approvers can never
+                # put a named person back, because the admin page builds its
+                # source dropdown from this list.
+                approver_source_types=["department_admin", "tenant_admin", "direct_user"],
+            )
+        )
+        return registry
+
+    def register_preset(self, preset: ApprovalScenarioPreset) -> None:
+        self._presets[preset.scenario_code] = preset
+
+    def list_presets(self) -> list[ApprovalScenarioPreset]:
+        return list(self._presets.values())
+
+    def get_preset(self, scenario_code: str) -> ApprovalScenarioPreset | None:
+        return self._presets.get(scenario_code)
+
+    def register_handler(self, scenario_code: str, handler: Any) -> None:
+        self._handlers[scenario_code] = handler
+
+    async def get_handler(self, scenario_code: str) -> Any:
+        handler = self._handlers.get(scenario_code)
+        if handler is None:
+            raise KeyError(f"handler not registered for scenario_code={scenario_code}")
+        return handler

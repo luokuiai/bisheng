@@ -1,0 +1,625 @@
+import json
+import os
+
+import yaml
+from loguru import logger
+
+from bisheng.common.models.config import Config, ConfigDao, ConfigKeyEnum
+from bisheng.common.repositories.implementations.config_repository_impl import ConfigRepositoryImpl
+from bisheng.core.cache.redis_manager import get_redis_client_sync
+from bisheng.core.config.settings import (
+    CofcoForwardingConf,
+    DailyChatConf,
+    IntelligenceCenterConf,
+    KnowledgeConf,
+    LinsightConf,
+    McpConf,
+    PasswordConf,
+    Settings,
+    ShougangConf,
+    SystemLoginMethod,
+    WorkflowConf,
+    decrypt_token,
+)
+from bisheng.core.database import get_async_db_session, get_sync_db_session
+
+config_file = os.getenv("config", "config.yaml")
+
+SANDBOX_ENDPOINT_CACHE_KEY = "config:sandbox_endpoint"
+SANDBOX_ENDPOINT_CACHE_TTL = 60
+_SANDBOX_UNREADABLE = "sandbox endpoint config unreadable; using deployment config"
+
+
+def sandbox_endpoint_payload_ok(value: object) -> bool:
+    """Page payload: dict with a list of address strings and a ciphertext string."""
+    if not isinstance(value, dict):
+        return False
+    endpoints = value.get("endpoints")
+    token_enc = value.get("token_enc")
+    if not isinstance(endpoints, list) or any(not isinstance(item, str) for item in endpoints):
+        return False
+    return isinstance(token_enc, str)
+
+
+def write_sandbox_endpoint_cache(payload: dict) -> None:
+    """Overwrite the execution cache. Only the save path calls this."""
+    if not sandbox_endpoint_payload_ok(payload):
+        raise ValueError("invalid sandbox endpoint cache payload")
+    get_redis_client_sync().set(
+        SANDBOX_ENDPOINT_CACHE_KEY,
+        {"endpoints": list(payload["endpoints"]), "token_enc": payload["token_enc"]},
+        expiration=SANDBOX_ENDPOINT_CACHE_TTL,
+    )
+
+
+def _merge_sandbox_page(base, payload: dict):
+    """Overlay a valid page payload onto deployment config. None means decrypt failed."""
+    update: dict = {}
+    if payload["endpoints"]:
+        update["endpoints"] = list(payload["endpoints"])
+    if payload["token_enc"]:
+        try:
+            update["token"] = decrypt_token(payload["token_enc"])
+        except Exception:
+            return None
+    if not update:
+        return base
+    return base.model_copy(update=update)
+
+
+def _read_sandbox_cache() -> tuple[str, dict | None]:
+    """Return (hit|miss|invalid|error, payload). error/invalid are not rewritten."""
+    try:
+        cached = get_redis_client_sync().get(SANDBOX_ENDPOINT_CACHE_KEY)
+    except Exception:
+        return "error", None
+    if cached is None:
+        return "miss", None
+    if sandbox_endpoint_payload_ok(cached):
+        return "hit", cached
+    return "invalid", None
+
+
+def load_sandbox_conf():
+    """Effective sandbox access for executors. Patch this in tests."""
+    return settings.get_sandbox_conf()
+
+
+def read_from_conf(file_path: str) -> str:
+    if "/" not in file_path:
+        # Get project main path
+        current_path = os.path.dirname(os.path.abspath(__file__))
+        # Look up the previous two levels of the catalog
+        current_path = os.path.dirname(os.path.dirname(current_path))
+
+        file_path = os.path.join(current_path, file_path)
+
+    with open(file_path, encoding="utf-8") as f:
+        content = f.read()
+
+    return content
+
+
+def parse_key(keys: list[str], setting_str: str = None, include_key: bool = False) -> str:
+    # Setujukey  Back  yamlConfigure invalueAll strings, including comments
+    if not setting_str:
+        setting_str = read_from_conf(config_file)
+    setting_lines = setting_str.split("\n")
+    value_of_key = [[] for _ in keys]
+    value_start_flag = [False for _ in keys]
+    prev_line = ""
+    for line in setting_lines:
+        for index, key in enumerate(keys):
+            if value_start_flag[index]:
+                if line.startswith("  ") or not line.strip() or line.startswith("#"):
+                    value_of_key[index].append(line)
+                else:
+                    value_start_flag[index] = False
+                    continue
+            if line.startswith(key + ":"):
+                value_start_flag[index] = True
+                if include_key:
+                    if prev_line.startswith("#"):
+                        value_of_key[index].append(prev_line)
+                    value_of_key[index].append(line)
+        prev_line = line
+    return ["\n".join(value) for value in value_of_key]
+
+
+def _apply_linsight_overrides(conf: LinsightConf, overrides: dict) -> None:
+    """Copy the DB ``linsight`` section onto ``conf``, skipping keys it no longer defines.
+
+    Deployed config rows still carry retired keys (F087 P2: ``tool_buffer`` and
+    others); pydantic's ``setattr`` raises on an unknown field.
+    """
+    for k, v in (overrides or {}).items():
+        if k in LinsightConf.model_fields:
+            setattr(conf, k, v)
+
+
+class ConfigService(Settings):
+    """Configure service classes, inherited fromSettingsto provide configuration access"""
+
+    def __init__(self, **data):
+
+        super().__init__(**data)
+
+    @staticmethod
+    def env_var_constructor(loader, node):
+        value = loader.construct_scalar(
+            node
+        )  # PyYAML loaderFixed method for constructing a variable value from the current node
+        var_name = value.strip(
+            "${} "
+        )  # Subtract variable values (e.g.${PATH}) Special characters and spaces before and after
+        env_val = os.getenv(
+            var_name
+        )  # Try to get the variable name in the environment variable (e.g.USER) corresponding to the value, if it is not obtained, it is empty
+        if env_val is None:
+            raise ValueError(f"Environment variable {var_name} not found")
+        return env_val
+
+    @classmethod
+    def load_settings_from_yaml(cls, file_path: str) -> "ConfigService":
+        # Sign up for customYAMLConstructor to handle environment variables
+        yaml.SafeLoader.add_constructor("!env", cls.env_var_constructor)
+        # Get current path
+        current_path = os.path.dirname(os.path.abspath(__file__))
+        # Look up the previous two levels of the catalog
+        current_path = os.path.dirname(os.path.dirname(current_path))
+        # Check if a string is a valid path or a file name
+        if "/" not in file_path:
+            file_path = os.path.join(current_path, file_path)
+
+        with open(file_path, encoding="utf-8") as f:
+            settings_dict = yaml.safe_load(f)
+
+        for key in settings_dict:
+            if key not in Settings.model_fields.keys():
+                raise KeyError(f"Key {key} not found in settings")
+            logger.debug(f"Loading {key} from {file_path}")
+
+        return ConfigService(**settings_dict)
+
+    async def init_config(self):
+        # Inisialisasiconfig
+
+        # First Passedyaml Get all of the profileskey
+        config_content = read_from_conf("initdb_config.yaml")
+        if not config_content:
+            return
+        async with get_async_db_session() as session:
+            config_repository = ConfigRepositoryImpl(session)
+            config = list(await config_repository.find_all())
+
+            db_keys = {conf.key: conf.value for conf in config}
+            all_config_key = "initdb_config"
+            # There is no default configuration in the database, write the default configuration to the database
+            if db_keys.get(all_config_key, None) is None:
+                # Write profile to database
+                # Compatible with old configurations, old configurations and new profiles need to bemerge, Noold configDirectly combine the newconfigAdd to Database
+                new_config_content = self.merge_old_config(config_content, config, db_keys)
+                try:
+                    db_config = Config(key=all_config_key, value=new_config_content)
+                    session.add(db_config)
+                    await session.commit()
+                except Exception as e:
+                    logger.exception(e)
+                    await session.rollback()
+                return
+
+            # The row exists, so the branch above will never run again on this
+            # install — which used to mean a setting shipped in a later release
+            # never reached the database at all. Backfill the missing keys (values
+            # already stored are left exactly as they are, so an operator's tuning
+            # survives every upgrade).
+            await self._backfill_missing_config(session, config, config_content, all_config_key)
+
+    async def _backfill_missing_config(
+        self, session, config: list[Config], config_content: str, all_config_key: str
+    ) -> None:
+        """Add newly shipped config keys to the stored config; never overwrite.
+
+        Best-effort by design: a failure here must not stop the service from
+        booting, because the code paths that read these settings all have their
+        own defaults.
+        """
+        try:
+            db_row = next((conf for conf in config if conf.key == all_config_key), None)
+            if db_row is None or not db_row.value:
+                return
+            merged, added = self.merge_missing_config(config_content, db_row.value)
+            if not added:
+                return
+            # Re-parse before writing: a malformed merge must never replace a
+            # working configuration.
+            yaml.safe_load(merged)
+            db_row.value = merged
+            session.add(db_row)
+            await session.commit()
+            # The read path caches this row in redis for 100s; drop it so the new
+            # keys are visible immediately instead of after the TTL.
+            try:
+                get_redis_client_sync().delete("config:initdb_config")
+            except Exception:
+                logger.warning("config backfill: redis cache eviction failed; new keys apply within 100s")
+            logger.info(f"config backfill: added {len(added)} missing key(s) to initdb_config: {added}")
+        except Exception:
+            logger.exception("config backfill failed; stored configuration left untouched")
+            try:
+                await session.rollback()
+            except Exception:
+                logger.warning("config backfill: rollback failed")
+
+    @staticmethod
+    def _extract_block(lines: list[str], key: str, indent: str) -> list[str]:
+        """Lines of ``<indent>key:`` and everything nested under it, plus the
+        comment lines directly above it.
+
+        Text-level on purpose: a yaml.safe_load/dump round-trip would drop every
+        comment in the file, and those comments are what operators read in the
+        system-config page.
+        """
+        prefix = f"{indent}{key}:"
+        for i, line in enumerate(lines):
+            if not (line == prefix.rstrip() or line.startswith(f"{prefix} ") or line.startswith(prefix)):
+                continue
+            # Walk up over the comment block that documents this key.
+            start = i
+            while start > 0 and lines[start - 1].strip().startswith("#"):
+                start -= 1
+            # Walk down while lines are blank or nested deeper than this key.
+            end = i + 1
+            while end < len(lines):
+                nxt = lines[end]
+                if not nxt.strip():
+                    end += 1
+                    continue
+                if len(nxt) - len(nxt.lstrip()) > len(indent):
+                    end += 1
+                    continue
+                break
+            # Trailing blank lines belong to the separation, not to the block.
+            while end > i + 1 and not lines[end - 1].strip():
+                end -= 1
+            return lines[start:end]
+        return []
+
+    @staticmethod
+    def _section_child_indent(lines: list[str], anchor: int) -> str:
+        """Return the indentation already used by a stored section's children."""
+        for line in lines[anchor + 1 :]:
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            leading = line[: len(line) - len(line.lstrip())]
+            if not leading:
+                break
+            return leading
+        return "  "
+
+    @staticmethod
+    def _reindent_block(block: list[str], source_indent: str, target_indent: str) -> list[str]:
+        """Move a raw YAML block while preserving its relative indentation."""
+        if source_indent == target_indent:
+            return block
+        return [
+            f"{target_indent}{line[len(source_indent) :]}" if line.startswith(source_indent) else line for line in block
+        ]
+
+    @staticmethod
+    def merge_missing_config(file_config: str, db_config: str) -> tuple[str, list[str]]:
+        """Add keys that exist in the shipped yaml but not in the stored config.
+
+        Returns ``(merged_text, added_paths)``; ``added_paths`` is empty when the
+        stored config already covers the file.
+
+        Why this exists: ``init_config`` only ever WRITES the yaml when the DB has
+        no ``initdb_config`` row at all, so on any environment that has been
+        installed once, a newly shipped setting never reaches the database. Values
+        then silently fall back to the Field defaults in ``settings.py`` — and only
+        for as long as nobody writes that section from the config page. A release
+        that adds ``linsight.max_model_turns`` is invisible to every existing
+        install; that is exactly how a 115-turn budget stayed in force after the
+        default had moved on.
+
+        Rules, in order of importance:
+          1. NEVER overwrite a value the DB already has — an operator's tuning
+             always wins, which is what makes running this on every boot safe.
+          2. Keys the DB has and the file does not are kept untouched.
+          3. New keys are carried over as RAW TEXT together with their comments.
+          4. Two levels deep: a missing top-level section comes over whole
+             (nested content included); inside a section that already exists, only
+             its missing direct children are inserted.
+        """
+        file_cfg = yaml.safe_load(file_config) or {}
+        db_cfg = yaml.safe_load(db_config) or {}
+        if not isinstance(file_cfg, dict) or not isinstance(db_cfg, dict):
+            return db_config, []
+
+        added: list[str] = []
+        file_lines = file_config.split("\n")
+        out_lines = db_config.split("\n")
+
+        for key, file_value in file_cfg.items():
+            if key not in db_cfg:
+                block = ConfigService._extract_block(file_lines, key, "")
+                if block:
+                    while out_lines and not out_lines[-1].strip():
+                        out_lines.pop()
+                    out_lines.extend(["", "", *block])
+                    added.append(key)
+                continue
+
+            # Section present on both sides — fill in only its missing children.
+            db_value = db_cfg.get(key)
+            if not isinstance(file_value, dict) or not isinstance(db_value, dict):
+                continue
+            missing = [sub for sub in file_value if sub not in db_value]
+            if not missing:
+                continue
+
+            section = ConfigService._extract_block(file_lines, key, "")
+            if not section:
+                continue
+            # Re-locate the section on every key: earlier insertions shift the lines.
+            anchor = None
+            for i, line in enumerate(out_lines):
+                if line.startswith(f"{key}:"):
+                    anchor = i
+                    break
+            if anchor is None:
+                continue
+            end = anchor + 1
+            while end < len(out_lines):
+                nxt = out_lines[end]
+                if not nxt.strip() or nxt.startswith((" ", "\t")):
+                    end += 1
+                    continue
+                break
+            while end > anchor + 1 and not out_lines[end - 1].strip():
+                end -= 1
+
+            insert: list[str] = []
+            target_indent = ConfigService._section_child_indent(out_lines, anchor)
+            for sub in missing:
+                block = ConfigService._extract_block(section, sub, "  ")
+                if block:
+                    insert.extend(ConfigService._reindent_block(block, "  ", target_indent))
+                    added.append(f"{key}.{sub}")
+            if insert:
+                out_lines[end:end] = insert
+
+        return "\n".join(out_lines), added
+
+    @staticmethod
+    def merge_old_config(new_config: str, old_db_config: list[Config], old_db_keys: dict[str, str]):
+        # No old configuration, write the new configuration directly to the database
+        if old_db_config.__len__() == 0:
+            return new_config
+        new_content = ""
+        # Start with the new configuration
+        config_yaml = yaml.safe_load(new_config)
+        for one in config_yaml.keys():
+            if old_db_keys.get(one, None) is None:  # is a new configuration, directly using the contents of the file
+                new_content += f"{parse_key([one], new_config, include_key=True)[0]}\n\n"
+            else:
+                new_content += f"{one}:\n{old_db_keys[one]}\n\n"
+        return new_content
+
+    @staticmethod
+    def _load_config_yaml(raw):
+        # Guard against non-text payloads. A misbehaving/mocked redis client can
+        # return a non-string object (e.g. a MagicMock in tests); yaml.safe_load
+        # would then treat it as an infinite input stream — an unbounded read
+        # loop that balloons memory. Fail fast with a clear error instead.
+        if not isinstance(raw, (str, bytes, bytearray)):
+            raise TypeError(f"config payload must be str/bytes, got {type(raw).__name__}")
+        return yaml.safe_load(raw)
+
+    @staticmethod
+    def get_all_config():
+
+        redis_key = "config:initdb_config"
+        cache = get_redis_client_sync().get(redis_key)
+        if cache:
+            return ConfigService._load_config_yaml(cache)
+        else:
+            with get_sync_db_session() as session:
+                config_repository = ConfigRepositoryImpl(session)
+                initdb_config = config_repository.find_one_sync(key=ConfigKeyEnum.INIT_DB.value)
+
+                if initdb_config:
+                    get_redis_client_sync().set(redis_key, initdb_config.value, 100)
+                    return ConfigService._load_config_yaml(initdb_config.value)
+                else:
+                    raise Exception("initdb_config not found, please check your system config")
+
+    @staticmethod
+    async def aget_all_config():
+
+        redis_key = "config:initdb_config"
+        cache = await get_redis_client_sync().aget(redis_key)
+        if cache:
+            return ConfigService._load_config_yaml(cache)
+        else:
+            async with get_async_db_session() as session:
+                config_repository = ConfigRepositoryImpl(session)
+                initdb_config = await config_repository.find_one(key=ConfigKeyEnum.INIT_DB.value)
+                if initdb_config:
+                    await get_redis_client_sync().aset(redis_key, initdb_config.value, 100)
+                    return ConfigService._load_config_yaml(initdb_config.value)
+                else:
+                    raise Exception("initdb_config not found, please check your system config")
+
+    def get_knowledge(self) -> KnowledgeConf:
+        # Due to distributed requirements, configurations that can be changed are stored inmysqlso each time the configuration is read from themysqlRead in
+        all_config = self.get_all_config()
+        ret = all_config.get("knowledges", {})
+        return KnowledgeConf(**ret)
+
+    async def async_get_knowledge(self) -> KnowledgeConf:
+        # Due to distributed requirements, configurations that can be changed are stored inmysqlso each time the configuration is read from themysqlRead in
+        all_config = await self.aget_all_config()
+        ret = all_config.get("knowledges", {})
+        return KnowledgeConf(**ret)
+
+    def get_default_llm(self):
+        # Due to distributed requirements, configurations that can be changed are stored inmysqlso each time the configuration is read from themysqlRead in
+        all_config = self.get_all_config()
+        return all_config.get("default_llm", {})
+
+    async def get_password_conf(self) -> PasswordConf:
+        # Get password-related configuration items
+        all_config = await self.aget_all_config()
+        return PasswordConf(**all_config.get("password_conf", {}))
+
+    def get_system_login_method(self) -> SystemLoginMethod:
+        # Get password-related configuration items
+        all_config = self.get_all_config()
+        tmp = SystemLoginMethod(**all_config.get("system_login_method", {}))
+        tmp.bisheng_pro = os.getenv("BISHENG_PRO") == "true"
+        tmp.dashboard_pro = os.getenv("BISHENG_DASHBOARD_PRO") == "true"
+        return tmp
+
+    async def aget_system_login_method(self) -> SystemLoginMethod:
+        # Get password-related configuration items
+        all_config = await self.aget_all_config()
+        tmp = SystemLoginMethod(**all_config.get("system_login_method", {}))
+        tmp.bisheng_pro = os.getenv("BISHENG_PRO") == "true"
+        tmp.dashboard_pro = os.getenv("BISHENG_DASHBOARD_PRO") == "true"
+        return tmp
+
+    def get_workflow_conf(self) -> WorkflowConf:
+        # Get password-related configuration items
+        all_config = self.get_all_config()
+        return WorkflowConf(**all_config.get("workflow", {}))
+
+    async def aget_daily_chat_conf(self) -> DailyChatConf:
+        try:
+            all_config = await self.aget_all_config()
+            return DailyChatConf(**(all_config.get("daily_chat", {}) or {}))
+        except Exception as e:
+            logger.warning(f"Failed to load daily_chat conf, using defaults: {e}")
+            return DailyChatConf()
+
+    async def aget_shougang_conf(self) -> ShougangConf:
+        """Get shougang deployment config from DB. Returns default (disabled) on miss/error."""
+        try:
+            all_config = await self.aget_all_config()
+            return ShougangConf(**(all_config.get("shougang", {}) or {}))
+        except Exception as e:
+            logger.warning(f"Failed to load shougang conf, using defaults: {e}")
+            return ShougangConf()
+
+    def get_linsight_conf(self) -> LinsightConf:
+        # Get Ideas-related configuration items
+        all_config = self.get_all_config()
+        conf = LinsightConf(debug=self.linsight_conf.debug)
+        _apply_linsight_overrides(conf, all_config.get("linsight", {}))
+        return conf
+
+    async def aget_linsight_conf(self) -> LinsightConf:
+        # Get Ideas-related configuration items
+        all_config = await self.aget_all_config()
+        conf = LinsightConf(debug=self.linsight_conf.debug)
+        _apply_linsight_overrides(conf, all_config.get("linsight", {}))
+        return conf
+
+    async def aget_intelligence_center_conf(self) -> IntelligenceCenterConf:
+        # Get Intelligence Center-related configuration items
+        all_config = await self.aget_all_config()
+        information_conf = all_config.get("information_conf", {})
+        if information_conf:
+            return IntelligenceCenterConf.model_validate(information_conf)
+        return self.information_conf
+
+    def get_intelligence_center_conf(self) -> IntelligenceCenterConf:
+        # Get Intelligence Center-related configuration items
+        all_config = self.get_all_config()
+        information_conf = all_config.get("information_conf", {})
+        if information_conf:
+            return IntelligenceCenterConf.model_validate(information_conf)
+        return self.information_conf
+
+    def get_from_db(self, key: str):
+        # Get all of them firstkey
+        all_config = self.get_all_config()
+        return all_config.get(key, {})
+
+    def get_cofco_forwarding_conf(self) -> CofcoForwardingConf:
+        """Hot-reload E+ forwarding config from DB; fall back to YAML boot value.
+
+        Save via POST /api/v1/settings/save invalidates the redis cache and the
+        next call here picks up the new value without a process restart.
+        """
+        all_config = self.get_all_config()
+        db_block = (all_config.get("in_app_message_forwarding") or {}).get("cofco") or {}
+        if db_block:
+            try:
+                return CofcoForwardingConf.model_validate(db_block)
+            except Exception as exc:
+                logger.warning(
+                    "Invalid cofco forwarding config in DB: %s; falling back to YAML",
+                    exc,
+                )
+        return self.in_app_message_forwarding.cofco
+
+    async def aget_from_db(self, key: str):
+        # Get all of them firstkey
+        all_config = await self.aget_all_config()
+        return all_config.get(key, {})
+
+    async def get_mcp_conf(self) -> McpConf:
+        all_config = await self.aget_all_config()
+        mcp_conf = all_config.get("mcp", {})
+        if mcp_conf:
+            return McpConf(**mcp_conf)
+        return McpConf()
+
+    def get_sandbox_conf(self):
+        """Effective sandbox access: page config over deployment, per field.
+
+        A missing cache key is filled with setNx. A bad cache entry or a Redis
+        error is not rewritten here, so an in-flight read cannot clobber a save.
+        """
+
+        state, cached = _read_sandbox_cache()
+        if state == "hit":
+            merged = _merge_sandbox_page(self.sandbox_conf, cached)
+            if merged is None:
+                logger.error(_SANDBOX_UNREADABLE)
+                return self.sandbox_conf
+            return merged
+
+        try:
+            row = ConfigDao.get_config(ConfigKeyEnum.SANDBOX_ENDPOINT)
+        except Exception:
+            logger.error(_SANDBOX_UNREADABLE)
+            return self.sandbox_conf
+        if row is None or not row.value:
+            return self.sandbox_conf
+        try:
+            parsed = json.loads(row.value)
+        except Exception:
+            logger.error(_SANDBOX_UNREADABLE)
+            return self.sandbox_conf
+        if not sandbox_endpoint_payload_ok(parsed):
+            logger.error(_SANDBOX_UNREADABLE)
+            return self.sandbox_conf
+        merged = _merge_sandbox_page(self.sandbox_conf, parsed)
+        if merged is None:
+            logger.error(_SANDBOX_UNREADABLE)
+            return self.sandbox_conf
+        if state == "miss":
+            try:
+                get_redis_client_sync().setNx(
+                    SANDBOX_ENDPOINT_CACHE_KEY,
+                    {"endpoints": list(parsed["endpoints"]), "token_enc": parsed["token_enc"]},
+                    SANDBOX_ENDPOINT_CACHE_TTL,
+                )
+            except Exception:
+                logger.error("sandbox endpoint cache fill failed")
+        return merged
+
+
+settings = ConfigService.load_settings_from_yaml(config_file)

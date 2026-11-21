@@ -1,0 +1,741 @@
+import request from '~/api/request';
+import { type ChatCitation, resolveCitationDetails } from '~/api/chatApi';
+import { stripCitationHandles } from '~/components/Chat/Messages/Content/citationUtils';
+import {
+    type ArtifactFile,
+    applyHtmlViewerTabIdentity,
+    fetchArtifactBlob,
+    getArtifactPreviewKind,
+    isAbsoluteImageSrc,
+    isDeliverableLinkHref,
+    isHtmlArtifact,
+    matchArtifactByRelPath,
+    openHtmlArtifactViewer,
+    resolveDeliverableLink,
+    stripEmptyHtmlPlaceholders,
+    stripWorkspacePaths,
+    toUploadedArtifacts,
+} from './artifactUtils';
+
+jest.mock('~/api/request', () => ({
+    __esModule: true,
+    default: { post: jest.fn() },
+}));
+
+// F069 P2: the export bake asks the resolver only for ids the seed lacks.
+jest.mock('~/api/chatApi', () => ({
+    __esModule: true,
+    resolveCitationDetails: jest.fn(),
+}));
+
+// The reference-list labels are i18n copy; render the key with its argument
+// so the fixtures stay ASCII.
+jest.mock('i18next', () => ({
+    __esModule: true,
+    default: {
+        t: (key: string, options?: Record<string, unknown>) =>
+            options && '0' in options ? `${key}:${String(options[0])}` : key,
+    },
+}));
+
+// Default: nothing more resolves than the seed. The P1 strip suites below
+// never seed anything, so they exercise the AC-22 fallback and must keep
+// producing the same bytes they did before baking existed.
+beforeEach(() => {
+    (resolveCitationDetails as jest.Mock).mockResolvedValue([]);
+});
+
+const mkArtifact = (over: Partial<ArtifactFile>): ArtifactFile => ({
+    file_id: over.file_id ?? Math.random().toString(36).slice(2),
+    file_name: over.file_name ?? 'x.png',
+    file_url: over.file_url ?? 'linsight/final_result/svid/rand.png',
+    file_path: over.file_path,
+    ...over,
+});
+
+describe('stripWorkspacePaths', () => {
+    it('drops the output/ folder prefix, keeping the filename', () => {
+        expect(stripWorkspacePaths('见 output/report.md')).toBe('见 report.md');
+    });
+
+    it('drops a leading-slash /output/ prefix (tool-result echo form)', () => {
+        expect(stripWorkspacePaths('Updated file /output/knowledge_base_full.md')).toBe(
+            'Updated file knowledge_base_full.md',
+        );
+    });
+
+    it('strips the prefix inside a markdown code span, keeping the backticks', () => {
+        expect(stripWorkspacePaths('导出到 `output/knowledge_base_full.md`，主要包括：')).toBe(
+            '导出到 `knowledge_base_full.md`，主要包括：',
+        );
+    });
+
+    it('handles scratch/ and multiple occurrences in one string', () => {
+        expect(stripWorkspacePaths('output/a.md 与 scratch/b.docx')).toBe('a.md 与 b.docx');
+    });
+
+    it('leaves prose without a file token untouched (输入/输出, bare "output 文件夹")', () => {
+        expect(stripWorkspacePaths('这是输入/输出分析，见 output 文件夹')).toBe('这是输入/输出分析，见 output 文件夹');
+    });
+
+    it('does not strip a mid-word match like myoutput/ (alphanumeric boundary)', () => {
+        expect(stripWorkspacePaths('myoutput/a.md')).toBe('myoutput/a.md');
+    });
+
+    it('is safe on empty / undefined input', () => {
+        expect(stripWorkspacePaths('')).toBe('');
+        expect(stripWorkspacePaths(undefined as unknown as string)).toBe(undefined);
+    });
+});
+
+describe('isAbsoluteImageSrc', () => {
+    it('treats http(s) / protocol-relative / data / blob / root-relative as absolute', () => {
+        expect(isAbsoluteImageSrc('https://x/y.png')).toBe(true);
+        expect(isAbsoluteImageSrc('http://x/y.png')).toBe(true);
+        expect(isAbsoluteImageSrc('//x/y.png')).toBe(true);
+        expect(isAbsoluteImageSrc('data:image/png;base64,AAAA')).toBe(true);
+        expect(isAbsoluteImageSrc('blob:https://x/uuid')).toBe(true);
+        expect(isAbsoluteImageSrc('/workspace/y.png')).toBe(true);
+    });
+
+    it('treats a bare relative ref as NOT absolute (goes through resolution)', () => {
+        expect(isAbsoluteImageSrc('charts/ch1_brazil.png')).toBe(false);
+        expect(isAbsoluteImageSrc('./charts/x.png')).toBe(false);
+        expect(isAbsoluteImageSrc('output/charts/x.png')).toBe(false);
+    });
+});
+
+describe('matchArtifactByRelPath', () => {
+    // file_path is the worker-local abs path; it preserves the relative dir suffix.
+    const brazil = mkArtifact({
+        file_name: 'ch1_brazil.png',
+        file_url: 'linsight/final_result/svid/aaaa1111.png',
+        file_path: '/cache/linsight/01b4635d/output/charts/ch1_brazil.png',
+    });
+    const argentina = mkArtifact({
+        file_name: 'ch1_argentina.png',
+        file_url: 'linsight/final_result/svid/bbbb2222.png',
+        file_path: '/cache/linsight/01b4635d/output/charts/ch1_argentina.png',
+    });
+    const list = [brazil, argentina];
+
+    it('matches a bare `charts/x.png` ref by file_path suffix', () => {
+        expect(matchArtifactByRelPath(list, 'charts/ch1_brazil.png')).toBe(brazil);
+    });
+
+    it('matches when the ref carries the output/ prefix too', () => {
+        expect(matchArtifactByRelPath(list, 'output/charts/ch1_argentina.png')).toBe(argentina);
+    });
+
+    it('tolerates a leading ./', () => {
+        expect(matchArtifactByRelPath(list, './charts/ch1_brazil.png')).toBe(brazil);
+    });
+
+    it('decodes URL-encoded (e.g. Chinese) filenames before matching', () => {
+        const cn = mkArtifact({
+            file_name: 'ch3_艾奥瓦豆油基差.png',
+            file_path: '/cache/linsight/01b4635d/output/charts/ch3_艾奥瓦豆油基差.png',
+        });
+        expect(matchArtifactByRelPath([cn], 'charts/ch3_%E8%89%BE%E5%A5%A5%E7%93%A6%E8%B1%86%E6%B2%B9%E5%9F%BA%E5%B7%AE.png')).toBe(cn);
+    });
+
+    it('disambiguates same basename in different dirs via the path suffix', () => {
+        const a = mkArtifact({ file_name: 'chart.png', file_path: '/w/output/charts/chart.png' });
+        const b = mkArtifact({ file_name: 'chart.png', file_path: '/w/output/other/chart.png' });
+        expect(matchArtifactByRelPath([a, b], 'charts/chart.png')).toBe(a);
+        expect(matchArtifactByRelPath([a, b], 'other/chart.png')).toBe(b);
+    });
+
+    it('falls back to a bare basename match when file_path is absent', () => {
+        const noPath = mkArtifact({ file_name: 'ch1_brazil.png', file_path: undefined });
+        expect(matchArtifactByRelPath([noPath], 'charts/ch1_brazil.png')).toBe(noPath);
+    });
+
+    it('returns undefined on no match / empty list / empty ref', () => {
+        expect(matchArtifactByRelPath(list, 'charts/nope.png')).toBeUndefined();
+        expect(matchArtifactByRelPath([], 'charts/ch1_brazil.png')).toBeUndefined();
+        expect(matchArtifactByRelPath(undefined, 'charts/ch1_brazil.png')).toBeUndefined();
+        expect(matchArtifactByRelPath(list, '')).toBeUndefined();
+    });
+});
+
+describe('resolveDeliverableLink', () => {
+    const report = mkArtifact({
+        file_name: '报告.md',
+        file_path: '/w/output/报告.md',
+    });
+
+    it('does not map a phantom name onto the sole generic report', () => {
+        // Used to return `report`: any unmatched name opened 报告.md, which served a
+        // file with other contents under another name and hid the fact that the
+        // claimed file was never written. The caller now renders this as 未生成.
+        expect(resolveDeliverableLink([report], '视频内容摘要.md')).toBeUndefined();
+        expect(resolveDeliverableLink([report], 'output/视频内容摘要.md')).toBeUndefined();
+    });
+
+    it('still resolves the sole deliverable when only the casing differs', () => {
+        const named = mkArtifact({ file_name: 'Report.md', file_path: '/w/output/Report.md' });
+        expect(resolveDeliverableLink([named], 'report.md')).toBe(named);
+    });
+
+    it('does not map a different phantom name to a specifically named sole deliverable', () => {
+        const audio = mkArtifact({
+            file_name: '音频转录结果.md',
+            file_path: '/w/output/音频转录结果.md',
+        });
+        expect(resolveDeliverableLink([audio], '视频内容摘要.md')).toBeUndefined();
+        expect(resolveDeliverableLink([audio], '音频转录结果.md')).toBe(audio);
+    });
+
+    it('prefers an exact match when the filename exists', () => {
+        const named = mkArtifact({
+            file_name: '视频内容摘要.md',
+            file_path: '/w/output/视频内容摘要.md',
+        });
+        expect(resolveDeliverableLink([named], '视频内容摘要.md')).toBe(named);
+    });
+
+    it('does not guess when several deliverables exist', () => {
+        const other = mkArtifact({ file_name: 'other.md', file_path: '/w/output/other.md' });
+        expect(resolveDeliverableLink([report, other], 'phantom.md')).toBeUndefined();
+    });
+});
+
+describe('isDeliverableLinkHref', () => {
+    it('detects workspace deliverable paths', () => {
+        expect(isDeliverableLinkHref('output/详细分析报告.md')).toBe(true);
+        expect(isDeliverableLinkHref('详细分析报告.md')).toBe(true);
+        expect(isDeliverableLinkHref('https://example.com/x.md')).toBe(false);
+        expect(isDeliverableLinkHref('charts/x.png')).toBe(false);
+    });
+});
+
+describe('isHtmlArtifact', () => {
+    // The panel hooks route the click and NewTabHint marks the row from this one
+    // predicate, so the marker can never disagree with what the click does.
+    it('is true only for .html deliverables, case-insensitively', () => {
+        expect(isHtmlArtifact(mkArtifact({ file_name: '分析报告.html' }))).toBe(true);
+        expect(isHtmlArtifact(mkArtifact({ file_name: '分析报告.HTML' }))).toBe(true);
+        expect(isHtmlArtifact(mkArtifact({ file_name: '分析报告.md' }))).toBe(false);
+        expect(isHtmlArtifact(mkArtifact({ file_name: 'html' }))).toBe(false);
+        expect(isHtmlArtifact(mkArtifact({ file_name: 'a.html.md' }))).toBe(false);
+    });
+});
+
+describe('stripEmptyHtmlPlaceholders', () => {
+    it('removes an empty styled <div></div> placeholder box (the leaked-noise case)', () => {
+        const md = '正文\n\n<div style="border:1px solid #ccc; height:120px; background:#f9f9f9;"></div>\n\n更多';
+        expect(stripEmptyHtmlPlaceholders(md)).toBe('正文\n\n\n\n更多');
+    });
+
+    it('removes multiple and simply-nested empty blocks', () => {
+        expect(stripEmptyHtmlPlaceholders('<div></div><section class="a"></section>')).toBe('');
+        expect(stripEmptyHtmlPlaceholders('<div><div></div></div>')).toBe('');
+    });
+
+    it('keeps content-bearing HTML untouched (only EMPTY tags are stripped)', () => {
+        expect(stripEmptyHtmlPlaceholders('<div>评论：看多</div>')).toBe('<div>评论：看多</div>');
+    });
+
+    it('leaves normal markdown (incl. image syntax) untouched', () => {
+        const md = '# 标题\n\n![季节性走势](charts/x.png)\n\n段落';
+        expect(stripEmptyHtmlPlaceholders(md)).toBe(md);
+    });
+
+    it('is safe on empty / undefined input', () => {
+        expect(stripEmptyHtmlPlaceholders('')).toBe('');
+        expect(stripEmptyHtmlPlaceholders(undefined as unknown as string)).toBe(undefined);
+    });
+});
+
+describe('openHtmlArtifactViewer', () => {
+    const origEnv = (global as any).__APP_ENV__;
+    let openSpy: jest.SpyInstance;
+
+    beforeEach(() => {
+        (global as any).__APP_ENV__ = { ...origEnv, BASE_URL: '/workspace' };
+        openSpy = jest.spyOn(window, 'open').mockImplementation(() => null);
+    });
+
+    afterEach(() => {
+        (global as any).__APP_ENV__ = origEnv;
+        openSpy.mockRestore();
+        // The share-token cases navigate; leave the location as they found it.
+        window.history.pushState({}, '', '/');
+    });
+
+    // Regression: file_url is a MinIO object key (no leading slash). The old code
+    // concatenated it straight onto BASE_URL → `/workspacelinsight/...` (missing
+    // slash 404). It must instead go through the /html viewer as a query param,
+    // carrying the vid so the viewer can resolve a presigned link.
+    it('passes url + vid as query params and never concatenates the key onto BASE_URL', () => {
+        openHtmlArtifactViewer(
+            {
+                file_id: '1',
+                file_name: '减肥计划.html',
+                file_url: 'linsight/final_result/abc/减肥计划.html',
+            },
+            'SV-1',
+        );
+
+        expect(openSpy).toHaveBeenCalledTimes(1);
+        const opened = openSpy.mock.calls[0][0] as string;
+
+        expect(opened).not.toContain('/workspacelinsight');
+        expect(opened.startsWith('/workspace/html?')).toBe(true);
+
+        const qs = new URLSearchParams(opened.split('?')[1]);
+        expect(qs.get('url')).toBe('linsight/final_result/abc/减肥计划.html');
+        expect(qs.get('vid')).toBe('SV-1');
+        expect(openSpy.mock.calls[0][1]).toBe('_blank');
+    });
+
+    it('tolerates an empty versionId (vid present but blank)', () => {
+        openHtmlArtifactViewer(
+            { file_id: '2', file_name: 'a.html', file_url: 'linsight/final_result/x/a.html' },
+            '',
+        );
+        const opened = openSpy.mock.calls[0][0] as string;
+        const qs = new URLSearchParams(opened.split('?')[1]);
+        expect(qs.get('vid')).toBe('');
+        expect(qs.get('url')).toBe('linsight/final_result/x/a.html');
+    });
+
+    // The viewer opens as its own tab at /html, so it cannot read the share
+    // token off its own location — without forwarding it here, a share
+    // recipient's HTML report 403s on resolve.
+    it('forwards the share token when opened from a share page', () => {
+        window.history.pushState({}, '', '/workspace/share/tok-1/SV-9');
+        openHtmlArtifactViewer(
+            { file_id: '3', file_name: 'r.html', file_url: 'linsight/final_result/y/r.html' },
+            'SV-9',
+        );
+        const qs = new URLSearchParams((openSpy.mock.calls[0][0] as string).split('?')[1]);
+        expect(qs.get('share')).toBe('tok-1');
+        expect(qs.get('vid')).toBe('SV-9');
+    });
+
+    it('omits the share param outside a share page', () => {
+        window.history.pushState({}, '', '/workspace/c/abc');
+        openHtmlArtifactViewer(
+            { file_id: '4', file_name: 'r.html', file_url: 'linsight/final_result/y/r.html' },
+            'SV-9',
+        );
+        const qs = new URLSearchParams((openSpy.mock.calls[0][0] as string).split('?')[1]);
+        expect(qs.has('share')).toBe(false);
+    });
+});
+
+describe('applyHtmlViewerTabIdentity', () => {
+    const origEnv = (global as any).__APP_ENV__;
+    const origTitle = document.title;
+
+    beforeEach(() => {
+        (global as any).__APP_ENV__ = { ...origEnv, BASE_URL: '/workspace' };
+        document.head.innerHTML = '';
+        document.title = 'BISHENG';
+        delete (window as any).BRAND_CONFIG;
+    });
+
+    afterEach(() => {
+        (global as any).__APP_ENV__ = origEnv;
+        document.title = origTitle;
+        delete (window as any).BRAND_CONFIG;
+    });
+
+    const favicon = () => document.head.querySelector<HTMLLinkElement>("link[rel~='icon']");
+
+    // The report lives in a sandboxed iframe whose <head> can't reach this tab, so
+    // the viewer must stamp the brand favicon onto the top-level /html document.
+    it('applies the configured brand favicon to the tab', () => {
+        (window as any).BRAND_CONFIG = { assets: { favicon: { url: '/workspace/brand-assets/favicon/custom.ico' } } };
+
+        applyHtmlViewerTabIdentity('<html><head><title>Report</title></head><body></body></html>');
+
+        expect(favicon()?.getAttribute('href')).toBe('/workspace/brand-assets/favicon/custom.ico');
+    });
+
+    it('falls back to the bundled default favicon when no brand favicon is configured', () => {
+        applyHtmlViewerTabIdentity('<html><head><title>Report</title></head></html>');
+
+        expect(favicon()?.getAttribute('href')).toBe('/workspace/assets/bisheng/favicon.ico');
+    });
+
+    // brand-runtime.js may have already created the icon link; reuse it instead of
+    // appending a duplicate the browser might ignore.
+    it('reuses an existing icon link instead of appending a duplicate', () => {
+        const existing = document.createElement('link');
+        existing.rel = 'icon';
+        existing.href = '/old.ico';
+        document.head.appendChild(existing);
+        (window as any).BRAND_CONFIG = { assets: { favicon: { url: '/new.ico' } } };
+
+        applyHtmlViewerTabIdentity('<html></html>');
+
+        const links = document.head.querySelectorAll("link[rel~='icon']");
+        expect(links.length).toBe(1);
+        expect(favicon()?.getAttribute('href')).toBe('/new.ico');
+    });
+
+    it("sets the tab title to the report's own <title>", () => {
+        applyHtmlViewerTabIdentity('<html><head><title>Seedmind</title></head><body></body></html>');
+
+        expect(document.title).toBe('Seedmind');
+    });
+
+    it('leaves the brand title in place when the report has no <title>', () => {
+        applyHtmlViewerTabIdentity('<html><body><p>no head title</p></body></html>');
+
+        expect(document.title).toBe('BISHENG');
+    });
+});
+
+/**
+ * Task-mode markdown carries citations as private-use spans
+ * `\ue200<sourceId>[\ue201<sourceId>...]\ue202`. The in-app preview turns them
+ * into badges, but a downloaded / knowledge-saved FILE would show invisible
+ * wrapper chars around bare source ids - so the hand-off path strips the whole
+ * span, ids included. Binary artifacts must never be decoded.
+ */
+describe('fetchArtifactBlob citation stripping', () => {
+    const origFetch = global.fetch;
+
+    // jsdom's Blob has no .text(); read the produced blob back through FileReader.
+    const readBlobText = (blob: Blob) =>
+        new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result));
+            reader.onerror = () => reject(reader.error);
+            reader.readAsText(blob);
+        });
+
+    const mockFetch = (body: string, type: string) => {
+        const raw = new Blob([body], { type });
+        const text = jest.fn().mockResolvedValue(body);
+        const blob = jest.fn().mockResolvedValue(raw);
+        global.fetch = jest.fn().mockResolvedValue({ ok: true, text, blob }) as unknown as typeof fetch;
+        return { raw, text, blob };
+    };
+
+    const cited =
+        'Claim A\ue200knowledgesearch_18f5868b:0\ue202 and claim B' +
+        '\ue200knowledgesearch_18f5868b:1\ue201websearch_ab12cd34:3\ue202.\n' +
+        'Orphan \ue201 marker left by a truncated stream.';
+    const clean = 'Claim A and claim B.\nOrphan  marker left by a truncated stream.';
+
+    beforeEach(() => {
+        (request.post as jest.Mock).mockResolvedValue({
+            status_code: 200,
+            data: { file_path: '/presigned/x' },
+        });
+    });
+
+    afterEach(() => {
+        global.fetch = origFetch;
+    });
+
+    it('removes citation spans, their source ids and stray markers from a .md deliverable', async () => {
+        mockFetch(cited, 'text/markdown');
+
+        const { blob, fileName } = await fetchArtifactBlob(
+            { file_id: '1', file_name: 'report.md', file_url: 'output/report.md', source: 'output' },
+            'SV-1',
+        );
+
+        expect(global.fetch).toHaveBeenCalledWith('/presigned/x');
+        expect(fileName).toBe('report.md');
+        expect(blob.type).toBe('text/markdown;charset=utf-8');
+        const text = await readBlobText(blob);
+        expect(text).toBe(clean);
+        expect(text).not.toMatch(/[\ue200\ue201\ue202]/);
+        expect(text).not.toContain('knowledgesearch_');
+        expect(text).not.toContain('websearch_');
+    });
+
+    it('treats .markdown like .md', async () => {
+        mockFetch(cited, 'text/markdown');
+
+        const { blob } = await fetchArtifactBlob(
+            { file_id: '2', file_name: 'notes.markdown', file_url: 'output/notes.markdown', source: 'output' },
+            'SV-1',
+        );
+
+        expect(await readBlobText(blob)).toBe(clean);
+    });
+
+    it('also strips a parsed-markdown upload (bytes are markdown whatever the name says)', async () => {
+        mockFetch(cited, 'text/markdown');
+
+        const { blob, fileName } = await fetchArtifactBlob(
+            { file_id: '3', file_name: 'source.pdf', file_url: 'uploads/source/index.md', source: 'upload' },
+            'SV-1',
+        );
+
+        expect(fileName).toBe('source.md');
+        expect(await readBlobText(blob)).toBe(clean);
+    });
+
+    it('passes a binary artifact through untouched (never decoded as text)', async () => {
+        const { raw, text } = mockFetch(
+            'PK not markdown knowledgesearch_1:0',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        );
+
+        const { blob, fileName } = await fetchArtifactBlob(
+            { file_id: '4', file_name: 'report.docx', file_url: 'output/report.docx', source: 'output' },
+            'SV-1',
+        );
+
+        expect(fileName).toBe('report.docx');
+        expect(blob).toBe(raw);
+        expect(text).not.toHaveBeenCalled();
+    });
+});
+
+describe('stripCitationHandles (unresolved short-handle grammar)', () => {
+    // Strip cases: every run shape the backend grammar (_RUN_RE) recognises.
+    it.each([
+        ['single group', 'Claim A. [S3] Next.', 'Claim A.  Next.'],
+        ['adjacent groups', 'Claim A. [S3][S7] Next.', 'Claim A.  Next.'],
+        ['adjacent groups with whitespace between', 'Claim A. [S3] [S7] Next.', 'Claim A.  Next.'],
+        ['comma list', 'Claim A. [S3, S7]', 'Claim A. '],
+        ['full-width comma list', 'Claim A. [S3\uff0cS7]', 'Claim A. '],
+        ['ideographic comma list', 'Claim A. [S3\u3001S7]', 'Claim A. '],
+        ['inner whitespace inside a group', 'Claim A. [ S3 , S7 ]', 'Claim A. '],
+        ['two separate runs', 'A. [S3] B. [S7]', 'A.  B. '],
+        ['four-digit handle', 'A. [S1234]', 'A. '],
+        ['run right after a table pipe', '|cell|[S3]|', '|cell||'],
+        ['run at the start of the text', '[S3] leading', ' leading'],
+    ])('strips %s', (_label, input, expected) => {
+        expect(stripCitationHandles(input)).toBe(expected);
+    });
+
+    // Keep cases: everything the grammar explicitly excludes.
+    it.each([
+        ['a bare number', 'Bare [3] stays.'],
+        ['a footnote reference', 'Footnote [^3] stays.'],
+        ['a markdown link label', 'Link [S3](https://x) stays.'],
+        ['a markdown link label with a space before the url', 'Link [S3] (https://x) stays.'],
+        ['a fenced code block', '```\n[S3]\n```'],
+        ['a tilde-fenced code block', '~~~\n[S3]\n~~~'],
+        ['an inline code span', 'Inline `[S3]` stays.'],
+        ['a definition line with a colon', '[S3]: Knowledge base rule'],
+        ['a definition line with a full-width colon', '[S3]\uff1a Knowledge base rule'],
+        ['an indented definition line', '  [S3]  : rule'],
+        ['a five-digit handle', 'A. [S12345]'],
+        ['a lowercase prefix', 'A. [s3]'],
+        ['a handle glued to an ascii word', 'word[S3]'],
+        ['a handle glued to another bracket', '[[S3]]'],
+        ['an empty string', ''],
+    ])('keeps %s', (_label, input) => {
+        expect(stripCitationHandles(input)).toBe(input);
+    });
+
+    it('strips runs around a definition line and around code without touching them', () => {
+        const text = 'A. [S3][S7] B. [S99] `[S3]` [S3](u)\n[S3]: def';
+        expect(stripCitationHandles(text)).toBe('A.  B.  `[S3]` [S3](u)\n[S3]: def');
+    });
+
+    it('only strips outside code even when prose and code alternate', () => {
+        const text = 'x [S1] `[S2]` y [S3]\n```\n[S4]\n```\nz [S5]';
+        expect(stripCitationHandles(text)).toBe('x  `[S2]` y \n```\n[S4]\n```\nz ');
+    });
+
+    it('does not touch a definition line when the same handle is cited in the body', () => {
+        const text = 'Body cites [S3] here.\n[S3]: def\nAnd [S3] again.';
+        expect(stripCitationHandles(text)).toBe('Body cites  here.\n[S3]: def\nAnd  again.');
+    });
+
+    it('does not treat a definition-like fragment mid-line as a definition', () => {
+        expect(stripCitationHandles('prose [S3]: not a def')).toBe('prose : not a def');
+    });
+});
+
+describe('fetchArtifactBlob unresolved-handle stripping', () => {
+    const origFetch = global.fetch;
+
+    const readBlobText = (blob: Blob) =>
+        new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result));
+            reader.onerror = () => reject(reader.error);
+            reader.readAsText(blob);
+        });
+
+    beforeEach(() => {
+        (request.post as jest.Mock).mockResolvedValue({
+            status_code: 200,
+            data: { file_path: '/presigned/x' },
+        });
+    });
+
+    afterEach(() => {
+        global.fetch = origFetch;
+    });
+
+    it('drops an unresolved [S99] from the saved markdown while a bare [3] stays', async () => {
+        const body =
+            'Resolved\ue200knowledgesearch_18f5868b:0\ue202 and unresolved [S99] and bare [3].\n' +
+            '[S99]: def line stays\n' +
+            'code `[S99]` stays';
+        const text = jest.fn().mockResolvedValue(body);
+        global.fetch = jest.fn().mockResolvedValue({ ok: true, text, blob: jest.fn() }) as unknown as typeof fetch;
+
+        const { blob } = await fetchArtifactBlob(
+            { file_id: '5', file_name: 'report.md', file_url: 'output/report.md', source: 'output' },
+            'SV-1',
+        );
+
+        const saved = await readBlobText(blob);
+        expect(saved).toBe(
+            'Resolved and unresolved  and bare [3].\n' +
+            '[S99]: def line stays\n' +
+            'code `[S99]` stays',
+        );
+        expect(saved).not.toMatch(/[\ue200\ue201\ue202]/);
+        expect(saved).not.toContain('knowledgesearch_');
+    });
+});
+
+/**
+ * F069 P2 (AC-20 / AC-22): with the run's citation seed the saved markdown
+ * carries visible `[n]` markers and a reference list; without any detail the
+ * P1 strip above still applies byte for byte.
+ */
+describe('fetchArtifactBlob citation baking', () => {
+    const origFetch = global.fetch;
+
+    const readBlobText = (blob: Blob) =>
+        new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result));
+            reader.onerror = () => reject(reader.error);
+            reader.readAsText(blob);
+        });
+
+    const mockFetchText = (body: string) => {
+        const text = jest.fn().mockResolvedValue(body);
+        global.fetch = jest.fn().mockResolvedValue({ ok: true, text, blob: jest.fn() }) as unknown as typeof fetch;
+    };
+
+    const seed: ChatCitation[] = [
+        {
+            citationId: 'knowledgesearch_18f5868b',
+            type: 'knowledgeSearch',
+            sourcePayload: {
+                documentName: 'handbook.pdf',
+                knowledgeName: 'HR',
+                items: [{ itemId: '0', page: 12 }],
+            },
+        },
+    ];
+
+    const report = { file_id: '6', file_name: 'report.md', file_url: 'output/report.md', source: 'output' as const };
+
+    beforeEach(() => {
+        (request.post as jest.Mock).mockResolvedValue({
+            status_code: 200,
+            data: { file_path: '/presigned/x' },
+        });
+    });
+
+    afterEach(() => {
+        global.fetch = origFetch;
+    });
+
+    it('bakes [n] plus a reference list from the seed and the resolve cache', async () => {
+        mockFetchText(
+            'Claimknowledgesearch_18f5868b:0 and webwebsearch_ab12cd34:3 and [S99].',
+        );
+        (resolveCitationDetails as jest.Mock).mockResolvedValue([
+            {
+                citationId: 'websearch_ab12cd34',
+                type: 'webSearch',
+                sourcePayload: { title: 'Example', source: 'example.com', url: 'https://example.com/x' },
+            },
+        ]);
+
+        const { blob } = await fetchArtifactBlob(report, 'SV-1', { citations: seed });
+
+        // Only the id missing from the seed goes to the resolver.
+        expect(resolveCitationDetails).toHaveBeenCalledWith(['websearch_ab12cd34']);
+        const saved = await readBlobText(blob);
+        expect(saved).toBe(
+            'Claim[1] and web[2] and .\n\n## com_linsight_export_references\n\n' +
+            '1. 《handbook.pdf》 · com_linsight_export_page:12 · HR\n' +
+            '2. Example · example.com · https://example.com/x\n',
+        );
+        expect(saved).not.toMatch(/[]/);
+        expect(saved).not.toContain('knowledgesearch_');
+    });
+
+    it('falls back to the P1 strip when there is no seed and the resolve fails (AC-22)', async () => {
+        mockFetchText('Claimknowledgesearch_18f5868b:0 and [S99] and bare [3].');
+        (resolveCitationDetails as jest.Mock).mockRejectedValue(new Error('network'));
+        const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+        const { blob } = await fetchArtifactBlob(report, 'SV-1');
+
+        expect(await readBlobText(blob)).toBe('Claim and  and bare [3].');
+        expect(warn).toHaveBeenCalled();
+    });
+
+    it('does not touch the resolver when the markdown has no markers', async () => {
+        mockFetchText('Plain [S99] text.');
+
+        const { blob } = await fetchArtifactBlob(report, 'SV-1', { citations: seed });
+
+        expect(resolveCitationDetails).not.toHaveBeenCalled();
+        expect(await readBlobText(blob)).toBe('Plain  text.');
+    });
+
+    it('drops a span the resolver cannot answer for and adds no section (forbidden source)', async () => {
+        mockFetchText('Claimknowledgesearch_forbidden:0 end.');
+        (resolveCitationDetails as jest.Mock).mockResolvedValue([]);
+
+        const { blob } = await fetchArtifactBlob(report, 'SV-1', { citations: [] });
+
+        expect(await readBlobText(blob)).toBe('Claim end.');
+    });
+});
+
+describe('uploaded spreadsheet kept as the original workbook', () => {
+    // Original-only entry: the seed object and the original are the same .xlsx.
+    const entry = {
+        file_id: 'f1',
+        original_filename: 'sales.xlsx',
+        valid: true,
+        ingest_mode: 'spreadsheet_original',
+        markdown_file_path: 'linsight/c1/f1.xlsx',
+        original_file_path: 'linsight/c1/f1.xlsx',
+    };
+
+    it('previews and downloads the workbook instead of rendering it as markdown', async () => {
+        const [artifact] = toUploadedArtifacts([entry]);
+
+        expect(artifact.file_url).toBe('linsight/c1/f1.xlsx');
+        expect(artifact.previewAsOriginal).toBe(true);
+        expect(getArtifactPreviewKind(artifact)).toBe('document');
+
+        global.fetch = jest.fn().mockResolvedValue({
+            ok: true,
+            blob: async () => new Blob(['PK']),
+        }) as unknown as typeof fetch;
+        const { fileName } = await fetchArtifactBlob({ ...artifact, directUrl: 'http://x/f1.xlsx' }, 'SV-1');
+        expect(fileName).toBe('sales.xlsx');
+    });
+
+    it('keeps the markdown view for dual-track entries parsed before this change', () => {
+        const [artifact] = toUploadedArtifacts([
+            {
+                ...entry,
+                ingest_mode: undefined,
+                markdown_file_path: 'linsight/c1/f1.md',
+                original_file_path: 'linsight/c1/f1_original.xlsx',
+            },
+        ]);
+
+        expect(artifact.file_url).toBe('linsight/c1/f1.md');
+        expect(getArtifactPreviewKind(artifact)).toBe('markdown');
+    });
+});

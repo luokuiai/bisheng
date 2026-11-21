@@ -1,0 +1,89 @@
+// @ts-strict-ignore
+import { Button, SearchInput } from '@bisheng/ui';
+import { AssistantIcon, SkillIcon } from "@/components/bs-icons";
+import { Tag } from '@bisheng/ui';
+
+import { getChatOnlineApi } from "@/controllers/API/assistant";
+import { useDebounce } from "@/util/hook";
+import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { useNavigate } from "react-router-dom";
+
+import { Sheet, SheetContent, SheetDescription, SheetTitle, SheetTrigger } from "../../bs-ui/sheet";
+import CardComponent from "../cardComponent";
+import LoadMore from "../loadMore";
+import AppAvator from "../cardComponent/avatar";
+
+export default function SkillChatSheet({ children, onSelect }) {
+    const [open, setOpen] = useState(false)
+    const { t } = useTranslation()
+    const navigate = useNavigate()
+
+    const cursorRef = useRef<string | null>(null)
+    const searchRef = useRef('')
+    const [options, setOptions] = useState<any>([])
+
+    const loadData = (more = false) => {
+        open && getChatOnlineApi(more ? cursorRef.current : null, searchRef.current, -1).then(res => {
+            const list = res.list || []
+            setOptions(opts => more ? [...opts, ...list] : list)
+            cursorRef.current = res.nextCursor
+        })
+    }
+    const debounceLoad = useDebounce(loadData, 600, false)
+
+    useEffect(() => {
+        cursorRef.current = null
+        searchRef.current = ''
+        loadData()
+    }, [open])
+
+    const handleSearch = (e) => {
+        cursorRef.current = null
+        searchRef.current = e.target.value
+        debounceLoad()
+    }
+
+    const handleLoadMore = () => {
+        loadData(true)
+    }
+
+    return <Sheet open={open} onOpenChange={setOpen}>
+        <SheetTrigger asChild>
+            {children}
+        </SheetTrigger>
+        <SheetContent className="sm:min-w-[966px]">
+            <div className="flex h-full" onClick={e => e.stopPropagation()}>
+                <div className="w-fit p-6">
+                    <SheetTitle>{t('chat.dialogueSelection')}</SheetTitle>
+                    <SheetDescription>{t('chat.chooseSkillOrAssistant')}</SheetDescription>
+                    <SearchInput placeholder={t('chat.search')} onChange={handleSearch} className={"my-6"} />
+                </div>
+                <div className="flex-1 min-w-[696px] bg-[#fff] dark:bg-[#030712] p-5 pt-12 h-full flex flex-wrap gap-1.5 overflow-y-auto scrollbar-hide content-start">
+                    {
+                        options.length ? options.map((flow, i) => (
+                            <CardComponent key={i}
+                                id={i + 1}
+                                data={flow}
+                                logo={<AppAvator id={flow.name} flowType={flow.flow_type} url={flow.logo} />}
+                                title={flow.name}
+                                description={flow.desc}
+                                type="sheet"
+                                footer={
+                                    <Tag className="absolute right-0 bottom-0" color={flow.flow_type === 'flow' ? 'skill' : 'default'}>
+                                        {flow.flow_type === 'flow' ? t('build.skill') : t('build.assistant')}
+                                    </Tag>
+                                }
+                                onClick={() => { onSelect(flow); setOpen(false) }}
+                            />
+                        )) : <div className="flex flex-col items-center justify-center pt-40 w-full">
+                            <p className="text-sm text-muted-foreground mb-3">{t('build.empty')}</p>
+                            <Button className="w-[200px]" onClick={() => navigate('/build/assist')}>{t('build.onlineSA')}</Button>
+                        </div>
+                    }
+                    <LoadMore onScrollLoad={handleLoadMore} />
+                </div>
+            </div>
+        </SheetContent>
+    </Sheet>
+};

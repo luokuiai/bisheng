@@ -1,0 +1,496 @@
+// @ts-strict-ignore
+import { Button, Input, notification, Select } from '@bisheng/ui';
+import { Outlined } from "bisheng-icons";
+import { useCallback,useEffect,useMemo,useState } from "react";
+import { EnumMultiSelect } from "./EnumMultiSelect";
+
+
+import {
+Dialog,
+DialogContent,
+DialogFooter,
+DialogHeader,
+DialogTitle
+} from "@/components/bs-ui/dialog";
+
+import { useSelectLabels } from "@/components/bs-comp/formFields/useSelectLabels";
+
+import { generateUUID } from "@/components/bs-ui/utils";
+import { Tag } from "@bisheng/ui";
+import { useTranslation } from "react-i18next";
+/* ================== 类型定义 ================== */
+export type LogicOperator = "and" | "or"
+export type FieldType = "string" | "number" | "date"
+// FilterOperator
+export type FilterOperator =
+  | "equals"
+  | "not_equals"
+  | "contains"
+  | "not_contains"
+  | "greater_than"
+  | "greater_than_or_equal"
+  | "less_than"
+  | "less_than_or_equal"
+  | "is_empty"
+  | "is_not_empty"
+  | "enum_in"
+  | "enum_not_in"
+export interface DatasetField {
+  fieldCode: string
+  displayName: string
+  fieldType: FieldType
+  role: "dimension" | "metric"
+  enumValues?: string[]
+  isVirtual?: boolean
+  isEnum?: boolean
+}
+export interface FilterCondition {
+  id: string
+  fieldCode?: string
+  fieldId?: string
+  fieldName?: string
+  fieldType?: FieldType
+  operator?: FilterOperator
+  value?: string | number | string[]
+  filterType?: "conditional" | "enum"
+}
+export interface FilterGroup {
+  logic: LogicOperator
+  conditions: FilterCondition[]
+}
+interface Props {
+  dimensions?: {fieldId?: string; name?:string;displayName?:string}[];
+  filtersLogic?: LogicOperator;
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  value: FilterGroup | null
+  onChange: (value: FilterGroup) => void
+  fields: DatasetField[]
+  dataset_code?: string
+}
+/* ================== 工具函数 ================== */
+const createEmptyCondition = (): FilterCondition => ({
+  id: generateUUID(6),
+})
+const operatorNeedsValue = (op?: FilterOperator) =>
+  !op || !["is_empty", "is_not_empty"].includes(op)
+const isEnumOperator = (op?: FilterOperator) =>
+  op === "enum_in" || op === "enum_not_in"
+/* ================== 枚举多选组件 (调用接口版本) ================== */
+/* ================== 主组件 ================== */
+export function FilterConditionDialog({
+  open,
+  onOpenChange,
+  value,
+  onChange,
+  fields,
+  dataset_code = "",
+  dimensions = [],
+  filtersLogic
+}: Props) {
+  const { t } = useTranslation("dashboard")
+  const selectLabels = useSelectLabels()
+  const [draft, setDraft] = useState<FilterGroup>({
+    logic: "and",
+    conditions: [createEmptyCondition()]
+  })
+  const [initialized, setInitialized] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const getFieldDisplayName = useCallback((fieldCode: string) => {
+    const dimension = dimensions.find(dim =>
+      dim.fieldId === fieldCode || dim.name === fieldCode
+    );
+    if (dimension?.displayName) {
+      return dimension.displayName;
+    }
+    // const field = fields.find(f => f.fieldCode === fieldCode);
+    return t(fieldCode) || t('filterConditionDialog.placeholders.noName');
+  }, [dimensions, fields, t]);
+  // 过滤掉时间字段
+  const filteredFields = useMemo(() => {
+    // console.log('原始字段数据:', fields)
+    if (!dataset_code || !dimensions || !fields) return []
+    return fields.filter(field => {
+      if (!field || !field.fieldCode || !field.displayName) {
+        // console.log('发现无效字段:', field)
+        return false
+      }
+      if (field.isVirtual === true) {
+        // console.log('过滤虚拟指标:', field.displayName)
+        return false
+      }
+      const lowerCode = field.fieldCode.toLowerCase()
+      const lowerName = field.displayName.toLowerCase()
+      // console.log('检查字段:', field.displayName, 'lowerCode:', lowerCode, 'lowerName:', lowerName)
+      // 检查是否包含时间相关关键词
+      const isTimeField = lowerCode.includes('time') ||
+        lowerCode.includes('date') ||
+        lowerName.includes(t('filterConditionDialog.keywords.time')) ||
+        lowerName.includes(t('filterConditionDialog.keywords.date'))
+      return !isTimeField
+    })
+  }, [fields, dimensions, dataset_code, t])
+  useEffect(() => {
+    if (!open) {
+      // 关闭对话框时重置状态
+      setDraft({
+        logic: "and",
+        conditions: [createEmptyCondition()]
+      })
+      setError(null)
+    }
+  }, [open])
+  useEffect(() => {
+    setInitialized(false)
+    setDraft({
+      logic: "and",
+      conditions: [createEmptyCondition()]
+    })
+  }, [dataset_code])
+  useEffect(() => {
+    if (!open) return
+    if (fields.length === 0) return
+    const safeValue = value || { logic: "and", conditions: [] }
+    const newConditions = (safeValue.conditions || []).map(c => {
+      let fieldCode = c.fieldCode
+      if (!fieldCode && c.fieldId) {
+        const field = fields.find(f => f.fieldCode === c.fieldId || f.fieldId === c.fieldId)
+        fieldCode = field?.fieldCode || c.fieldId
+      }
+      const field = fields.find(f => f.fieldCode === fieldCode)
+      const isEnum = field?.isEnum || (field?.enumValues?.length > 0)
+      let operator: FilterOperator
+      if (c.operator) operator = c.operator
+      else if (isEnum) operator = "in"  // 修改这里：枚举筛选用 "in"
+      else if (field?.fieldType === "string") operator = "equals"
+      else operator = "equals"
+      // 处理空值操作符的回显
+      let valueToSet = c.value ?? (isEnum ? [] : "")
+      // 如果是空值操作符，不需要值
+      if (c.operator && ["is_empty", "is_not_empty"].includes(c.operator)) {
+        valueToSet = ""
+      }
+      return {
+        id: c.id ?? generateUUID(6),
+        fieldCode: fieldCode ?? "",
+        fieldId: c.fieldId,
+        fieldType: field?.fieldType,
+        fieldName: field?.displayName,
+        operator,
+        value: valueToSet,
+        filterType: c.filterType || (isEnum ? "enum" : "conditional")
+      }
+    })
+    setDraft({
+      logic: safeValue.logic || filtersLogic || "and",
+      conditions: newConditions.length > 0 ? newConditions : [createEmptyCondition()]
+    })
+    setError(null)
+  }, [open, value, fields])
+  const isEnumField = useCallback((fieldCode: string) => {
+    const field = fields.find(f => f.fieldCode === fieldCode)
+    return !!field?.isEnum || (field?.enumValues?.length > 0)
+  }, [fields])
+  const validate = (): boolean => {
+    for (const c of draft.conditions) {
+      if (draft.conditions.length === 0) {
+        return true
+      }
+      if (!c.fieldCode) {
+        // setError(t('filterConditionDialog.errors.selectField'))
+        return true
+      }
+      if (!c.operator) {
+        setError(t('filterConditionDialog.errors.selectOperator'))
+        return false
+      }
+      if (operatorNeedsValue(c.operator)) {
+        if (c.filterType === "enum") {
+          if (!Array.isArray(c.value) || c.value.length === 0) {
+            setError(t('filterConditionDialog.errors.selectEnumValue'))
+            return false
+          }
+        } else {
+          if (c.value === undefined || c.value === "") {
+            setError(t('filterConditionDialog.errors.enterFilterValue'))
+            return false
+          }
+        }
+      }
+    }
+    setError(null)
+    return true
+  }
+  const updateCondition = (id: string, patch: Partial<FilterCondition>) => {
+    setDraft(prev => ({
+      ...prev,
+      conditions: prev.conditions.map(c => (c.id === id ? { ...c, ...patch } : c))
+    }))
+  }
+  const addCondition = () => {
+    setDraft(prev => ({
+      ...prev,
+      conditions: [...prev.conditions, createEmptyCondition()]
+    }))
+  }
+  const removeCondition = (id: string) => {
+    setDraft(prev => {
+      const newConditions = prev.conditions.filter(c => c.id !== id)
+      return {
+        ...prev,
+        conditions: newConditions.length > 0 ? newConditions : [createEmptyCondition()]
+      }
+    })
+  }
+  const handleFieldChange = (id: string, fieldCode: string) => {
+    const field = filteredFields.find(f => f.fieldCode === fieldCode)
+    const isEnum = isEnumField(fieldCode)
+    let defaultOperator: FilterOperator
+    let defaultFilterType: "conditional" | "enum"
+    if (isEnum) {
+      defaultFilterType = "enum"
+      defaultOperator = "in"
+    } else {
+      defaultFilterType = "conditional"
+      defaultOperator = "equals"
+    }
+    console.log(field, 8888999);
+    updateCondition(id, {
+      fieldCode,
+      fieldType: field?.fieldType,
+      fieldId: field?.fieldId || fieldCode,
+      fieldName: field?.displayName,
+      filterType: defaultFilterType,
+      operator: defaultOperator,
+      value: isEnum ? [] : ""
+    })
+  }
+  const handleFilterTypeChange = (id: string, filterType: "conditional" | "enum") => {
+    const condition = draft.conditions.find(c => c.id === id)
+    if (!condition || !condition.fieldCode) return
+    const isEnum = filterType === "enum"
+    updateCondition(id, {
+      filterType,
+      value: isEnum ? [] : condition.value,
+      operator: condition.operator ?? (isEnum ? "enum_in" : "equals")
+    })
+  }
+  const handleOperatorChange = (id: string, operator: FilterOperator) => {
+    const condition = draft.conditions.find(c => c.id === id)
+    const isEnum = condition?.filterType === "enum"
+    if (isEnum) {
+      updateCondition(id, { operator, value: [] })
+    } else {
+      if (!operatorNeedsValue(operator)) {
+        updateCondition(id, { operator, value: "" })
+      } else {
+        updateCondition(id, { operator, value: condition?.value || "" })
+      }
+    }
+  }
+  // Operators offered per field type; date fields have none here
+  const getOperatorOptions = (fieldType?: FieldType) => {
+    const operators: [FilterOperator, string][] = fieldType === "string"
+      ? [
+        ["equals", 'equals'], ["not_equals", 'notEquals'], ["contains", 'contains'],
+        ["not_contains", 'notContains'], ["is_empty", 'isEmpty'], ["is_not_empty", 'isNotEmpty'],
+      ]
+      : fieldType === "number"
+        ? [
+          ["equals", 'equals'], ["not_equals", 'notEquals'], ["greater_than", 'greaterThan'],
+          ["greater_than_or_equal", 'greaterThanOrEqual'], ["less_than", 'lessThan'], ["less_than_or_equal", 'lessThanOrEqual'],
+        ]
+        : []
+    return operators.map(([value, key]) => ({ value, label: t(`filterConditionDialog.operators.${key}`) }))
+  }
+  const handleToggleLogic = () => {
+    setDraft(prev => ({
+      ...prev,
+      logic: prev.logic === "and" ? "or" : "and"
+    }))
+  }
+  const handleSave = () => {
+    if (!validate()) return
+    const validConditions = draft.conditions.filter(c => c.fieldCode)
+    // if (validConditions.length === 0) {
+    //   setError(t('filterConditionDialog.errors.atLeastOneCondition'))
+    //   return
+    // }
+    if (validConditions.length === 0) {
+      onChange({
+        logic: "and",
+        conditions: []
+      })
+      notification.open({ type: "success", description: String(t('filterConditionDialog.toast.saveSuccess') ?? '') })
+      onOpenChange(false)
+      return
+    }
+    // 确保返回的数据结构正确
+    const transformedConditions = draft.conditions
+      .filter(c => c.fieldCode && c.value !== undefined)
+      .map(c => {
+        // 如果是枚举筛选，直接使用 "in"
+        if (c.filterType === "enum") {
+          return {
+            id: c.id,
+            fieldId: c.fieldId,
+            fieldCode: c.fieldCode,
+            fieldName: c.fieldName,
+            operator: "in", // 枚举筛选固定用 in
+            value: c.value,
+            filterType: c.filterType,
+            fieldType: c.fieldType
+          }
+        }
+        // 条件筛选：使用用户选择的操作符
+        return {
+          id: c.id,
+          fieldId: c.fieldId,
+          fieldCode: c.fieldCode,
+          fieldName: c.fieldName,
+          operator: c.operator, // 使用用户选择的操作符
+          value: c.value,
+          filterType: c.filterType,
+          fieldType: c.fieldType
+        }
+      })
+    console.log('保存的条件:', transformedConditions)
+    onChange({
+      logic: draft.logic,
+      conditions: transformedConditions
+    })
+    notification.open({ type: "success", description: String(t('filterConditionDialog.toast.saveSuccess') ?? '') })
+    onOpenChange(false)
+  }
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-[900px] max-h-[70vh] flex flex-col">
+        <DialogHeader>
+          <DialogTitle>{t('filterConditionDialog.title')}</DialogTitle>
+        </DialogHeader>
+        <div className="relative">
+          {/* 全局 AND / OR + 竖虚线 */}
+          {draft.conditions.length > 1 && (
+            <>
+              {/* 完整的垂直虚线 - 从顶部横线到底部横线 */}
+              <div className="absolute left-3 top-6 bottom-6 w-[1px] border-l border-dashed border-gray-300"></div>
+              {/* 顶部横线 */}
+              <div className="absolute left-3 top-6 w-3 h-[1px] border-t border-dashed border-gray-300"></div>
+              {/* 底部横线 */}
+              <div className="absolute left-3 bottom-6 w-3 h-[1px] border-t border-dashed border-gray-300"></div>
+              {/* AND / OR徽章 */}
+              <div className="absolute -left-4 top-1/2 -translate-y-1/2 z-10">
+                <Button size="small" variant="text" onClick={handleToggleLogic} color="default">
+                  {draft.logic}
+                  <Outlined.Refresh size={10} className="ml-1" />
+                </Button>
+              </div>
+            </>
+          )}
+          <div className="space-y-4 pl-8">
+            {/* 条件列表 */}
+            {draft.conditions.length > 0 ? (
+              draft.conditions.map((c, index) => {
+                return (
+                  <div key={c.id} className="relative group">
+                    <div className="flex items-center gap-2 p-2">
+                      {/* 第一个下拉框：选择字段 */}
+                      <Select
+                        {...selectLabels}
+                        className="w-[120px]"
+                        options={filteredFields
+                          .filter(f => f.fieldCode != null && f.fieldCode !== '')
+                          .map(f => ({ value: f.fieldCode, label: getFieldDisplayName(f.fieldCode) || t('noValue') }))}
+                        value={c.fieldCode || null}
+                        onChange={v => { if (v != null) handleFieldChange(c.id, String(v)) }}
+                        placeholder={t('filterConditionDialog.placeholders.selectField')}
+                        aria-label={t('filterConditionDialog.placeholders.selectField')}
+                        emptyText={t('filterConditionDialog.filterTypes.noFields')}
+                      />
+                      {/* 第二个下拉框：筛选类型 */}
+                      {c.fieldCode && (
+                        <Select
+                          {...selectLabels}
+                          className="w-[100px]"
+                          options={[
+                            { value: "conditional", label: t('filterConditionDialog.filterTypes.conditional') },
+                            ...(c.fieldType !== "number" ? [{ value: "enum", label: t('filterConditionDialog.filterTypes.enum') }] : []),
+                          ]}
+                          value={c.filterType || null}
+                          onChange={v => { if (v != null) handleFilterTypeChange(c.id, v as "conditional" | "enum") }}
+                          placeholder={t('filterConditionDialog.placeholders.filterType')}
+                          aria-label={t('filterConditionDialog.placeholders.filterType')}
+                        />
+                      )}
+                      {/* 条件筛选的操作符和值输入 */}
+                      {c.fieldCode && c.filterType === "conditional" && (
+                        <>
+                          {/* 操作符 */}
+                          <Select
+                            {...selectLabels}
+                            className="w-[160px]"
+                            options={getOperatorOptions(c.fieldType)}
+                            value={c.operator || null}
+                            onChange={v => { if (v != null) handleOperatorChange(c.id, v as FilterOperator) }}
+                            placeholder={t('filterConditionDialog.placeholders.operator')}
+                            aria-label={t('filterConditionDialog.placeholders.operator')}
+                          />
+                          {/* 值输入 */}
+                          {c.operator && operatorNeedsValue(c.operator) && (
+                            <>
+                              <Input type="text" placeholder={t('filterConditionDialog.placeholders.enterNumber')} value={c.value ?? ""} onChange={e =>
+                                  updateCondition(c.id, {
+                                    value: e.target.value
+                                  })
+                                } className={"flex-1 min-w-[120px] h-8"} />
+                            </>
+                          )}
+                        </>
+                      )}
+                      {/* 枚举筛选的下拉选择框 */}
+                      {c.fieldCode && c.filterType === "enum" && (
+                        <div className="flex-1">
+                          <EnumMultiSelect
+                            dataset_code={dataset_code}
+                            fieldCode={c.fieldCode}
+                            selected={(c.value as string[]) || []}
+                            onChange={selected => updateCondition(c.id, { value: selected })}
+                            placeholder={t('filterConditionDialog.placeholders.selectEnumValue')}
+                          />
+                        </div>
+                      )}
+                      {/* 删除按钮 */}
+                      <Button variant="text" size="medium" onClick={() => removeCondition(c.id)} className="flex-shrink-0 h-8 w-8 group-hover:opacity-100 opacity-0" color="default" iconOnly>
+                        <Outlined.Delete className="h-4 w-4 hover:text-red-600 cursor-pointer" />
+                      </Button>
+                    </div>
+                  </div>
+                )
+              })
+            ) : (
+              <div className="text-center py-4 text-muted-foreground">
+              </div>
+            )}
+          </div>
+        </div>
+        {/* 添加条件按钮 */}
+        <div>
+          <Button variant="outlined" className="border-primary text-primary hover:bg-primary/10 h-8" onClick={addCondition} color="default">
+            <Outlined.Plus className="h-3 w-3 mr-1" />
+            {t('filterConditionDialog.buttons.addCondition')}
+          </Button>
+        </div>
+        {/* 错误提示 */}
+        {error && <div className="text-sm text-destructive">{error}</div>}
+        <DialogFooter>
+          <Button variant="outlined" onClick={() => onOpenChange(false)} color="default">
+            {t('filterConditionDialog.buttons.cancel')}
+          </Button>
+          <Button onClick={handleSave}>
+            {t('filterConditionDialog.buttons.save')}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}

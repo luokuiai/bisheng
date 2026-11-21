@@ -1,0 +1,24 @@
+import path from 'path';
+import { defineConfig } from 'vitest/config';
+import svgr from 'vite-plugin-svgr';
+
+export default defineConfig({
+  plugins: [svgr()],
+  resolve: {
+    dedupe: ['react-i18next'],
+    alias: {
+      '@': path.resolve(__dirname, './src'),
+    },
+  },
+  test: {
+    globals: true,
+    environment: 'jsdom',
+    setupFiles: ['./src/test/setup.ts'],
+    include: ['src/**/*.{test,spec}.{ts,tsx}'],
+    coverage: {
+      provider: 'v8',
+      include: ['src/**/*.{ts,tsx}'],
+      exclude: ['src/**/*.d.ts', 'src/test/**'],
+    },
+  },
+});

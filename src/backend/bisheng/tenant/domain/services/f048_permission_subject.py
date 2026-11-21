@@ -1,0 +1,454 @@
+"""Tenant-owned subject validation for F048 Grant APIs."""
+
+from __future__ import annotations
+
+from bisheng.common.errcode.permission import PermissionInvalidResourceError, PermissionSubjectUnavailableError
+from bisheng.database.models.department import (
+    DepartmentDao,
+    UserDepartmentDao,
+)
+from bisheng.database.models.group import GroupDao
+from bisheng.database.models.tenant import UserTenantDao
+from bisheng.database.models.user_group import UserGroupDao
+from bisheng.department.domain.services.department_service import _dept_node_dict
+from bisheng.open_api.domain.repositories.service_account_repository import ServiceAccountRepository
+from bisheng.permission.domain.services import grant_subject_service
+from bisheng.permission.domain.services.grant_source_service import (
+    GrantSourceRecord,
+    GrantSourceService,
+)
+from bisheng.permission.domain.services.grant_subject_service import GrantSubjectScope
+from bisheng.permission.domain.services.permission_action_service import (
+    PermissionActor,
+)
+from bisheng.tenant.domain.repositories.grant_department_repository import GrantDepartmentRepository
+from bisheng.tenant.domain.repositories.grant_subject_search_repository import GrantSubjectSearchRepository
+from bisheng.tenant.domain.repositories.permission_subject_repository import PermissionSubjectRepository
+from bisheng.user.application.runtime_identity import read_current_person_facts
+from bisheng.user.domain.models.user import UserDao
+
+
+class TenantPermissionSubjectDirectory:
+    """Validate subjects and decorate names without entering permission domain."""
+
+    def __init__(self) -> None:
+        self._sources = GrantSourceService()
+        self._candidate_queries = GrantSubjectSearchRepository()
+        self._departments = GrantDepartmentRepository()
+        self._summary_queries = PermissionSubjectRepository()
+
+    async def describe_active_sources(self, *, tenant_id, sources):
+        """Read names and current identity eligibility, never expand usersets."""
+        supported = {"user", "department", "user_group", "service_account"}
+        for source in sources:
+            if source.subject_type not in supported or not source.subject_id.isdigit():
+                raise PermissionSubjectUnavailableError(reason="unsupported_summary_subject")
+        keys = tuple({(row.subject_type, row.subject_id) for row in sources})
+        users = await read_current_person_facts([int(ident) for kind, ident in keys if kind == "user"])
+        names = await self._summary_queries.load(tenant_id, keys)
+        result, seen = [], set()
+        for source in sources:
+            kind, ident = source.subject_type, source.subject_id
+            if kind == "service_account":
+                continue
+            if kind == "user":
+                person = users.get(int(ident))
+                if person is None or person["state"] == "ambiguous":
+                    raise PermissionSubjectUnavailableError(reason="summary_person_unresolved")
+                if person["state"] != "active" or person["tenant_id"] != tenant_id:
+                    continue
+                name = person["name"]
+            else:
+                row = names.get((kind, ident))
+                if row is None or row.tenant_id != tenant_id:
+                    continue
+                name = row.name if kind == "department" else row.group_name
+            relation, children = source.userset_relation, source.include_children
+            if (
+                (kind == "user" and (relation is not None or children))
+                or (kind == "user_group" and (relation not in {"admin", "member"} or children))
+                or (kind == "department" and relation != ("subtree_member" if children else "member"))
+            ):
+                raise PermissionSubjectUnavailableError(reason="summary_userset_unresolved")
+            if not name:
+                raise PermissionSubjectUnavailableError(reason="summary_name_unresolved")
+            key = (kind, ident, relation, children)
+            if key not in seen:
+                seen.add(key)
+                result.append(
+                    {
+                        "type": kind,
+                        "id": ident,
+                        "name": name,
+                        "userset_relation": relation,
+                        "include_children": children,
+                    }
+                )
+        return result
+
+    async def candidate_users(self, scope, *, keyword: str, page: int, page_size: int):
+        return await self._candidate_queries.users(scope, keyword=keyword, page=page, page_size=page_size)
+
+    async def count_candidate_users(self, scope, *, keyword: str):
+        return await self._candidate_queries.count_users(scope, keyword=keyword)
+
+    async def candidate_groups(self, scope, *, keyword: str, page: int, page_size: int):
+        return await self._candidate_queries.groups(scope, keyword=keyword, page=page, page_size=page_size)
+
+    async def count_candidate_groups(self, scope, *, keyword: str):
+        return await self._candidate_queries.count_groups(scope, keyword=keyword)
+
+    async def candidate_departments(self, scope, *, keyword: str, limit: int):
+        return await self._candidate_queries.departments(scope, keyword=keyword, limit=limit)
+
+    async def candidate_department_layer(self, scope, *, parent_id: int | None) -> list[dict]:
+        rows, children = await self._departments.layer(scope, parent_id=parent_id)
+        return [_dept_node_dict(row, has_children=int(row.id) in children) for row in rows]
+
+    async def _department_forest(self, boundary, matches) -> list[dict]:
+        if boundary is None or not matches:
+            return []
+        rows, children = await self._departments.forest(boundary, matches)
+        matched_ids = {int(row.id) for row in matches}
+        nodes = {
+            int(row.id): _dept_node_dict(row, has_children=int(row.id) in children, matched=int(row.id) in matched_ids)
+            for row in rows
+        }
+        roots = []
+        for row in rows:
+            parent = nodes.get(row.parent_id)
+            if parent is None:
+                roots.append(nodes[int(row.id)])
+            else:
+                parent["children"].append(nodes[int(row.id)])
+
+        def sort_layer(layer):
+            layer.sort(key=lambda node: (node["sort_order"], node["id"]))
+            for node in layer:
+                sort_layer(node["children"])
+
+        sort_layer(roots)
+        return roots
+
+    async def search_candidate_departments(self, scope, *, keyword: str, limit: int) -> dict:
+        boundary, rows = await self._departments.search(scope, keyword=keyword, limit=limit + 1)
+        matches = rows[:limit]
+        return {
+            "roots": await self._department_forest(boundary, matches),
+            "total_matches": len(matches),
+            "truncated": len(rows) > limit,
+        }
+
+    async def candidate_department_path(self, scope, *, dept_id: int) -> dict:
+        boundary, row = await self._departments.get(scope, department_id=dept_id)
+        roots = await self._department_forest(boundary, [row] if row is not None else [])
+        return {"roots": roots, "total_matches": int(row is not None), "truncated": False}
+
+    @staticmethod
+    def _prospective_scope(tenant_id: int, resource_type: str) -> GrantSubjectScope:
+        if resource_type not in {"knowledge_space", "channel"}:
+            raise PermissionInvalidResourceError()
+        return GrantSubjectScope(tenant_id=tenant_id, department_path=None)
+
+    async def list_users(
+        self,
+        *,
+        tenant_id: int,
+        resource_type: str,
+        keyword: str,
+        page: int,
+        page_size: int,
+    ) -> dict[str, object]:
+        scope = self._prospective_scope(tenant_id, resource_type)
+        rows = await grant_subject_service.list_candidate_users(
+            scope,
+            keyword=keyword,
+            page=page,
+            page_size=page_size,
+        )
+        total = await grant_subject_service.count_candidate_users(scope, keyword=keyword)
+        return {"data": rows, "total": total}
+
+    async def list_user_groups(
+        self,
+        *,
+        tenant_id: int,
+        resource_type: str,
+        keyword: str,
+        page: int,
+        page_size: int,
+    ) -> dict[str, object]:
+        scope = self._prospective_scope(tenant_id, resource_type)
+        rows = await grant_subject_service.list_candidate_user_groups(
+            scope,
+            keyword=keyword,
+            page=page,
+            page_size=page_size,
+        )
+        total = await grant_subject_service.count_candidate_user_groups(scope, keyword=keyword)
+        return {"data": rows, "total": total}
+
+    async def list_department_children(
+        self,
+        *,
+        tenant_id: int,
+        resource_type: str,
+        parent_id: int | None,
+    ) -> list[dict[str, object]]:
+        return await grant_subject_service.list_candidate_department_layer(
+            self._prospective_scope(tenant_id, resource_type),
+            parent_id=parent_id,
+        )
+
+    async def search_departments(
+        self,
+        *,
+        tenant_id: int,
+        resource_type: str,
+        keyword: str,
+        limit: int,
+    ) -> dict[str, object]:
+        return await grant_subject_service.search_candidate_departments(
+            self._prospective_scope(tenant_id, resource_type),
+            keyword=keyword,
+            limit=limit,
+        )
+
+    async def get_department_path(
+        self,
+        *,
+        tenant_id: int,
+        resource_type: str,
+        department_id: int,
+    ) -> dict[str, object]:
+        return await grant_subject_service.get_candidate_department_path(
+            self._prospective_scope(tenant_id, resource_type),
+            dept_id=department_id,
+        )
+
+    async def actor_projected_subjects(
+        self,
+        actor: PermissionActor,
+    ) -> frozenset[str]:
+        if actor.subject_type == "service_account":
+            return frozenset({actor.fga_subject})
+        projected = {actor.fga_subject, f"tenant:{actor.current_tenant_id}#member"}
+        memberships = await UserDepartmentDao.aget_user_departments(actor.user_id)
+        departments = await DepartmentDao.aget_by_ids([row.department_id for row in memberships])
+        for department in departments:
+            if int(department.tenant_id or 0) != actor.current_tenant_id or department.status != "active":
+                continue
+            projected.add(f"department:{department.id}#member")
+            path_ids = [int(value) for value in (department.path or "").split("/") if value.isdigit()]
+            for ancestor_id in (*path_ids, int(department.id or 0)):
+                if ancestor_id > 0:
+                    projected.add(f"department:{ancestor_id}#subtree_member")
+
+        member_groups = await UserGroupDao.aget_user_group(actor.user_id)
+        admin_groups = await UserGroupDao.aget_user_admin_group(actor.user_id)
+        for membership in (*member_groups, *admin_groups):
+            projected.add(f"user_group:{membership.group_id}#member")
+        for membership in admin_groups:
+            projected.add(f"user_group:{membership.group_id}#admin")
+        return frozenset(projected)
+
+    async def canonical_source(
+        self,
+        *,
+        tenant_id: int,
+        source_id: int,
+        subject_type: str,
+        subject_id: str,
+        userset_relation: str | None,
+        include_children: bool,
+    ) -> GrantSourceRecord:
+        normalized_type = subject_type.strip().lower()
+        normalized_id = subject_id.strip()
+        if not normalized_id.isdigit():
+            raise PermissionInvalidResourceError()
+        identifier = int(normalized_id)
+        if normalized_type == "tenant":
+            valid = identifier == tenant_id
+            source_type = "TENANT"
+        elif normalized_type == "user":
+            rows = await UserTenantDao.aget_user_tenants(identifier)
+            valid = any(row.tenant_id == tenant_id and row.status == "active" and row.is_active == 1 for row in rows)
+            if not valid:
+                raise PermissionSubjectUnavailableError()
+            source_type = "DIRECT"
+        elif normalized_type == "service_account":
+            row = await ServiceAccountRepository.get(identifier)
+            valid = bool(row and row.is_enabled and row.tenant_id == tenant_id)
+            source_type = "DIRECT"
+        elif normalized_type == "department":
+            _, row = await self._departments.get(
+                GrantSubjectScope(tenant_id=tenant_id, department_path=None), department_id=identifier
+            )
+            valid = row is not None
+            source_type = "DEPARTMENT"
+        elif normalized_type == "user_group":
+            row = await GroupDao.aget_by_id(identifier)
+            valid = bool(row and row.tenant_id == tenant_id)
+            source_type = "USER_GROUP"
+        else:
+            raise PermissionInvalidResourceError()
+        if not valid:
+            raise PermissionInvalidResourceError()
+        return self._sources.canonicalize_source(
+            source_id=source_id,
+            subject_type=normalized_type,
+            subject_id=normalized_id,
+            source_type=source_type,
+            userset_relation=userset_relation,
+            include_children=include_children,
+        )
+
+    async def display_names(
+        self,
+        subjects: tuple[tuple[str, str], ...],
+    ) -> dict[tuple[str, str], str]:
+        user_ids = [
+            int(subject_id) for subject_type, subject_id in subjects if subject_type == "user" and subject_id.isdigit()
+        ]
+        department_ids = [
+            int(subject_id)
+            for subject_type, subject_id in subjects
+            if subject_type == "department" and subject_id.isdigit()
+        ]
+        group_ids = [
+            int(subject_id)
+            for subject_type, subject_id in subjects
+            if subject_type == "user_group" and subject_id.isdigit()
+        ]
+        service_account_ids = [
+            int(subject_id)
+            for subject_type, subject_id in subjects
+            if subject_type == "service_account" and subject_id.isdigit()
+        ]
+        users = await UserDao.aget_user_by_ids(user_ids) if user_ids else []
+        departments = await DepartmentDao.aget_by_ids(department_ids) if department_ids else []
+        groups = await GroupDao.aget_group_by_ids(group_ids) if group_ids else []
+        service_accounts = await ServiceAccountRepository.get_by_ids(service_account_ids)
+        return {
+            **{("user", str(row.user_id)): row.user_name for row in users or () if row.user_id is not None},
+            **{("department", str(row.id)): row.name for row in departments if row.id is not None},
+            **{("user_group", str(row.id)): row.group_name for row in groups if row.id is not None},
+            **{("service_account", str(row.id)): row.name for row in service_accounts if row.id is not None},
+        }
+
+    async def resource_display_names(
+        self,
+        resources: tuple[tuple[str, str], ...],
+    ) -> dict[tuple[str, str], str]:
+        """Label the resources a grant can be inherited from.
+
+        The permission layer knows a resource's identity, never its name, so the
+        business side resolves labels for both spaces and folders. Unknown or
+        missing resources stay unlabeled so callers can use a friendly generic
+        fallback without exposing the internal resource key.
+        """
+
+        from bisheng.knowledge.domain.models.knowledge import KnowledgeDao
+        from bisheng.knowledge.domain.models.knowledge_file import KnowledgeFileDao
+
+        knowledge_ids = [
+            int(resource_id)
+            for resource_type, resource_id in resources
+            if resource_type in {"knowledge_space", "knowledge_library"} and resource_id.isdigit()
+        ]
+        folder_ids = [
+            int(resource_id)
+            for resource_type, resource_id in resources
+            if resource_type == "folder" and resource_id.isdigit()
+        ]
+        knowledge_rows = await KnowledgeDao.aget_list_by_ids(knowledge_ids) if knowledge_ids else []
+        folder_rows = await KnowledgeFileDao.aget_file_by_ids(folder_ids) if folder_ids else []
+        knowledge_by_id = {int(row.id): row.name for row in knowledge_rows or () if row.id is not None}
+        folder_by_id = {int(row.id): row.file_name for row in folder_rows or () if row.id is not None}
+        labels = {
+            (resource_type, resource_id): knowledge_by_id[int(resource_id)]
+            for resource_type, resource_id in resources
+            if resource_type in {"knowledge_space", "knowledge_library"}
+            and resource_id.isdigit()
+            and int(resource_id) in knowledge_by_id
+        }
+        labels.update(
+            {
+                (resource_type, resource_id): folder_by_id[int(resource_id)]
+                for resource_type, resource_id in resources
+                if resource_type == "folder" and resource_id.isdigit() and int(resource_id) in folder_by_id
+            }
+        )
+        labels.update(await self._application_resource_display_names(resources))
+        return labels
+
+    @staticmethod
+    async def _application_resource_display_names(
+        resources: tuple[tuple[str, str], ...],
+    ) -> dict[tuple[str, str], str]:
+        """Resolve labels for non-knowledge top-level resources in bounded queries."""
+
+        from sqlmodel import col, select
+
+        from bisheng.channel.domain.models.channel import Channel
+        from bisheng.core.database import get_async_db_session
+        from bisheng.database.models.app import APP_STATE_DELETED, App
+        from bisheng.database.models.assistant import Assistant
+        from bisheng.database.models.flow import Flow
+        from bisheng.telemetry_search.domain.models.dashboard import Dashboard
+        from bisheng.tool.domain.models.gpts_tools import GptsToolsType
+
+        ids_by_type = {
+            resource_type: tuple(resource_id for item_type, resource_id in resources if item_type == resource_type)
+            for resource_type in ("workflow", "assistant", "channel", "tool", "dashboard", "app")
+        }
+        if not any(ids_by_type.values()):
+            return {}
+        labels: dict[tuple[str, str], str] = {}
+        async with get_async_db_session() as session:
+            if ids_by_type["workflow"]:
+                rows = (await session.exec(select(Flow).where(col(Flow.id).in_(ids_by_type["workflow"])))).all()
+                labels.update({("workflow", str(row.id)): row.name for row in rows})
+            if ids_by_type["assistant"]:
+                rows = (
+                    await session.exec(
+                        select(Assistant).where(
+                            col(Assistant.id).in_(ids_by_type["assistant"]),
+                            Assistant.is_delete == 0,
+                        )
+                    )
+                ).all()
+                labels.update({("assistant", str(row.id)): row.name for row in rows})
+            if ids_by_type["channel"]:
+                rows = (await session.exec(select(Channel).where(col(Channel.id).in_(ids_by_type["channel"])))).all()
+                labels.update({("channel", str(row.id)): row.name for row in rows})
+            if ids_by_type["app"]:
+                # Hosted applications (F054): ``app.id`` is a str like Flow /
+                # Assistant, and "deleted" is a state, not an ``is_delete`` flag.
+                rows = (
+                    await session.exec(
+                        select(App).where(
+                            col(App.id).in_(ids_by_type["app"]),
+                            App.state != APP_STATE_DELETED,
+                        )
+                    )
+                ).all()
+                labels.update({("app", str(row.id)): row.name for row in rows})
+
+            tool_ids = tuple(int(value) for value in ids_by_type["tool"] if value.isdigit())
+            if tool_ids:
+                rows = (
+                    await session.exec(
+                        select(GptsToolsType).where(
+                            col(GptsToolsType.id).in_(tool_ids),
+                            GptsToolsType.is_delete == 0,
+                        )
+                    )
+                ).all()
+                labels.update({("tool", str(row.id)): row.name for row in rows})
+
+            dashboard_ids = tuple(int(value) for value in ids_by_type["dashboard"] if value.isdigit())
+            if dashboard_ids:
+                rows = (await session.exec(select(Dashboard).where(col(Dashboard.id).in_(dashboard_ids)))).all()
+                labels.update({("dashboard", str(row.id)): row.title for row in rows})
+        return labels

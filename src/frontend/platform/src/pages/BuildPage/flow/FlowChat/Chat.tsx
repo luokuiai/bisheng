@@ -1,0 +1,33 @@
+// @ts-strict-ignore
+import { useState } from "react";
+import ChatInput from "./ChatInput";
+import ChatMessages from "./ChatMessages";
+
+export default function Chat({
+    stop = false,
+    debug,
+    autoRun,
+    logo = null,
+    clear = false,
+    form = false,
+    useName,
+    title = '',
+    inputForm = null,
+    guideWord,
+    wsUrl,
+    onBeforSend,
+    version,
+    loadMore
+}) {
+    const [loading, setLoading] = useState(autoRun)
+
+    return <div className="h-full bg-background-login">
+        <div className="relative h-full">
+            <ChatMessages title={title} canExecute debug={debug} version={version} logo={logo} useName={useName} guideWord={guideWord} loadMore={loadMore}></ChatMessages>
+            <ChatInput autoRun={autoRun} version={version} clear={clear} form={form} wsUrl={wsUrl} inputForm={inputForm} onBeforSend={onBeforSend} onLoad={() => setLoading(false)} ></ChatInput>
+        </div>
+        {/* {loading && <div className="absolute top-0 left-0 w-full h-full flex items-center justify-center bg-primary/5 z-10">
+            <LoadingIcon className="size-24" />
+        </div>} */}
+    </div>
+};

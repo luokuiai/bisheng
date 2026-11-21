@@ -1,0 +1,264 @@
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import case, func, or_
+from sqlalchemy.exc import IntegrityError
+from sqlmodel import col, select, update
+from sqlmodel.ext.asyncio.session import AsyncSession
+
+from bisheng.channel.domain.models.channel import Channel, ChannelVisibilityEnum
+from bisheng.channel.domain.repositories.interfaces.channel_repository import ChannelRepository
+from bisheng.common.models.space_channel_member import (
+    REJECTED_STATUS_DISPLAY_WINDOW,
+    BusinessTypeEnum,
+    MembershipStatusEnum,
+    SpaceChannelMember,
+)
+from bisheng.common.repositories.implementations.base_repository_impl import BaseRepositoryImpl
+
+
+class ChannelRepositoryImpl(BaseRepositoryImpl[Channel, str], ChannelRepository):
+    """Channel repository implementation"""
+
+    def __init__(self, session: AsyncSession):
+        super().__init__(session, Channel)
+
+    async def find_by_creation_request(
+        self,
+        *,
+        tenant_id: int,
+        user_id: int,
+        creation_request_id: str,
+    ) -> Channel | None:
+        query = select(Channel).where(
+            Channel.tenant_id == tenant_id,
+            Channel.user_id == user_id,
+            Channel.creation_request_id == creation_request_id,
+        )
+        return (await self.session.exec(query)).first()
+
+    async def save_creation(self, channel: Channel) -> tuple[Channel, bool]:
+        try:
+            return await self.save(channel), True
+        except IntegrityError:
+            await self.session.rollback()
+            if channel.creation_request_id is None or channel.tenant_id is None:
+                raise
+            existing = await self.find_by_creation_request(
+                tenant_id=int(channel.tenant_id),
+                user_id=channel.user_id,
+                creation_request_id=channel.creation_request_id,
+            )
+            if existing is None:
+                raise
+            return existing, False
+
+    async def find_channels_by_ids(self, channel_ids: list[str]) -> list[Channel]:
+        """Find channels by a list of channel IDs."""
+        if not channel_ids:
+            return []
+        query = select(Channel).where(col(Channel.id).in_(channel_ids))
+        result = await self.session.exec(query)
+        return list(result.all())
+
+    async def find_channels_by_user_id(self, user_id: int) -> list[Channel]:
+        """Find all channels created by the given user (tenant auto-scoped)."""
+        query = select(Channel).where(Channel.user_id == user_id)
+        result = await self.session.exec(query)
+        return list(result.all())
+
+    async def find_followed_by_visible_ids(
+        self,
+        channel_ids: list[str],
+        *,
+        tenant_id: int,
+        exclude_creator_id: int,
+    ) -> list[Channel]:
+        """Load one bounded visible-id chunk under the canonical followed filters.
+
+        Called by ``_get_followed_channels`` with a page of ids that OpenFGA has
+        already declared visible for the current user; the ``tenant_id`` and
+        ``user_id != exclude_creator_id`` predicates keep the row set to the
+        active tenant and drop the user's own created channels at the DB layer,
+        so the loop never materialises them just to filter them out again.
+        """
+        if not channel_ids:
+            return []
+        query = select(Channel).where(
+            col(Channel.id).in_(channel_ids),
+            Channel.tenant_id == tenant_id,
+            Channel.user_id != exclude_creator_id,
+        )
+        result = await self.session.exec(query)
+        return list(result.all())
+
+    async def find_square_channels(
+        self, user_id: int, keyword: str | None = None, page: int = 1, page_size: int = 20
+    ) -> list[tuple[Any, ...]]:
+        """
+        Find released channels for the channel square with subscription status and subscriber count.
+        Uses multi-table LEFT JOIN:
+        - LEFT JOIN space_channel_member for current user's subscription status
+        - LEFT JOIN subquery for subscriber count (status=ACTIVE)
+        Returns list of tuples:
+        (Channel, user_subscription_status, user_subscription_update_time, subscriber_count)
+        """
+        rejection_cutoff = datetime.now() - REJECTED_STATUS_DISPLAY_WINDOW
+
+        # Subquery: count unique active subscribers per channel
+        subscriber_subq = (
+            select(
+                SpaceChannelMember.business_id,
+                func.count(func.distinct(SpaceChannelMember.user_id)).label("subscriber_count"),
+            )
+            .where(
+                SpaceChannelMember.business_type == BusinessTypeEnum.CHANNEL,
+                SpaceChannelMember.status == MembershipStatusEnum.ACTIVE,
+            )
+            .group_by(SpaceChannelMember.business_id)
+            .subquery()
+        )
+
+        # Main query with LEFT JOINs
+        query = (
+            select(
+                Channel,
+                SpaceChannelMember.status.label("user_subscription_status"),
+                SpaceChannelMember.update_time.label("user_subscription_update_time"),
+                func.coalesce(subscriber_subq.c.subscriber_count, 0).label("subscriber_count"),
+            )
+            .outerjoin(
+                SpaceChannelMember,
+                (SpaceChannelMember.business_id == Channel.id)
+                & (SpaceChannelMember.business_type == BusinessTypeEnum.CHANNEL)
+                & (SpaceChannelMember.user_id == user_id),
+            )
+            .outerjoin(subscriber_subq, subscriber_subq.c.business_id == Channel.id)
+            .where(
+                Channel.is_released == True,  # noqa: E712 — DM8 rejects `IS 1`
+                Channel.visibility != ChannelVisibilityEnum.PRIVATE,
+            )
+        )
+
+        # Apply keyword filter (fuzzy search on name and description)
+        if keyword:
+            like_pattern = f"%{keyword}%"
+            query = query.where(or_(Channel.name.like(like_pattern), Channel.description.like(like_pattern)))
+
+        subscription_order = case(
+            (SpaceChannelMember.status.is_(None), 0),
+            (
+                (SpaceChannelMember.status == MembershipStatusEnum.REJECTED)
+                & (SpaceChannelMember.update_time < rejection_cutoff),
+                0,
+            ),
+            else_=1,
+        )
+        query = query.order_by(
+            subscription_order.asc(),
+            subscriber_subq.c.subscriber_count.desc(),
+            func.coalesce(Channel.update_time, Channel.create_time).desc(),
+            Channel.id.asc(),
+        )
+
+        # Pagination
+        offset = (page - 1) * page_size
+        query = query.offset(offset).limit(page_size)
+
+        result = await self.session.exec(query)
+        return list(result.all())
+
+    async def find_public_recommend_channels(self, user_id: int, candidate_limit: int = 100) -> list[tuple[Any, ...]]:
+        """
+        Find released PUBLIC channels for the home-page discovery carousel.
+
+        Same tuple shape as :meth:`find_square_channels`
+        ``(Channel, user_subscription_status, user_subscription_update_time, subscriber_count)``
+        but restricted to ``visibility == PUBLIC`` and unpaginated (capped at
+        ``candidate_limit``). The caller computes per-channel article counts via ES
+        and re-sorts by content count, so DB ordering here is only the candidate
+        pre-filter — newest channels first, bounded to keep the ES batch small.
+        """
+        subscriber_subq = (
+            select(SpaceChannelMember.business_id, func.count().label("subscriber_count"))
+            .where(
+                SpaceChannelMember.business_type == BusinessTypeEnum.CHANNEL,
+                SpaceChannelMember.status == MembershipStatusEnum.ACTIVE,
+            )
+            .group_by(SpaceChannelMember.business_id)
+            .subquery()
+        )
+
+        query = (
+            select(
+                Channel,
+                SpaceChannelMember.status.label("user_subscription_status"),
+                SpaceChannelMember.update_time.label("user_subscription_update_time"),
+                func.coalesce(subscriber_subq.c.subscriber_count, 0).label("subscriber_count"),
+            )
+            .outerjoin(
+                SpaceChannelMember,
+                (SpaceChannelMember.business_id == Channel.id)
+                & (SpaceChannelMember.business_type == BusinessTypeEnum.CHANNEL)
+                & (SpaceChannelMember.user_id == user_id),
+            )
+            .outerjoin(subscriber_subq, subscriber_subq.c.business_id == Channel.id)
+            .where(
+                Channel.is_released == True,  # noqa: E712 — DM8 rejects `IS 1`
+                Channel.visibility == ChannelVisibilityEnum.PUBLIC,
+            )
+            .order_by(func.coalesce(Channel.update_time, Channel.create_time).desc())
+            .limit(candidate_limit)
+        )
+
+        result = await self.session.exec(query)
+        return list(result.all())
+
+    async def count_square_channels(self, keyword: str | None = None) -> int:
+        """Count total released channels matching the keyword filter."""
+        query = (
+            select(func.count())
+            .select_from(Channel)
+            .where(
+                Channel.is_released == True,  # noqa: E712 — DM8 rejects `IS 1`
+                Channel.visibility != ChannelVisibilityEnum.PRIVATE,
+            )
+        )
+
+        if keyword:
+            like_pattern = f"%{keyword}%"
+            query = query.where(or_(Channel.name.like(like_pattern), Channel.description.like(like_pattern)))
+
+        result = await self.session.exec(query)
+        return result.one()
+
+    async def find_all_referenced_source_ids(self) -> set[str]:
+        """Union of all source_ids referenced by any channel in the current tenant."""
+        query = select(Channel.source_list)
+        result = await self.session.exec(query)
+        referenced: set[str] = set()
+        for source_list in result.all():
+            if source_list:
+                referenced.update(str(source_id).strip() for source_id in source_list if str(source_id).strip())
+        return referenced
+
+    async def find_channels_referencing_source(self, source_id: str) -> list[Channel]:
+        normalized = str(source_id).strip()
+        if not normalized:
+            return []
+        result = await self.session.exec(select(Channel))
+        return [
+            channel
+            for channel in result.all()
+            if normalized in {str(item).strip() for item in (channel.source_list or []) if str(item).strip()}
+        ]
+
+    def update_channel_latest_article_update_time(self, channles: list[Channel]) -> list[Channel]:
+        for channel in channles:
+            stmt = (
+                update(Channel)
+                .where(Channel.id == channel.id)
+                .values(latest_article_update_time=channel.latest_article_update_time)
+            )
+            self.session.exec(stmt)
+            self.session.commit()

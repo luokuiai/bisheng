@@ -1,0 +1,54 @@
+// @ts-strict-ignore
+import { Textarea } from '@bisheng/ui';
+
+import { Label } from "@/components/bs-ui/label";
+import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
+
+export const WebSearchConfig = ({
+    config,
+    onChange,
+    errors = {},
+}: {
+    config: {
+        tool: string;
+        params: {
+            api_key?: string;
+            base_url?: string;
+            engine?: string;
+        };
+        prompt: string;
+    };
+    onChange: (field: string, value: any) => void;
+    errors?: Record<string, any>;
+}) => {
+    const { t } = useTranslation();
+
+    // Store parameters for all tools separately
+    const [toolsParams, setToolsParams] = useState<Record<string, any>>({
+        bing: { api_key: "", base_url: "" },
+        bocha: { api_key: "", base_url: "" },
+        jina: { api_key: "", base_url: "" },
+        serp: { api_key: "", engine: "", base_url: "" },
+        tavily: { api_key: "", base_url: "" },
+    });
+
+    // Initialize toolsParams with existing config
+    useEffect(() => {
+        if (config.tool && config.params) {
+            setToolsParams((prev) => ({
+                ...prev,
+                [config.tool]: { ...prev[config.tool], ...config.params },
+            }));
+        }
+    }, [config]);
+
+    return (
+        <>
+            <Label className="bisheng-label">{t("bench.webSearchPrompt")}</Label>
+            <div className="mt-3">
+                <Textarea value={config.prompt || config} onChange={(e) => onChange("prompt", e.target.value)} textareaClassName={"min-h-48"} />
+            </div>
+        </>
+    );
+};
