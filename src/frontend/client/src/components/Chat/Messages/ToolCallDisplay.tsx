@@ -15,6 +15,7 @@ import { AlertCircle } from "lucide-react";
 import { memo, useEffect, useState, type FC } from "react";
 import type { AgentToolCall } from "~/api/chatApi";
 import { useLocalize } from "~/hooks";
+import { localizeToolName } from "~/locales/toolName";
 import { cn } from "~/utils";
 
 export interface ToolCallDisplayProps {
@@ -52,7 +53,8 @@ function resolveToolName(
 ): string {
     const key = BUILTIN_TOOL_I18N[(tc.tool_name || "").toLowerCase()];
     if (key) return localize(key);
-    return tc.display_name || tc.tool_name || localize("com_tools_generic_fallback");
+    const fallback = tc.display_name || tc.tool_name || localize("com_tools_generic_fallback");
+    return localizeToolName(tc.tool_name, fallback, localize);
 }
 
 function parseResults(raw: any): any[] {

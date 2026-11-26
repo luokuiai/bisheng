@@ -1,4 +1,5 @@
 import type { Capability } from '~/api/capabilities';
+import { localizeToolName } from '~/locales/toolName';
 type Translate = (key: string, options?: { defaultValue: string }) => string;
 type SearchableCapability = Capability & { searchText?: string };
 
@@ -8,9 +9,7 @@ export function localizeCapability(item: Capability, translate: Translate): Sear
     ? translate(`com_capability_center.scenario_${item.trial.scenario}`, { defaultValue: item.name })
     : item.name;
   const builtin = item.kind === 'builtin';
-  const name = builtin && item.tool_key
-    ? translate(`tool:tools.${item.tool_key}.name`, { defaultValue: trialName })
-    : trialName;
+  const name = builtin ? localizeToolName(item.tool_key, trialName, translate) : trialName;
   const description = builtin && item.tool_key
     ? translate(`tool:tools.${item.tool_key}.desc`, { defaultValue: item.description })
     : item.description;

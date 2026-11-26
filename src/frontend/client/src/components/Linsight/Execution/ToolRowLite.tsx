@@ -13,6 +13,7 @@
 import { Outlined } from 'bisheng-icons';
 import { memo, useState, type FC } from 'react';
 import { useLocalize } from '~/hooks';
+import { localizeToolName } from '~/locales/toolName';
 import { cn } from '~/utils';
 import CollapsibleTimelineItem from './CollapsibleTimelineItem';
 import { ACCENT, BODY, MUTED } from './execTokens';
@@ -53,14 +54,9 @@ const INK_GLYPH = '[&>svg]:text-text-1';
 function resolveTitle(step: MergedStep, localize: ReturnType<typeof useLocalize>): string {
     const key = (step.name || '').toLowerCase();
     const verb = TOOL_VERB_I18N[key];
-    if (step.running) {
-        // Mirror ToolCallDisplay inflight phrasing; verb maps are past-tense, so
-        // running steps use the generic "Calling X" form against the raw name.
-        return localize('com_tools_state_tool_running', { name: step.name || localize('com_tools_generic_fallback') });
-    }
-    if (verb) return localize(verb);
-    // Fallback: "Used {name}" (North Star generic-tool phrasing).
-    return localize('com_tools_state_tool_done', { name: step.name || localize('com_tools_generic_fallback') });
+    if (!step.running && verb) return localize(verb);
+    const name = localizeToolName(step.name, step.name || localize('com_tools_generic_fallback'), localize);
+    return localize(step.running ? 'com_tools_state_tool_running' : 'com_tools_state_tool_done', { name });
 }
 
 const ToolRowLiteBase: FC<ToolRowLiteProps> = ({ step }) => {
